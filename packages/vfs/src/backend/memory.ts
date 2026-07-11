@@ -85,11 +85,79 @@ export class MemoryBackend implements WashBackend {
     Object.assign(this.node(id).attrs, attrs);
   }
 
-  // Content ops, unlink, rename, links: Tasks 4 and 5.
-  async read(): Promise<Uint8Array> { throw new VfsError("ENOSYS"); }
-  async write(): Promise<void> { throw new VfsError("ENOSYS"); }
-  async truncate(): Promise<void> { throw new VfsError("ENOSYS"); }
-  async unlink(): Promise<void> { throw new VfsError("ENOSYS"); }
-  async rename(): Promise<void> { throw new VfsError("ENOSYS"); }
+  private fileNode(id: NodeId): MemNode {
+    const n = this.node(id);
+    if (n.attrs.kind === "dir") throw new VfsError("EISDIR");
+    return n;
+  }
+
+  async read(id: NodeId, offset: number, length: number): Promise<Uint8Array> {
+    const n = this.fileNode(id);
+    if (offset >= n.data.byteLength) return new Uint8Array(0);
+    return n.data.slice(offset, Math.min(offset + length, n.data.byteLength));
+  }
+
+  async write(id: NodeId, offset: number, data: Uint8Array): Promise<void> {
+    const n = this.fileNode(id);
+    const end = offset + data.byteLength;
+    if (end > n.data.byteLength) {
+      const grown = new Uint8Array(end);
+      grown.set(n.data, 0);
+      n.data = grown;
+    }
+    n.data.set(data, offset);
+    n.attrs.size = n.data.byteLength;
+    n.attrs.mtimeMs = Date.now();
+  }
+
+  async truncate(id: NodeId, size: number): Promise<void> {
+    const n = this.fileNode(id);
+    const next = new Uint8Array(size);
+    next.set(n.data.slice(0, Math.min(size, n.data.byteLength)), 0);
+    n.data = next;
+    n.attrs.size = size;
+    n.attrs.mtimeMs = Date.now();
+  }
+
+  private decNlinkAndMaybeGC(id: NodeId): void {
+    const n = this.node(id);
+    n.attrs.nlink -= 1;
+    if (n.attrs.nlink <= 0) this.nodes.delete(id);
+  }
+
+  async unlink(parent: NodeId, name: string): Promise<void> {
+    const p = this.dir(parent);
+    const entry = p.children.get(name);
+    if (!entry) throw new VfsError("ENOENT", name);
+    const child = this.node(entry.childId);
+    if (child.attrs.kind === "dir" && child.children!.size > 0) throw new VfsError("ENOTEMPTY", name);
+    p.children.delete(name);
+    if (child.attrs.kind === "dir") this.nodes.delete(entry.childId);
+    else this.decNlinkAndMaybeGC(entry.childId);
+  }
+
+  async rename(fromParent: NodeId, fromName: string, toParent: NodeId, toName: string): Promise<void> {
+    const fp = this.dir(fromParent);
+    const tp = this.dir(toParent);
+    const moving = fp.children.get(fromName);
+    if (!moving) throw new VfsError("ENOENT", fromName);
+    const existing = tp.children.get(toName);
+    if (existing) {
+      if (existing.childId === moving.childId) return;
+      const exNode = this.node(existing.childId);
+      const mvNode = this.node(moving.childId);
+      if (exNode.attrs.kind === "dir") {
+        if (mvNode.attrs.kind !== "dir") throw new VfsError("EISDIR", toName);
+        if (exNode.children!.size > 0) throw new VfsError("ENOTEMPTY", toName);
+        this.nodes.delete(existing.childId);
+      } else {
+        if (mvNode.attrs.kind === "dir") throw new VfsError("ENOTDIR", toName);
+        this.decNlinkAndMaybeGC(existing.childId);
+      }
+    }
+    fp.children.delete(fromName);
+    tp.children.set(toName, moving);
+  }
+
   async flush(): Promise<void> {}
 }
