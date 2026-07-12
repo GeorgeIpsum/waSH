@@ -15,16 +15,18 @@ interface LockManagerLike {
 }
 
 function acquireLock(locks: LockManagerLike, name: string): Promise<(() => void) | undefined> {
-  return new Promise((resolveAcq) => {
-    void locks.request(name, { ifAvailable: true }, (lock) => {
-      if (!lock) {
-        resolveAcq(undefined);
-        return Promise.resolve();
-      }
-      return new Promise<void>((releaseLock) => {
-        resolveAcq(() => releaseLock());
-      });
-    });
+  return new Promise((resolveAcq, rejectAcq) => {
+    locks
+      .request(name, { ifAvailable: true }, (lock) => {
+        if (!lock) {
+          resolveAcq(undefined);
+          return Promise.resolve();
+        }
+        return new Promise<void>((releaseLock) => {
+          resolveAcq(() => releaseLock());
+        });
+      })
+      .catch(rejectAcq);
   });
 }
 
@@ -53,8 +55,13 @@ export class Vfs {
       release = await acquireLock(locks, `wash-mount:${p}`);
       if (!release) throw new VfsError("EPERM", p);
     }
-    this.mounts.push({ path: p, backend, rootId: await backend.root(), release });
-    this.mounts.sort((a, b) => b.path.length - a.path.length);
+    try {
+      this.mounts.push({ path: p, backend, rootId: await backend.root(), release });
+      this.mounts.sort((a, b) => b.path.length - a.path.length);
+    } catch (e) {
+      release?.();
+      throw e;
+    }
   }
 
   private mountFor(path: string): Mount {
@@ -360,10 +367,13 @@ export class Vfs {
   async unmount(path: string): Promise<void> {
     const p = normalize(path);
     if (p === "/") throw new VfsError("EINVAL", p);
-    const i = this.mounts.findIndex((m) => m.path === p);
-    if (i < 0) throw new VfsError("ENOENT", p);
-    await this.mounts[i]!.backend.flush();
-    this.mounts[i]!.release?.();
-    this.mounts.splice(i, 1);
+    const m = this.mounts.find((x) => x.path === p);
+    if (!m) throw new VfsError("ENOENT", p);
+    await m.backend.flush();
+    const i = this.mounts.indexOf(m);
+    if (i >= 0) {
+      this.mounts.splice(i, 1);
+      m.release?.();
+    }
   }
 }

@@ -79,4 +79,84 @@ describe("Vfs streams + fsync + unmount", () => {
       delete (globalThis as Record<string, unknown>).navigator;
     }
   });
+
+  it("unmount flushes queued write-back ops before removing the mount", async () => {
+    const { CachedBackend } = await import("../src/cache/cached-backend.js");
+    const inner = new MemoryBackend();
+    await vfs.mkdir("/mnt");
+    await vfs.mount("/mnt", new CachedBackend(inner, { flushDelayMs: 60_000 }));
+    await vfs.writeFile("/mnt/f", "data");
+    const root = await inner.root();
+    expect(await inner.lookup(root, "f")).toBeNull();
+    await vfs.unmount("/mnt");
+    expect(await inner.lookup(root, "f")).not.toBeNull();
+  });
+
+  it("concurrent unmounts splice the right mounts", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    class SlowFlush extends MemoryBackend {
+      override async flush(): Promise<void> {
+        await gate;
+      }
+    }
+    await vfs.mkdir("/a");
+    await vfs.mkdir("/b");
+    await vfs.mount("/a", new SlowFlush());
+    await vfs.mount("/b", new MemoryBackend());
+    const pending = vfs.unmount("/a");
+    await vfs.unmount("/b");
+    release();
+    await pending;
+    expect((await vfs.stat("/")).kind).toBe("dir");
+    await expect(vfs.unmount("/a")).rejects.toMatchObject({ errno: "ENOENT" });
+    await expect(vfs.unmount("/b")).rejects.toMatchObject({ errno: "ENOENT" });
+  });
+
+  it("mount releases the lock when backend.root() fails after acquisition", async () => {
+    const held = new Set<string>();
+    const fakeLocks = {
+      request: async (name: string, _opts: { ifAvailable: boolean }, cb: (lock: unknown) => Promise<unknown>) => {
+        if (held.has(name)) return cb(null);
+        held.add(name);
+        try {
+          return await cb({ name });
+        } finally {
+          held.delete(name);
+        }
+      },
+    };
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: fakeLocks } });
+    try {
+      const bad = new MemoryBackend();
+      (bad as unknown as { root: () => Promise<string> }).root = async () => {
+        throw new Error("boom");
+      };
+      const v = new Vfs();
+      await expect(v.mount("/", bad, { exclusive: true })).rejects.toThrow("boom");
+      const v2 = new Vfs();
+      await v2.mount("/", new MemoryBackend(), { exclusive: true }); // lock was released
+    } finally {
+      delete (globalThis as Record<string, unknown>).navigator;
+    }
+  });
+
+  it(
+    "mount propagates lock-manager failures instead of hanging",
+    async () => {
+      const fakeLocks = {
+        request: async () => {
+          throw new Error("locks down");
+        },
+      };
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: { locks: fakeLocks } });
+      try {
+        const v = new Vfs();
+        await expect(v.mount("/", new MemoryBackend(), { exclusive: true })).rejects.toThrow("locks down");
+      } finally {
+        delete (globalThis as Record<string, unknown>).navigator;
+      }
+    },
+    2000,
+  );
 });
