@@ -88,7 +88,7 @@ export class Vfs {
     return (await this.resolve(path)).realPath;
   }
 
-  private async resolveParent(path: string): Promise<{ backend: WashBackend; dirId: NodeId; name: string; mountPath: string }> {
+  private async resolveParent(path: string): Promise<{ backend: WashBackend; dirId: NodeId; name: string; mountPath: string; parentRealPath: string }> {
     const p = normalize(path);
     if (p === "/") throw new VfsError("EINVAL", "/");
     const idx = p.lastIndexOf("/");
@@ -96,7 +96,7 @@ export class Vfs {
     const name = p.slice(idx + 1);
     const parent = await this.resolve(parentPath);
     if (parent.attrs.kind !== "dir") throw new VfsError("ENOTDIR", parentPath);
-    return { backend: parent.backend, dirId: parent.id, name, mountPath: parent.mountPath };
+    return { backend: parent.backend, dirId: parent.id, name, mountPath: parent.mountPath, parentRealPath: parent.realPath };
   }
 
   async mkdir(path: string, opts: { recursive?: boolean } = {}): Promise<void> {
@@ -150,10 +150,16 @@ export class Vfs {
     const f = normalize(from);
     const t = normalize(to);
     if (t === f) return;
-    if (t.startsWith(f + "/")) throw new VfsError("EINVAL", to);
     const src = await this.resolveParent(f);
     const dst = await this.resolveParent(t);
     if (src.mountPath !== dst.mountPath) throw new VfsError("EXDEV", to);
+    const moving = await this.resolve(f, { followLast: false });
+    if (
+      dst.parentRealPath === moving.realPath ||
+      dst.parentRealPath.startsWith(moving.realPath === "/" ? "/" : moving.realPath + "/")
+    ) {
+      throw new VfsError("EINVAL", to);
+    }
     await src.backend.rename(src.dirId, src.name, dst.dirId, dst.name);
   }
 

@@ -50,6 +50,15 @@ describe("Vfs metadata ops", () => {
     await expect(vfs.rename("/c", "/c/inner/c")).rejects.toMatchObject({ errno: "EINVAL" });
   });
 
+  it("rename EINVAL guard is not bypassable via symlinks", async () => {
+    await vfs.mkdir("/a");
+    await vfs.mkdir("/a/b");
+    await vfs.symlink("/a/b", "/link");
+    await expect(vfs.rename("/a", "/link/x")).rejects.toMatchObject({ errno: "EINVAL" });
+    expect(await vfs.exists("/a")).toBe(true);
+    expect((await vfs.stat("/a/b")).kind).toBe("dir");
+  });
+
   it("rename across mounts throws EXDEV", async () => {
     await vfs.mkdir("/mnt");
     await vfs.mount("/mnt", new MemoryBackend());
