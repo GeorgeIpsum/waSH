@@ -214,6 +214,15 @@ export function runBackendConformance(
         await be.create(root, "d", d, "dir");
         await expect(be.link!(root, "d2", d)).rejects.toMatchObject({ errno: "EPERM" });
       });
+
+      it("link EEXIST takes precedence over EPERM when both apply", async (ctx) => {
+        if (!be.caps.hardlinks) return ctx.skip();
+        const d = ulid();
+        await be.create(root, "d", d, "dir");
+        const f = ulid();
+        await be.create(root, "f", f, "file");
+        await expect(be.link!(root, "f", d)).rejects.toMatchObject({ errno: "EEXIST" });
+      });
     });
 
     describe("flush", () => {

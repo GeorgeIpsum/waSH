@@ -97,8 +97,8 @@ export class CachedBackend implements WashBackend {
   link?: (parent: NodeId, name: string, id: NodeId) => Promise<void> = async (parent, name, id): Promise<void> => {
     if (!this.inner.link) throw new Error("unsupported");
     const attrs = await this.getattr(id); // ENOENT if unknown; ensures attrCache is populated
-    if (attrs.kind === "dir") throw new VfsError("EPERM", name);
     if ((await this.lookup(parent, name)) !== null) throw new VfsError("EEXIST", name);
+    if (attrs.kind === "dir") throw new VfsError("EPERM", name);
     // Never replace the attrCache entry: mutate it in place so every other
     // name aliasing this node (existing hardlinks) observes the same nlink
     // bump instead of going stale. getattr() above guarantees this is set.
