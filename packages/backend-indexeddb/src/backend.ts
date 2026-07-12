@@ -31,6 +31,14 @@ export class IndexedDBBackend implements WashBackend {
   private tx: IDBTransaction | null = null;
   private txCompletion: Promise<void> | null = null;
   private lastAbort: unknown = null;
+  private issuedInAttempt = 0;
+
+  /** All op-body requests go through this so withTx knows whether an attempt
+   * had side effects before deciding to retry. */
+  private r<T>(request: IDBRequest<T>): Promise<T> {
+    this.issuedInAttempt++;
+    return req(request);
+  }
 
   private constructor(
     private readonly db: IDBDatabase,
@@ -100,20 +108,33 @@ export class IndexedDBBackend implements WashBackend {
 
   /**
    * Run one contract op against the shared transaction. If the cached txn
-   * already auto-committed (batch boundary), the op's first request throws
-   * TransactionInactiveError/InvalidStateError — reset and retry the WHOLE
-   * op once on a fresh txn. Ops must be restartable and must never await
-   * anything but IDB requests (see plan Global Constraints).
+   * already auto-committed (batch boundary) and the op's very FIRST request
+   * throws TransactionInactiveError/InvalidStateError, that attempt issued
+   * zero IDB requests — nothing could have persisted — so it is trivially
+   * safe to reset and retry once on a fresh txn. Multi-mutation ops are NOT
+   * restartable in general: a failure that strikes mid-op (after some of the
+   * op's requests already succeeded) must surface as an error, never be
+   * partially re-executed, because a retry would re-run mutations like
+   * unlink's nlink decrement or rename's dirent move a second time. The
+   * whole batch's fate in that case is governed by the abort-poisoning path
+   * (lastAbort / flush()), not by a body replay. This relaxes the
+   * restartability requirement to: ops need no side effects before their
+   * first request (trivially true), not full restartability.
    */
   private async withTx<T>(fn: (tx: IDBTransaction) => Promise<T>): Promise<T> {
-    if (this.lastAbort) throw this.lastAbort;
     for (let attempt = 0; ; attempt++) {
+      if (this.lastAbort) throw this.lastAbort;
       const tx = this.currentTx();
+      this.issuedInAttempt = 0;
       try {
         return await fn(tx);
       } catch (e) {
         const errName = (e as { name?: string } | null)?.name;
-        if (attempt === 0 && (errName === "TransactionInactiveError" || errName === "InvalidStateError")) {
+        const staleHandle =
+          attempt === 0 &&
+          this.issuedInAttempt === 0 &&
+          (errName === "TransactionInactiveError" || errName === "InvalidStateError");
+        if (staleHandle) {
           if (this.tx === tx) this.tx = null;
           continue;
         }
@@ -151,7 +172,7 @@ export class IndexedDBBackend implements WashBackend {
   }
 
   private async getInode(tx: IDBTransaction, id: NodeId): Promise<InodeRecord> {
-    const rec = (await req(tx.objectStore("inodes").get(id))) as InodeRecord | undefined;
+    const rec = (await this.r(tx.objectStore("inodes").get(id))) as InodeRecord | undefined;
     if (!rec) throw new VfsError("ENOENT");
     return rec;
   }
@@ -190,14 +211,14 @@ export class IndexedDBBackend implements WashBackend {
     return this.withTx(async (tx) => {
       const rec = await this.getInode(tx, id);
       Object.assign(rec, attrs);
-      await req(tx.objectStore("inodes").put(rec, id));
+      await this.r(tx.objectStore("inodes").put(rec, id));
     });
   }
 
   async lookup(parent: NodeId, name: string): Promise<NodeInfo | null> {
     return this.withTx(async (tx) => {
       await this.requireDir(tx, parent);
-      const d = (await req(tx.objectStore("dirents").get(this.direntKey(parent, name)))) as DirentRecord | undefined;
+      const d = (await this.r(tx.objectStore("dirents").get(this.direntKey(parent, name)))) as DirentRecord | undefined;
       if (!d) return null;
       return { id: d.childId, attrs: this.stripTarget(await this.getInode(tx, d.childId)) };
     });
@@ -206,7 +227,7 @@ export class IndexedDBBackend implements WashBackend {
   async readdir(id: NodeId): Promise<Dirent[]> {
     return this.withTx(async (tx) => {
       await this.requireDir(tx, id);
-      const vals = (await req(tx.objectStore("dirents").getAll(this.direntRange(id)))) as DirentRecord[];
+      const vals = (await this.r(tx.objectStore("dirents").getAll(this.direntRange(id)))) as DirentRecord[];
       return vals.map((v) => ({ name: v.name, childId: v.childId, kind: v.kind }));
     });
   }
@@ -214,7 +235,7 @@ export class IndexedDBBackend implements WashBackend {
   async readdirPlus(id: NodeId): Promise<(Dirent & { attrs: Attrs })[]> {
     return this.withTx(async (tx) => {
       await this.requireDir(tx, id);
-      const vals = (await req(tx.objectStore("dirents").getAll(this.direntRange(id)))) as DirentRecord[];
+      const vals = (await this.r(tx.objectStore("dirents").getAll(this.direntRange(id)))) as DirentRecord[];
       const out: (Dirent & { attrs: Attrs })[] = [];
       for (const v of vals) {
         out.push({ name: v.name, childId: v.childId, kind: v.kind, attrs: this.stripTarget(await this.getInode(tx, v.childId)) });
@@ -226,15 +247,15 @@ export class IndexedDBBackend implements WashBackend {
   async create(parent: NodeId, name: string, id: NodeId, kind: NodeKind, attrs?: Partial<Attrs>): Promise<void> {
     return this.withTx(async (tx) => {
       await this.requireDir(tx, parent);
-      const existing = await req(tx.objectStore("dirents").get(this.direntKey(parent, name)));
+      const existing = await this.r(tx.objectStore("dirents").get(this.direntKey(parent, name)));
       if (existing) throw new VfsError("EEXIST", name);
       const now = Date.now();
       const rec: InodeRecord = {
         kind, size: 0, mode: this.defaultMode(kind), mtimeMs: now, ctimeMs: now, nlink: 1, ...attrs,
       };
-      await req(tx.objectStore("inodes").put(rec, id));
+      await this.r(tx.objectStore("inodes").put(rec, id));
       const dirent: DirentRecord = { name, childId: id, kind };
-      await req(tx.objectStore("dirents").put(dirent, this.direntKey(parent, name)));
+      await this.r(tx.objectStore("dirents").put(dirent, this.direntKey(parent, name)));
     });
   }
 
@@ -260,8 +281,8 @@ export class IndexedDBBackend implements WashBackend {
       const range = this.chunkRange(id, first, last);
       const keysReq = store.getAllKeys(range);
       const valsReq = store.getAll(range);
-      const keys = (await req(keysReq)) as [NodeId, number][];
-      const vals = (await req(valsReq)) as Uint8Array[];
+      const keys = (await this.r(keysReq)) as [NodeId, number][];
+      const vals = (await this.r(valsReq)) as Uint8Array[];
       for (let i = 0; i < keys.length; i++) {
         const idx = keys[i]![1];
         const chunk = vals[i]!;
@@ -291,17 +312,17 @@ export class IndexedDBBackend implements WashBackend {
         if (slice.byteLength === this.chunkSize) {
           chunk = slice.slice(); // full-chunk overwrite: skip the read
         } else {
-          const existing = (await req(store.get([id, idx]))) as Uint8Array | undefined;
+          const existing = (await this.r(store.get([id, idx]))) as Uint8Array | undefined;
           const size = Math.max(existing?.byteLength ?? 0, to - chunkStart);
           chunk = new Uint8Array(size);
           if (existing) chunk.set(existing, 0);
           chunk.set(slice, from - chunkStart);
         }
-        await req(store.put(chunk, [id, idx]));
+        await this.r(store.put(chunk, [id, idx]));
       }
       if (end > rec.size) rec.size = end;
       rec.mtimeMs = Date.now();
-      await req(tx.objectStore("inodes").put(rec, id));
+      await this.r(tx.objectStore("inodes").put(rec, id));
     });
   }
 
@@ -311,49 +332,49 @@ export class IndexedDBBackend implements WashBackend {
       const store = tx.objectStore("data");
       if (size < rec.size) {
         const lastKeep = size === 0 ? -1 : Math.floor((size - 1) / this.chunkSize);
-        await req(store.delete(this.chunkRange(id, lastKeep + 1)));
+        await this.r(store.delete(this.chunkRange(id, lastKeep + 1)));
         if (lastKeep >= 0) {
-          const boundary = (await req(store.get([id, lastKeep]))) as Uint8Array | undefined;
+          const boundary = (await this.r(store.get([id, lastKeep]))) as Uint8Array | undefined;
           const keep = size - lastKeep * this.chunkSize;
           if (boundary && boundary.byteLength > keep) {
-            await req(store.put(boundary.slice(0, keep), [id, lastKeep]));
+            await this.r(store.put(boundary.slice(0, keep), [id, lastKeep]));
           }
         }
       }
       rec.size = size; // extend is sparse: missing chunks read as zeros
       rec.mtimeMs = Date.now();
-      await req(tx.objectStore("inodes").put(rec, id));
+      await this.r(tx.objectStore("inodes").put(rec, id));
     });
   }
 
   private async dirHasChildren(tx: IDBTransaction, id: NodeId): Promise<boolean> {
-    const keys = await req(tx.objectStore("dirents").getAllKeys(this.direntRange(id), 1));
+    const keys = await this.r(tx.objectStore("dirents").getAllKeys(this.direntRange(id), 1));
     return keys.length > 0;
   }
 
   private async gcInode(tx: IDBTransaction, id: NodeId, rec: InodeRecord): Promise<void> {
     rec.nlink -= 1;
     if (rec.nlink <= 0) {
-      await req(tx.objectStore("inodes").delete(id));
-      await req(tx.objectStore("data").delete(this.chunkRange(id)));
+      await this.r(tx.objectStore("inodes").delete(id));
+      await this.r(tx.objectStore("data").delete(this.chunkRange(id)));
     } else {
-      await req(tx.objectStore("inodes").put(rec, id));
+      await this.r(tx.objectStore("inodes").put(rec, id));
     }
   }
 
   async unlink(parent: NodeId, name: string): Promise<void> {
     return this.withTx(async (tx) => {
       await this.requireDir(tx, parent);
-      const d = (await req(tx.objectStore("dirents").get(this.direntKey(parent, name)))) as DirentRecord | undefined;
+      const d = (await this.r(tx.objectStore("dirents").get(this.direntKey(parent, name)))) as DirentRecord | undefined;
       if (!d) throw new VfsError("ENOENT", name);
       const child = await this.getInode(tx, d.childId);
       if (child.kind === "dir") {
         if (await this.dirHasChildren(tx, d.childId)) throw new VfsError("ENOTEMPTY", name);
-        await req(tx.objectStore("inodes").delete(d.childId));
+        await this.r(tx.objectStore("inodes").delete(d.childId));
       } else {
         await this.gcInode(tx, d.childId, child);
       }
-      await req(tx.objectStore("dirents").delete(this.direntKey(parent, name)));
+      await this.r(tx.objectStore("dirents").delete(this.direntKey(parent, name)));
     });
   }
 
@@ -362,9 +383,9 @@ export class IndexedDBBackend implements WashBackend {
       await this.requireDir(tx, fromParent);
       await this.requireDir(tx, toParent);
       const dirents = tx.objectStore("dirents");
-      const moving = (await req(dirents.get(this.direntKey(fromParent, fromName)))) as DirentRecord | undefined;
+      const moving = (await this.r(dirents.get(this.direntKey(fromParent, fromName)))) as DirentRecord | undefined;
       if (!moving) throw new VfsError("ENOENT", fromName);
-      const displaced = (await req(dirents.get(this.direntKey(toParent, toName)))) as DirentRecord | undefined;
+      const displaced = (await this.r(dirents.get(this.direntKey(toParent, toName)))) as DirentRecord | undefined;
       if (displaced) {
         if (displaced.childId === moving.childId) return; // POSIX same-inode no-op
         const exNode = await this.getInode(tx, displaced.childId);
@@ -372,30 +393,30 @@ export class IndexedDBBackend implements WashBackend {
         if (exNode.kind === "dir") {
           if (mvNode.kind !== "dir") throw new VfsError("EISDIR", toName);
           if (await this.dirHasChildren(tx, displaced.childId)) throw new VfsError("ENOTEMPTY", toName);
-          await req(tx.objectStore("inodes").delete(displaced.childId));
+          await this.r(tx.objectStore("inodes").delete(displaced.childId));
         } else {
           if (mvNode.kind === "dir") throw new VfsError("ENOTDIR", toName);
           await this.gcInode(tx, displaced.childId, exNode);
         }
       }
-      await req(dirents.delete(this.direntKey(fromParent, fromName)));
+      await this.r(dirents.delete(this.direntKey(fromParent, fromName)));
       const next: DirentRecord = { ...moving, name: toName };
-      await req(dirents.put(next, this.direntKey(toParent, toName)));
+      await this.r(dirents.put(next, this.direntKey(toParent, toName)));
     });
   }
 
   async symlink(parent: NodeId, name: string, id: NodeId, target: string): Promise<void> {
     return this.withTx(async (tx) => {
       await this.requireDir(tx, parent);
-      const existing = await req(tx.objectStore("dirents").get(this.direntKey(parent, name)));
+      const existing = await this.r(tx.objectStore("dirents").get(this.direntKey(parent, name)));
       if (existing) throw new VfsError("EEXIST", name);
       const now = Date.now();
       const rec: InodeRecord = {
         kind: "symlink", size: target.length, mode: 0o777, mtimeMs: now, ctimeMs: now, nlink: 1, target,
       };
-      await req(tx.objectStore("inodes").put(rec, id));
+      await this.r(tx.objectStore("inodes").put(rec, id));
       const dirent: DirentRecord = { name, childId: id, kind: "symlink" };
-      await req(tx.objectStore("dirents").put(dirent, this.direntKey(parent, name)));
+      await this.r(tx.objectStore("dirents").put(dirent, this.direntKey(parent, name)));
     });
   }
 
@@ -410,14 +431,14 @@ export class IndexedDBBackend implements WashBackend {
   async link(parent: NodeId, name: string, id: NodeId): Promise<void> {
     return this.withTx(async (tx) => {
       await this.requireDir(tx, parent);
-      const existing = await req(tx.objectStore("dirents").get(this.direntKey(parent, name)));
+      const existing = await this.r(tx.objectStore("dirents").get(this.direntKey(parent, name)));
       if (existing) throw new VfsError("EEXIST", name); // EEXIST before EPERM (contract precedence)
       const rec = await this.getInode(tx, id);
       if (rec.kind === "dir") throw new VfsError("EPERM", name);
       rec.nlink += 1;
-      await req(tx.objectStore("inodes").put(rec, id));
+      await this.r(tx.objectStore("inodes").put(rec, id));
       const dirent: DirentRecord = { name, childId: id, kind: rec.kind };
-      await req(tx.objectStore("dirents").put(dirent, this.direntKey(parent, name)));
+      await this.r(tx.objectStore("dirents").put(dirent, this.direntKey(parent, name)));
     });
   }
 }

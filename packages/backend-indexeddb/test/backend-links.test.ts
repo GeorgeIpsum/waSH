@@ -76,6 +76,28 @@ describe("IndexedDBBackend unlink/rename/links", () => {
     await expect(be.rename(root, "d1", root, "f2")).rejects.toMatchObject({ errno: "ENOTDIR" });
   });
 
+  it("mid-op transaction failure surfaces as an error, never a partial retry", async () => {
+    const f = ulid();
+    await be.create(root, "a", f, "file");
+    await be.link!(root, "b", f);
+    await be.flush();
+    // Deterministically kill the txn after unlink's first internal read.
+    const orig = (be as unknown as { getInode: (tx: IDBTransaction, id: string) => Promise<unknown> }).getInode.bind(be);
+    let calls = 0;
+    (be as unknown as { getInode: unknown }).getInode = async (tx: IDBTransaction, id: string) => {
+      const out = await orig(tx, id);
+      if (++calls === 1) tx.abort();
+      return out;
+    };
+    await expect(be.unlink(root, "a")).rejects.toBeTruthy();
+    (be as unknown as { getInode: unknown }).getInode = orig;
+    await expect(be.flush()).rejects.toBeTruthy(); // abort surfaced once, poison cleared
+    // No corruption: the abort rolled the whole batch back; both names intact, nlink untouched.
+    expect((await be.lookup(root, "a"))?.id).toBe(f);
+    expect((await be.lookup(root, "b"))?.id).toBe(f);
+    expect((await be.getattr(f)).nlink).toBe(2);
+  });
+
   it("symlink stores target on the inode; readlink EINVAL on non-symlink", async () => {
     const s = ulid();
     await be.symlink!(root, "ln", s, "/target");
