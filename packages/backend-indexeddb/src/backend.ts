@@ -326,7 +326,98 @@ export class IndexedDBBackend implements WashBackend {
     });
   }
 
-  // Remaining contract ops land in Tasks 4–5.
-  async unlink(): Promise<void> { throw new VfsError("ENOSYS"); }
-  async rename(): Promise<void> { throw new VfsError("ENOSYS"); }
+  private async dirHasChildren(tx: IDBTransaction, id: NodeId): Promise<boolean> {
+    const keys = await req(tx.objectStore("dirents").getAllKeys(this.direntRange(id), 1));
+    return keys.length > 0;
+  }
+
+  private async gcInode(tx: IDBTransaction, id: NodeId, rec: InodeRecord): Promise<void> {
+    rec.nlink -= 1;
+    if (rec.nlink <= 0) {
+      await req(tx.objectStore("inodes").delete(id));
+      await req(tx.objectStore("data").delete(this.chunkRange(id)));
+    } else {
+      await req(tx.objectStore("inodes").put(rec, id));
+    }
+  }
+
+  async unlink(parent: NodeId, name: string): Promise<void> {
+    return this.withTx(async (tx) => {
+      await this.requireDir(tx, parent);
+      const d = (await req(tx.objectStore("dirents").get(this.direntKey(parent, name)))) as DirentRecord | undefined;
+      if (!d) throw new VfsError("ENOENT", name);
+      const child = await this.getInode(tx, d.childId);
+      if (child.kind === "dir") {
+        if (await this.dirHasChildren(tx, d.childId)) throw new VfsError("ENOTEMPTY", name);
+        await req(tx.objectStore("inodes").delete(d.childId));
+      } else {
+        await this.gcInode(tx, d.childId, child);
+      }
+      await req(tx.objectStore("dirents").delete(this.direntKey(parent, name)));
+    });
+  }
+
+  async rename(fromParent: NodeId, fromName: string, toParent: NodeId, toName: string): Promise<void> {
+    return this.withTx(async (tx) => {
+      await this.requireDir(tx, fromParent);
+      await this.requireDir(tx, toParent);
+      const dirents = tx.objectStore("dirents");
+      const moving = (await req(dirents.get(this.direntKey(fromParent, fromName)))) as DirentRecord | undefined;
+      if (!moving) throw new VfsError("ENOENT", fromName);
+      const displaced = (await req(dirents.get(this.direntKey(toParent, toName)))) as DirentRecord | undefined;
+      if (displaced) {
+        if (displaced.childId === moving.childId) return; // POSIX same-inode no-op
+        const exNode = await this.getInode(tx, displaced.childId);
+        const mvNode = await this.getInode(tx, moving.childId);
+        if (exNode.kind === "dir") {
+          if (mvNode.kind !== "dir") throw new VfsError("EISDIR", toName);
+          if (await this.dirHasChildren(tx, displaced.childId)) throw new VfsError("ENOTEMPTY", toName);
+          await req(tx.objectStore("inodes").delete(displaced.childId));
+        } else {
+          if (mvNode.kind === "dir") throw new VfsError("ENOTDIR", toName);
+          await this.gcInode(tx, displaced.childId, exNode);
+        }
+      }
+      await req(dirents.delete(this.direntKey(fromParent, fromName)));
+      const next: DirentRecord = { ...moving, name: toName };
+      await req(dirents.put(next, this.direntKey(toParent, toName)));
+    });
+  }
+
+  async symlink(parent: NodeId, name: string, id: NodeId, target: string): Promise<void> {
+    return this.withTx(async (tx) => {
+      await this.requireDir(tx, parent);
+      const existing = await req(tx.objectStore("dirents").get(this.direntKey(parent, name)));
+      if (existing) throw new VfsError("EEXIST", name);
+      const now = Date.now();
+      const rec: InodeRecord = {
+        kind: "symlink", size: target.length, mode: 0o777, mtimeMs: now, ctimeMs: now, nlink: 1, target,
+      };
+      await req(tx.objectStore("inodes").put(rec, id));
+      const dirent: DirentRecord = { name, childId: id, kind: "symlink" };
+      await req(tx.objectStore("dirents").put(dirent, this.direntKey(parent, name)));
+    });
+  }
+
+  async readlink(id: NodeId): Promise<string> {
+    return this.withTx(async (tx) => {
+      const rec = await this.getInode(tx, id);
+      if (rec.kind !== "symlink" || rec.target === undefined) throw new VfsError("EINVAL");
+      return rec.target;
+    });
+  }
+
+  async link(parent: NodeId, name: string, id: NodeId): Promise<void> {
+    return this.withTx(async (tx) => {
+      await this.requireDir(tx, parent);
+      const existing = await req(tx.objectStore("dirents").get(this.direntKey(parent, name)));
+      if (existing) throw new VfsError("EEXIST", name); // EEXIST before EPERM (contract precedence)
+      const rec = await this.getInode(tx, id);
+      if (rec.kind === "dir") throw new VfsError("EPERM", name);
+      rec.nlink += 1;
+      await req(tx.objectStore("inodes").put(rec, id));
+      const dirent: DirentRecord = { name, childId: id, kind: rec.kind };
+      await req(tx.objectStore("dirents").put(dirent, this.direntKey(parent, name)));
+    });
+  }
 }
