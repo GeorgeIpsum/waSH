@@ -45,4 +45,30 @@ describe("IndexedDBBackend shell", () => {
     await be.flush(); // idempotent
     be.close();
   });
+
+  it("ops spanning a macrotask boundary reuse a fresh txn transparently (withTx retry path)", async () => {
+    const be = await IndexedDBBackend.open(`sh-${ulid()}`);
+    const root = await be.root();
+    await be.setattr(root, { mtimeMs: 111 });
+    await new Promise((r) => setTimeout(r, 0)); // shared txn auto-commits here
+    await be.setattr(root, { ctimeMs: 222 }); // must retry on a fresh txn, not throw
+    const attrs = await be.getattr(root);
+    expect(attrs.mtimeMs).toBe(111);
+    expect(attrs.ctimeMs).toBe(222);
+    be.close();
+  });
+
+  it("an aborted batch poisons ops until flush() reports and clears it", async () => {
+    const be = await IndexedDBBackend.open(`sh-${ulid()}`);
+    const root = await be.root();
+    await be.setattr(root, { mtimeMs: 1 }); // opens the shared txn
+    (be as unknown as { tx: IDBTransaction }).tx.abort(); // simulate quota/forced abort
+    await new Promise((r) => setTimeout(r, 0)); // abort event fires asynchronously
+    await expect(be.setattr(root, { mtimeMs: 2 })).rejects.toBeTruthy(); // poisoned, no suffix txn
+    await expect(be.flush()).rejects.toBeTruthy(); // abort surfaced exactly once
+    await be.setattr(root, { mtimeMs: 3 }); // cleared: fresh txn works
+    await be.flush();
+    expect((await be.getattr(root)).mtimeMs).toBe(3);
+    be.close();
+  });
 });

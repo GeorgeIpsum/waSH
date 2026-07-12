@@ -30,6 +30,7 @@ export class IndexedDBBackend implements WashBackend {
 
   private tx: IDBTransaction | null = null;
   private txCompletion: Promise<void> | null = null;
+  private lastAbort: unknown = null;
 
   private constructor(
     private readonly db: IDBDatabase,
@@ -83,10 +84,15 @@ export class IndexedDBBackend implements WashBackend {
       tx = this.db.transaction(STORE_NAMES as unknown as string[], "readwrite");
     }
     this.tx = tx;
-    const completion = txDone(tx).finally(() => {
-      if (this.tx === tx) this.tx = null;
-      if (this.txCompletion === completion) this.txCompletion = null;
-    });
+    const completion = txDone(tx)
+      .catch((e) => {
+        this.lastAbort = e;
+        throw e;
+      })
+      .finally(() => {
+        if (this.tx === tx) this.tx = null;
+        if (this.txCompletion === completion) this.txCompletion = null;
+      });
     completion.catch(() => {}); // observed via flush(); avoid unhandled rejection
     this.txCompletion = completion;
     return tx;
@@ -100,6 +106,7 @@ export class IndexedDBBackend implements WashBackend {
    * anything but IDB requests (see plan Global Constraints).
    */
   private async withTx<T>(fn: (tx: IDBTransaction) => Promise<T>): Promise<T> {
+    if (this.lastAbort) throw this.lastAbort;
     for (let attempt = 0; ; attempt++) {
       const tx = this.currentTx();
       try {
@@ -115,10 +122,32 @@ export class IndexedDBBackend implements WashBackend {
     }
   }
 
+  /**
+   * Durability point. If the shared batch transaction aborted, flush()
+   * rejects with the abort reason (spec §10: flush failures fail the next
+   * fsync) and clears the poison so the caller can retry.
+   *
+   * Residual gap (accepted, tracked): ops that already resolved into an
+   * aborted batch were dequeued by the write-back layer and are not
+   * replayed — the cache stays ahead of inner until those paths are
+   * rewritten again. Full recovery needs journal-until-flush-confirmed in
+   * CachedBackend, tracked alongside the fsync-strict contract work
+   * (pre-Plan-4).
+   */
   async flush(): Promise<void> {
     const completion = this.txCompletion;
     this.tx = null; // stop reusing; the pending txn auto-commits
-    if (completion) await completion;
+    try {
+      if (completion) await completion;
+    } catch (e) {
+      this.lastAbort = null;
+      throw e;
+    }
+    if (this.lastAbort) {
+      const e = this.lastAbort;
+      this.lastAbort = null;
+      throw e;
+    }
   }
 
   private async getInode(tx: IDBTransaction, id: NodeId): Promise<InodeRecord> {
