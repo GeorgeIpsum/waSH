@@ -82,10 +82,13 @@ describe("IndexedDBBackend unlink/rename/links", () => {
     await be.link!(root, "b", f);
     await be.flush();
     // Deterministically kill the txn after unlink's first internal read.
-    const orig = (be as unknown as { getInode: (tx: IDBTransaction, id: string) => Promise<unknown> }).getInode.bind(be);
+    type ReqFn = <T>(request: IDBRequest<T>) => Promise<T>;
+    const orig = (
+      be as unknown as { getInode: (tx: IDBTransaction, r: ReqFn, id: string) => Promise<unknown> }
+    ).getInode.bind(be);
     let calls = 0;
-    (be as unknown as { getInode: unknown }).getInode = async (tx: IDBTransaction, id: string) => {
-      const out = await orig(tx, id);
+    (be as unknown as { getInode: unknown }).getInode = async (tx: IDBTransaction, r: ReqFn, id: string) => {
+      const out = await orig(tx, r, id);
       if (++calls === 1) tx.abort();
       return out;
     };
