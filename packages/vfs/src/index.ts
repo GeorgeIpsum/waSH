@@ -5,4 +5,6 @@ export { ulid } from "./ulid.js";
 export { MemoryBackend } from "./backend/memory.js";
 export { CachedBackend } from "./cache/cached-backend.js";
 export { Vfs } from "./core/vfs.js";
-export { normalize, split } from "./core/path.js";
+export type { ResolvedNode } from "./core/vfs.js";
+export type { OpenFlag } from "./core/fd.js";
+export { normalize, split, join } from "./core/path.js";

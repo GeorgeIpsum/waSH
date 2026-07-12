@@ -3,11 +3,30 @@ import { VfsError } from "../errors.js";
 import { normalize, split } from "./path.js";
 import { ulid } from "../ulid.js";
 import type { Dirent } from "../types.js";
+import { CHUNK_SIZE } from "../types.js";
 import { FdTable, canRead, canWrite, isAppend, type OpenFlag } from "./fd.js";
 
 const MAX_SYMLINK_HOPS = 40;
 
-interface Mount { path: string; backend: WashBackend; rootId: NodeId; }
+interface Mount { path: string; backend: WashBackend; rootId: NodeId; release?: () => void; }
+
+interface LockManagerLike {
+  request(name: string, opts: { ifAvailable: boolean }, cb: (lock: unknown) => Promise<unknown>): Promise<unknown>;
+}
+
+function acquireLock(locks: LockManagerLike, name: string): Promise<(() => void) | undefined> {
+  return new Promise((resolveAcq) => {
+    void locks.request(name, { ifAvailable: true }, (lock) => {
+      if (!lock) {
+        resolveAcq(undefined);
+        return Promise.resolve();
+      }
+      return new Promise<void>((releaseLock) => {
+        resolveAcq(() => releaseLock());
+      });
+    });
+  });
+}
 
 export interface ResolvedNode {
   backend: WashBackend;
@@ -23,12 +42,18 @@ export class Vfs {
   private mounts: Mount[] = []; // sorted longest path first
   private fds = new FdTable();
 
-  async mount(path: string, backend: WashBackend): Promise<void> {
+  async mount(path: string, backend: WashBackend, opts: { exclusive?: boolean } = {}): Promise<void> {
     const p = normalize(path);
     if (this.mounts.length === 0 && p !== "/") throw new VfsError("EINVAL", "first mount must be /");
     if (this.mounts.some((m) => m.path === p)) throw new VfsError("EEXIST", p);
     if (p !== "/") await this.resolve(p); // mountpoint must exist on parent mount
-    this.mounts.push({ path: p, backend, rootId: await backend.root() });
+    let release: (() => void) | undefined;
+    const locks = (globalThis as { navigator?: { locks?: LockManagerLike } }).navigator?.locks;
+    if (opts.exclusive && locks) {
+      release = await acquireLock(locks, `wash-mount:${p}`);
+      if (!release) throw new VfsError("EPERM", p);
+    }
+    this.mounts.push({ path: p, backend, rootId: await backend.root(), release });
     this.mounts.sort((a, b) => b.path.length - a.path.length);
   }
 
@@ -289,5 +314,56 @@ export class Vfs {
     const r = await this.resolve(path);
     if (r.attrs.kind === "dir") throw new VfsError("EISDIR", path);
     await r.backend.truncate(r.id, size);
+  }
+
+  async createReadStream(path: string): Promise<ReadableStream<Uint8Array>> {
+    const fd = await this.open(path, "r");
+    const self = this;
+    return new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const chunk = await self.read(fd, CHUNK_SIZE);
+        if (chunk.byteLength === 0) {
+          controller.close();
+          await self.close(fd);
+        } else {
+          controller.enqueue(chunk);
+        }
+      },
+      async cancel() {
+        await self.close(fd);
+      },
+    });
+  }
+
+  async createWriteStream(path: string, opts: { append?: boolean } = {}): Promise<WritableStream<Uint8Array>> {
+    const fd = await this.open(path, opts.append ? "a" : "w");
+    const self = this;
+    return new WritableStream<Uint8Array>({
+      async write(chunk) {
+        await self.write(fd, chunk);
+      },
+      async close() {
+        await self.close(fd);
+      },
+      async abort() {
+        await self.close(fd);
+      },
+    });
+  }
+
+  async fsync(): Promise<void> {
+    for (const m of [...this.mounts].sort((a, b) => a.path.length - b.path.length)) {
+      await m.backend.flush();
+    }
+  }
+
+  async unmount(path: string): Promise<void> {
+    const p = normalize(path);
+    if (p === "/") throw new VfsError("EINVAL", p);
+    const i = this.mounts.findIndex((m) => m.path === p);
+    if (i < 0) throw new VfsError("ENOENT", p);
+    await this.mounts[i]!.backend.flush();
+    this.mounts[i]!.release?.();
+    this.mounts.splice(i, 1);
   }
 }
