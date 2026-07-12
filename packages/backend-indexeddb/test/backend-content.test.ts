@@ -62,4 +62,15 @@ describe("IndexedDBBackend content (small chunkSize to exercise boundaries)", ()
     await expect(be.read(root, 0, 1)).rejects.toMatchObject({ errno: "EISDIR" });
     await expect(be.write(root, 0, enc.encode("x"))).rejects.toMatchObject({ errno: "EISDIR" });
   });
+
+  it("zero-length writes are POSIX no-ops (size, mtime, content untouched)", async () => {
+    await be.write(file, 0, enc.encode("abc"));
+    const before = await be.getattr(file);
+    await be.write(file, 100, new Uint8Array(0));
+    const after = await be.getattr(file);
+    expect(after.size).toBe(3);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+    expect((await be.read(file, 0, 10)).byteLength).toBe(3);
+    await expect(be.write(root, 0, new Uint8Array(0))).rejects.toMatchObject({ errno: "EISDIR" });
+  });
 });
