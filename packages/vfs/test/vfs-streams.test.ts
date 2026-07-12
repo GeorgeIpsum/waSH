@@ -102,9 +102,10 @@ describe("Vfs streams + fsync + unmount", () => {
     }
     await vfs.mkdir("/a");
     await vfs.mkdir("/b");
-    // fast unmount removes the earlier-indexed mount so a stale captured index in the slow one would shift
-    await vfs.mount("/b", new SlowFlush());
-    await vfs.mount("/a", new MemoryBackend());
+    await vfs.mount("/a", new MemoryBackend()); // fast, mounted first → lower index
+    await vfs.mount("/b", new SlowFlush()); // slow, mounted second → higher index
+    // Slow unmount suspends at flush; fast unmount completes first. Under the
+    // old stale-index code the slow one would then splice the wrong entry ("/").
     const pending = vfs.unmount("/b");
     await vfs.unmount("/a");
     release();
