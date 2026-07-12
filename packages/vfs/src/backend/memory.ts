@@ -159,5 +159,32 @@ export class MemoryBackend implements WashBackend {
     tp.children.set(toName, moving);
   }
 
+  async symlink(parent: NodeId, name: string, id: NodeId, target: string): Promise<void> {
+    const p = this.dir(parent);
+    if (p.children.has(name)) throw new VfsError("EEXIST", name);
+    this.nodes.set(id, {
+      attrs: mkAttrs("symlink", { size: target.length }),
+      data: new Uint8Array(0),
+      children: null,
+      target,
+    });
+    p.children.set(name, { childId: id, kind: "symlink" });
+  }
+
+  async readlink(id: NodeId): Promise<string> {
+    const n = this.node(id);
+    if (n.attrs.kind !== "symlink" || n.target === null) throw new VfsError("EINVAL");
+    return n.target;
+  }
+
+  async link(parent: NodeId, name: string, id: NodeId): Promise<void> {
+    const p = this.dir(parent);
+    if (p.children.has(name)) throw new VfsError("EEXIST", name);
+    const n = this.node(id);
+    if (n.attrs.kind === "dir") throw new VfsError("EPERM", name);
+    n.attrs.nlink += 1;
+    p.children.set(name, { childId: id, kind: n.attrs.kind });
+  }
+
   async flush(): Promise<void> {}
 }
