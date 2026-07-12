@@ -136,6 +136,11 @@ export class IndexedDBBackend implements WashBackend {
           (errName === "TransactionInactiveError" || errName === "InvalidStateError");
         if (staleHandle) {
           if (this.tx === tx) this.tx = null;
+          // The old txn may be mid-abort: its abort event (which records
+          // lastAbort) dispatches asynchronously. Settle the old generation
+          // before retrying so the loop-top poison check can't be raced.
+          const completion = this.txCompletion;
+          if (completion) await completion.catch(() => {});
           continue;
         }
         throw e;

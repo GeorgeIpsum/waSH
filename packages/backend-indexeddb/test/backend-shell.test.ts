@@ -63,10 +63,24 @@ describe("IndexedDBBackend shell", () => {
     const root = await be.root();
     await be.setattr(root, { mtimeMs: 1 }); // opens the shared txn
     (be as unknown as { tx: IDBTransaction }).tx.abort(); // simulate quota/forced abort
-    await new Promise((r) => setTimeout(r, 0)); // abort event fires asynchronously
+    await new Promise((r) => setImmediate(r)); // abort event fires asynchronously (matches fake-indexeddb's dispatch)
     await expect(be.setattr(root, { mtimeMs: 2 })).rejects.toBeTruthy(); // poisoned, no suffix txn
     await expect(be.flush()).rejects.toBeTruthy(); // abort surfaced exactly once
     await be.setattr(root, { mtimeMs: 3 }); // cleared: fresh txn works
+    await be.flush();
+    expect((await be.getattr(root)).mtimeMs).toBe(3);
+    be.close();
+  });
+
+  it("an abort is never masked by the stale-handle retry (no-wait race)", async () => {
+    const be = await IndexedDBBackend.open(`sh-${ulid()}`);
+    const root = await be.root();
+    await be.setattr(root, { mtimeMs: 1 });
+    (be as unknown as { tx: IDBTransaction }).tx.abort();
+    // No wait here — this races the abort event on purpose.
+    await expect(be.setattr(root, { mtimeMs: 2 })).rejects.toBeTruthy();
+    await expect(be.flush()).rejects.toBeTruthy();
+    await be.setattr(root, { mtimeMs: 3 });
     await be.flush();
     expect((await be.getattr(root)).mtimeMs).toBe(3);
     be.close();
