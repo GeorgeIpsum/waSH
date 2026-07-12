@@ -371,9 +371,8 @@ export class Vfs {
     if (!m) throw new VfsError("ENOENT", p);
     await m.backend.flush();
     const i = this.mounts.indexOf(m);
-    if (i >= 0) {
-      this.mounts.splice(i, 1);
-      m.release?.();
-    }
+    if (i < 0) throw new VfsError("ENOENT", p);
+    this.mounts.splice(i, 1);
+    m.release?.();
   }
 }

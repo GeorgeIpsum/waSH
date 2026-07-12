@@ -102,15 +102,29 @@ describe("Vfs streams + fsync + unmount", () => {
     }
     await vfs.mkdir("/a");
     await vfs.mkdir("/b");
-    await vfs.mount("/a", new SlowFlush());
-    await vfs.mount("/b", new MemoryBackend());
-    const pending = vfs.unmount("/a");
-    await vfs.unmount("/b");
+    // fast unmount removes the earlier-indexed mount so a stale captured index in the slow one would shift
+    await vfs.mount("/b", new SlowFlush());
+    await vfs.mount("/a", new MemoryBackend());
+    const pending = vfs.unmount("/b");
+    await vfs.unmount("/a");
     release();
     await pending;
     expect((await vfs.stat("/")).kind).toBe("dir");
     await expect(vfs.unmount("/a")).rejects.toMatchObject({ errno: "ENOENT" });
     await expect(vfs.unmount("/b")).rejects.toMatchObject({ errno: "ENOENT" });
+  });
+
+  it("concurrent same-path unmounts: exactly one wins, loser gets ENOENT", async () => {
+    await vfs.mkdir("/mnt");
+    await vfs.mount("/mnt", new MemoryBackend());
+    const results = await Promise.allSettled([vfs.unmount("/mnt"), vfs.unmount("/mnt")]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter(
+      (r): r is PromiseRejectedResult => r.status === "rejected",
+    );
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]!.reason).toMatchObject({ errno: "ENOENT" });
   });
 
   it("mount releases the lock when backend.root() fails after acquisition", async () => {
