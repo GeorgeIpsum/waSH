@@ -1,5 +1,5 @@
 import type {
-  Attrs, BackendCaps, Dirent, NodeId, NodeInfo, NodeKind, WashBackend,
+  Attrs, BackendCaps, BackendDump, Dirent, NodeId, NodeInfo, NodeKind, WashBackend,
 } from "@wash/vfs";
 import { CHUNK_SIZE, VfsError, ulid } from "@wash/vfs";
 import { STORE_NAMES, SCHEMA_VERSION, openDb, req, txDone } from "./idb.js";
@@ -246,6 +246,32 @@ export class IndexedDBBackend implements WashBackend {
         out.push({ name: v.name, childId: v.childId, kind: v.kind, attrs: this.stripTarget(await this.getInode(tx, v.childId)) });
       }
       return out;
+    });
+  }
+
+  /**
+   * Bulk namespace export for mount-time cache warming (spec §5): two
+   * `getAll` + two `getAllKeys` reads, all issued synchronously (pipelined
+   * in one shared txn) before any of them is awaited.
+   */
+  async dump(): Promise<BackendDump> {
+    return this.withTx(async (tx) => {
+      const inodeStore = tx.objectStore("inodes");
+      const direntStore = tx.objectStore("dirents");
+      const inodeKeysReq = this.r(inodeStore.getAllKeys());
+      const inodeValsReq = this.r(inodeStore.getAll());
+      const direntKeysReq = this.r(direntStore.getAllKeys());
+      const direntValsReq = this.r(direntStore.getAll());
+      const inodeKeys = (await inodeKeysReq) as NodeId[];
+      const inodeVals = (await inodeValsReq) as InodeRecord[];
+      const direntKeys = (await direntKeysReq) as [NodeId, string][];
+      const direntVals = (await direntValsReq) as DirentRecord[];
+      return {
+        inodes: inodeKeys.map((id, i) => ({ id, attrs: this.stripTarget(inodeVals[i]!) })),
+        dirents: direntKeys.map((k, i) => ({
+          parentId: k[0], name: k[1], childId: direntVals[i]!.childId, kind: direntVals[i]!.kind,
+        })),
+      };
     });
   }
 

@@ -24,6 +24,12 @@ export interface NodeInfo {
   attrs: Attrs;
 }
 
+/** Bulk namespace export for mount-time cache warming (spec §5). */
+export interface BackendDump {
+  inodes: { id: NodeId; attrs: Attrs }[];
+  dirents: { parentId: NodeId; name: string; childId: NodeId; kind: NodeKind }[];
+}
+
 export interface BackendCaps {
   symlinks: "supported" | "none";
   hardlinks: boolean;
@@ -61,4 +67,6 @@ export interface WashBackend {
   readlink?(id: NodeId): Promise<string>;
   link?(parent: NodeId, name: string, id: NodeId): Promise<void>;
   flush(): Promise<void>;
+  /** Optional bulk namespace export for mount-time cache warming (spec §5). */
+  dump?(): Promise<BackendDump>;
 }
