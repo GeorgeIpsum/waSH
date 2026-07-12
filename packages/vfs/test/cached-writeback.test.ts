@@ -90,17 +90,74 @@ describe("CachedBackend write-back", () => {
 
   it("concurrent flush callers never interleave op replay", async () => {
     const inner = new MemoryBackend();
-    const slow = delayedBackend(inner, 20);
+    let flushDelay = 0;
+    const slow = new Proxy(inner, {
+      get(target, prop, receiver) {
+        const v = Reflect.get(target, prop, receiver);
+        if (prop === "flush") {
+          return async () => {
+            await new Promise<void>((r) => setTimeout(r, flushDelay));
+            return (v as () => Promise<void>).call(target);
+          };
+        }
+        if (prop === "create" || prop === "rename") {
+          return async (...args: unknown[]) => {
+            await new Promise<void>((r) => setTimeout(r, 10));
+            return (v as (...a: unknown[]) => Promise<unknown>).apply(target, args);
+          };
+        }
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as unknown as WashBackend;
     const wb = new CachedBackend(slow, { flushDelayMs: 60_000 });
     const root = await wb.root();
+    // pre-warm the NEG entries so create+rename queue as pure cache hits (no drain)
+    expect(await wb.lookup(root, "a.txt")).toBeNull();
+    expect(await wb.lookup(root, "b.txt")).toBeNull();
+    // get a slow cycle in flight first
+    flushDelay = 30;
+    const inflight = wb.flush();
+    // enqueue two order-dependent ops while that cycle is running
     const f = ulid();
     await wb.create(root, "a.txt", f, "file");
     await wb.rename(root, "a.txt", root, "b.txt");
-    const results = await Promise.allSettled([wb.flush(), wb.flush(), wb.flush()]);
+    // concurrent flush waiters must serialize behind the in-flight cycle
+    const results = await Promise.allSettled([inflight, wb.flush(), wb.flush()]);
     expect(results.every((r) => r.status === "fulfilled")).toBe(true);
     expect(wb.pendingOps()).toBe(0);
     expect(await inner.lookup(root, "b.txt")).not.toBeNull();
     expect(await inner.lookup(root, "a.txt")).toBeNull();
+  });
+
+  it("file content survives a transient truncate failure and lands on retry", async () => {
+    const inner = new MemoryBackend();
+    let failOnce = true;
+    const flaky = new Proxy(inner, {
+      get(target, prop, receiver) {
+        const v = Reflect.get(target, prop, receiver);
+        if (prop === "truncate") {
+          return async (...args: unknown[]) => {
+            if (failOnce) {
+              failOnce = false;
+              throw new Error("transient truncate failure");
+            }
+            return (v as (...a: unknown[]) => Promise<unknown>).apply(target, args);
+          };
+        }
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as unknown as WashBackend;
+    const wb = new CachedBackend(flaky, { flushDelayMs: 60_000 });
+    const root = await wb.root();
+    const f = ulid();
+    await wb.create(root, "f", f, "file");
+    await wb.flush(); // create lands so only the content op remains in later flushes
+    await wb.write(f, 0, enc.encode("precious data"));
+    await expect(wb.flush()).rejects.toThrow("transient truncate failure");
+    // buffer must still be present: reads keep serving dirty content
+    expect(dec.decode(await wb.read(f, 0, 100))).toBe("precious data");
+    await wb.flush(); // retry
+    expect(dec.decode(await inner.read(f, 0, 100))).toBe("precious data");
   });
 
   it("a rejecting op stays at the queue head and retries in order", async () => {

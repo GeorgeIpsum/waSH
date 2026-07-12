@@ -334,9 +334,15 @@ export class CachedBackend implements WashBackend {
     this.enqueue(async () => {
       const buf = this.dirtyData.get(id);
       if (!buf) return; // evicted (unlinked) or already flushed before this op ran
-      this.dirtyData.delete(id);
+      // Only delete the buffer after the inner ops succeed. A rejection here
+      // must leave dirtyData intact — the queue's failed-op-at-head retry
+      // policy re-runs this same closure, and reads must keep serving the
+      // dirty buffer (not stale inner content) until that retry lands. The
+      // identity check guards against a concurrent re-dirty (write/truncate
+      // always installs a fresh Uint8Array) clobbering the newer buffer.
       await this.inner.truncate(id, buf.byteLength);
       if (buf.byteLength > 0) await this.inner.write(id, 0, buf);
+      if (this.dirtyData.get(id) === buf) this.dirtyData.delete(id);
     });
   }
 
