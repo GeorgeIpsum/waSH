@@ -229,4 +229,36 @@ describe("CachedBackend write-back", () => {
       vi.useRealTimers();
     }
   });
+
+  it("re-dirtying a file mid-flush still converges to durability", async () => {
+    const inner = new MemoryBackend();
+    const slow = new Proxy(inner, {
+      get(target, prop, receiver) {
+        const v = Reflect.get(target, prop, receiver);
+        if (prop === "truncate" || prop === "write") {
+          return async (...args: unknown[]) => {
+            await new Promise<void>((r) => setTimeout(r, 15));
+            return (v as (...a: unknown[]) => Promise<unknown>).apply(target, args);
+          };
+        }
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as unknown as WashBackend;
+    const wb = new CachedBackend(slow, { flushDelayMs: 60_000 });
+    const root = await wb.root();
+    const f = ulid();
+    await wb.create(root, "f", f, "file");
+    await wb.write(f, 0, enc.encode("version A"));
+    const inflight = wb.flush();
+    await new Promise<void>((r) => setTimeout(r, 5)); // land mid-await of the content op
+    await wb.write(f, 0, enc.encode("version B"));
+    await inflight;
+    await wb.flush();
+    expect(wb.pendingOps()).toBe(0);
+    expect(dec.decode(await inner.read(f, 0, 100))).toBe("version B");
+    // and later writes must still flush (the gate must not be stuck closed)
+    await wb.write(f, 0, enc.encode("version C"));
+    await wb.flush();
+    expect(dec.decode(await inner.read(f, 0, 100))).toBe("version C");
+  });
 });

@@ -331,6 +331,19 @@ export class CachedBackend implements WashBackend {
   /** Queues the single write-back op for `id`'s content, once per dirty session. */
   private queueContentFlush(id: NodeId): void {
     if (this.dirtyData.has(id)) return; // already queued; the op re-reads dirtyData lazily at flush time
+    this.enqueueContentOp(id);
+  }
+
+  /**
+   * The actual content-flush op. Split out from `queueContentFlush` so a
+   * write/truncate that re-dirties `id` while this op's inner calls are still
+   * in flight can re-enqueue itself once the identity check below detects the
+   * newer buffer — otherwise `queueContentFlush`'s "buffer present ⟹ op
+   * pending" gate would stay closed forever (the buffer is only deleted
+   * *after* inner succeeds), permanently stranding the newer content
+   * unflushed even though `pendingOps()` reports zero.
+   */
+  private enqueueContentOp(id: NodeId): void {
     this.enqueue(async () => {
       const buf = this.dirtyData.get(id);
       if (!buf) return; // evicted (unlinked) or already flushed before this op ran
@@ -343,6 +356,7 @@ export class CachedBackend implements WashBackend {
       await this.inner.truncate(id, buf.byteLength);
       if (buf.byteLength > 0) await this.inner.write(id, 0, buf);
       if (this.dirtyData.get(id) === buf) this.dirtyData.delete(id);
+      else this.enqueueContentOp(id); // re-dirtied mid-flush: newer buffer needs its own op
     });
   }
 
