@@ -114,8 +114,9 @@ commands/engine → POSIX-ish async façade (open/read/write/stat/readdir/mkdir/
 
 ```ts
 interface WashBackend {
-  readonly caps: BackendCaps;   // symlinks (native|emulated|none), hardlinks,
-                                // atomicDirRename, durability model, maxFileSize…
+  readonly caps: BackendCaps;   // symlinks (supported|none — may be backend-emulated),
+                                // hardlinks, atomicDirRename, renameCost ("O1"|"subtree"),
+                                // reservedNames, durability model, maxFileSize…
   root(): Promise<NodeId>;
   lookup(parent: NodeId, name: string): Promise<NodeInfo | null>;
   getattr(id: NodeId): Promise<Attrs>;          // kind, size, mode, mtime, ctime, nlink
@@ -128,7 +129,8 @@ interface WashBackend {
          attrs: Partial<Attrs>): Promise<void>;            // id minted by VFS core (ULID)
   unlink(parent: NodeId, name: string): Promise<void>;
   rename(fromParent: NodeId, fromName: string,
-         toParent: NodeId, toName: string): Promise<void>; // O(1) by contract
+         toParent: NodeId, toName: string): Promise<void>; // O(1) for id-addressed
+                                // backends; cost declared via caps.renameCost
   setattr(id: NodeId, attrs: Partial<Attrs>): Promise<void>;
   readlink?/symlink?/link?                                  // per caps
   flush(): Promise<void>;                                   // durability point
@@ -138,7 +140,9 @@ interface WashBackend {
 Key decisions:
 
 - **Id-addressed, single-step ops.** Path walking + caching live in the core, written
-  once for all backends. Rename is O(1) regardless of subtree size.
+  once for all backends. Rename is O(1) for id-addressed backends and never *silently*
+  degraded: backends declare `renameCost: "O1" | "subtree"` and `atomicDirRename` in
+  caps (OPFS's documented directory-rename fallback in §6 is the `"subtree"` case).
 - **NodeIds are ULIDs minted by the VFS core** and passed into `create` — namespace
   ops are write-back cacheable without a backend round trip to allocate ids.
   Contract requirement: ids stable for the lifetime of a mount (not across sessions).
@@ -147,9 +151,20 @@ Key decisions:
   barriers so a crash never exposes inconsistent states. `fsync`/`sync` force flush.
   Accepted risk: a tab crash loses the last few seconds of writes.
 - **Capabilities, not lowest-common-denominator**: unsupported ops fail with clear
-  errnos (`EPERM`) per mount; symlinks are core-emulated when a backend lacks them.
+  errnos (`EPERM`) per mount; when a platform lacks symlinks natively the *backend*
+  emulates them behind the optional `symlink`/`readlink` hooks (see §6's sidecar) —
+  the v1 contract deliberately has no core-side emulation, so `caps.symlinks` is
+  `"supported" | "none"`.
 - **Metadata model**: single-user Unix-ish. Mode bits real (x-bit gates PATH lookup
-  and `./script`), size, mtime/ctime, nlink. No uid/gid in v1.
+  and `./script`), size, mtime/ctime, nlink. No uid/gid in v1 — everything runs as
+  uid 0, so read/write mode bits are stored but not enforced (root semantics); the
+  x-bit is enforced by the engine (Plan 4).
+- **Known v1 gap (must resolve before the engine ships, Plan 4)**: open fds do not
+  keep unlinked files alive — `fd=open(f); unlink(f); read(fd)` fails, breaking the
+  POSIX `exec 3<f; rm f` / anonymous-tempfile patterns. Candidate fixes, decided in
+  the implementing plan: (a) VFS-level anonymous overlay pinning content for open
+  unlinked nodes (no contract change), or (b) optional `retain(id)`/`release(id)`
+  backend hooks for lazy GC.
 - **Concurrency (v1)**: one session owns a writable mount, enforced with Web Locks;
   second tab gets read-only or a clear error. Cross-tab sharing out of scope for v1.
 - Ships the **in-memory reference backend** + a reusable backend conformance suite
@@ -183,6 +198,11 @@ meta      key: string               val: fs metadata, schema version
 | delete file | delete inode + `delete(bound([id,0],[id,∞]))` | range delete |
 | flush | entire dirty batch in **one readwrite transaction** | commit cost (~ms) amortized over hundreds of ops |
 
+Note: the *delete file* row is the inode-GC step, reached only when `nlink` hits 0.
+`unlink` itself deletes one dirent and decrements `nlink` — hardlinked content
+survives until its last name is gone (constrained by the conformance suite's
+nlink-lifecycle case).
+
 ### Performance levers (in impact order)
 
 1. **One transaction per flush batch**; background flushes use
@@ -214,9 +234,17 @@ OPFS is hierarchical already; three real decisions:
 3. **Sidecars, not lies**: per-directory hidden `.wash-attrs` entry (JSON: name →
    {mode, symlink target}, deviations-from-default only) provides mode bits and
    emulated symlinks; hardlinks declared unsupported; mtime free via
-   `File.lastModified`. **Directory rename**: OPFS `move()` is file-only today →
-   recursive copy+delete fallback, non-atomic, `caps.atomicDirRename = false`,
-   documented loudly (IDB backend is O(1) here — honest docs data point).
+   `File.lastModified`. The sidecar lives *inside* its directory deliberately — it
+   moves with the directory on rename for free. **Reserved-name policy**: the
+   sidecar name is declared in `caps.reservedNames`; the backend hides reserved
+   names from `readdir`/`lookup` and rejects user `create`/`unlink`/`rename`
+   targeting them with `EPERM`; documented plainly (precedent: `.git`), and the
+   conformance suite exercises reserved-name behavior gated on the cap.
+   **Directory rename**: OPFS `move()` is file-only today → recursive copy+delete
+   fallback, non-atomic, `caps.atomicDirRename = false`, `caps.renameCost =
+   "subtree"`, documented loudly (IDB backend is O(1) here — honest docs data
+   point). During the copy the backend rebinds each descendant's existing NodeId
+   to its new handle, so caller-visible ids remain stable per the contract.
 
 `flush()` = `handle.flush()` on dirty handles; write-back cache mainly coalesces.
 
