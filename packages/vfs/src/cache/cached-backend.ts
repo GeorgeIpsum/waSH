@@ -93,23 +93,53 @@ export class CachedBackend implements WashBackend {
     return run;
   }
 
+  // Namespace mutation mutex: `create`/`unlink`/`rename`/`symlink`/`link`
+  // each validate against the cache then mutate it across multiple awaits
+  // (lookup → readdir prime → primeEntry/enqueue). Without serialization two
+  // concurrent same-name mutations can both pass validation before either
+  // mutates the cache, corrupting namespace state and poisoning the flush
+  // queue with an op the backend will reject. A single backend-wide mutex
+  // (not per-name) is intentionally coarse: namespace ops are rare relative
+  // to content ops, and the two lock families never nest, so no deadlock.
+  private nsMutex: Promise<unknown> = Promise.resolve();
+
+  private withNsLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.nsMutex.then(fn, fn);
+    this.nsMutex = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /** Reserved names (spec §caps.reservedNames) are rejected synchronously, before any cache mutation or enqueue. */
+  private checkReserved(name: string, ...more: string[]): void {
+    const reserved = this.inner.caps.reservedNames;
+    if (!reserved?.length) return;
+    for (const n of [name, ...more]) {
+      if (reserved.includes(n)) throw new VfsError("EPERM", n);
+    }
+  }
+
   /** Invoked (fire-and-forget) when an auto-triggered flush rejects. */
   onFlushError?: (err: unknown) => void;
 
   // Optional per WashBackend — only present on the instance when `inner` has them
   // (conditional assignment in the constructor below).
-  symlink?: (parent: NodeId, name: string, id: NodeId, target: string) => Promise<void> = async (
+  symlink?: (parent: NodeId, name: string, id: NodeId, target: string) => Promise<void> = (
     parent,
     name,
     id,
     target,
-  ): Promise<void> => {
-    if (!this.inner.symlink) throw new Error("unsupported");
-    if ((await this.lookup(parent, name)) !== null) throw new VfsError("EEXIST", name);
-    await this.readdir(parent); // ensure parent dir cache is primed (drains if cold)
-    this.primeEntry(parent, name, id, "symlink", mkAttrs("symlink", { size: target.length }));
-    this.enqueue(() => this.inner.symlink!(parent, name, id, target));
-  };
+  ): Promise<void> =>
+    this.withNsLock(async () => {
+      if (!this.inner.symlink) throw new Error("unsupported");
+      this.checkReserved(name);
+      if ((await this.lookup(parent, name)) !== null) throw new VfsError("EEXIST", name);
+      await this.readdir(parent); // ensure parent dir cache is primed (drains if cold)
+      this.primeEntry(parent, name, id, "symlink", mkAttrs("symlink", { size: target.length }));
+      this.enqueue(() => this.inner.symlink!(parent, name, id, target));
+    });
 
   readlink?: (id: NodeId) => Promise<string> = async (id): Promise<string> => {
     if (!this.inner.readlink) throw new Error("unsupported");
@@ -117,20 +147,22 @@ export class CachedBackend implements WashBackend {
     return this.inner.readlink(id);
   };
 
-  link?: (parent: NodeId, name: string, id: NodeId) => Promise<void> = async (parent, name, id): Promise<void> => {
-    if (!this.inner.link) throw new Error("unsupported");
-    const attrs = await this.getattr(id); // ENOENT if unknown; ensures attrCache is populated
-    if ((await this.lookup(parent, name)) !== null) throw new VfsError("EEXIST", name);
-    if (attrs.kind === "dir") throw new VfsError("EPERM", name);
-    // Never replace the attrCache entry: mutate it in place so every other
-    // name aliasing this node (existing hardlinks) observes the same nlink
-    // bump instead of going stale. getattr() above guarantees this is set.
-    const cached = this.attrCache.get(id)!;
-    cached.nlink += 1;
-    this.lookupCache.set(this.key(parent, name), { id, kind: cached.kind });
-    this.readdirCache.get(parent)?.set(name, { name, childId: id, kind: cached.kind });
-    this.enqueue(() => this.inner.link!(parent, name, id));
-  };
+  link?: (parent: NodeId, name: string, id: NodeId) => Promise<void> = (parent, name, id): Promise<void> =>
+    this.withNsLock(async () => {
+      if (!this.inner.link) throw new Error("unsupported");
+      this.checkReserved(name);
+      const attrs = await this.getattr(id); // ENOENT if unknown; ensures attrCache is populated
+      if ((await this.lookup(parent, name)) !== null) throw new VfsError("EEXIST", name);
+      if (attrs.kind === "dir") throw new VfsError("EPERM", name);
+      // Never replace the attrCache entry: mutate it in place so every other
+      // name aliasing this node (existing hardlinks) observes the same nlink
+      // bump instead of going stale. getattr() above guarantees this is set.
+      const cached = this.attrCache.get(id)!;
+      cached.nlink += 1;
+      this.lookupCache.set(this.key(parent, name), { id, kind: cached.kind });
+      this.readdirCache.get(parent)?.set(name, { name, childId: id, kind: cached.kind });
+      this.enqueue(() => this.inner.link!(parent, name, id));
+    });
 
   constructor(protected inner: WashBackend, protected opts: { flushDelayMs?: number } = {}) {
     this.caps = inner.caps;
@@ -278,59 +310,68 @@ export class CachedBackend implements WashBackend {
   }
 
   async create(parent: NodeId, name: string, id: NodeId, kind: NodeKind, attrs?: Partial<Attrs>): Promise<void> {
-    if ((await this.lookup(parent, name)) !== null) throw new VfsError("EEXIST", name);
-    // Prime the parent's readdir cache (drains + reads inner if cold) BEFORE
-    // registering the new entry below — otherwise a subsequent readdir(parent)
-    // on a still-cold cache would go to `inner`, which doesn't have this
-    // entry yet (it's only enqueued, not flushed).
-    await this.readdir(parent);
-    // Snapshot the caller-supplied `attrs` now: both the cache prime below
-    // and the enqueued closure must see the object as it was at call time,
-    // not whatever the caller mutates it to before the op is flushed.
-    const attrsSnapshot = attrs ? { ...attrs } : undefined;
-    this.primeEntry(parent, name, id, kind, mkAttrs(kind, attrsSnapshot));
-    if (kind === "dir") this.readdirCache.set(id, new Map());
-    this.enqueue(() => this.inner.create(parent, name, id, kind, attrsSnapshot));
+    return this.withNsLock(async () => {
+      this.checkReserved(name);
+      if ((await this.lookup(parent, name)) !== null) throw new VfsError("EEXIST", name);
+      // Prime the parent's readdir cache (drains + reads inner if cold) BEFORE
+      // registering the new entry below — otherwise a subsequent readdir(parent)
+      // on a still-cold cache would go to `inner`, which doesn't have this
+      // entry yet (it's only enqueued, not flushed).
+      await this.readdir(parent);
+      // Snapshot the caller-supplied `attrs` now: both the cache prime below
+      // and the enqueued closure must see the object as it was at call time,
+      // not whatever the caller mutates it to before the op is flushed.
+      const attrsSnapshot = attrs ? { ...attrs } : undefined;
+      this.primeEntry(parent, name, id, kind, mkAttrs(kind, attrsSnapshot));
+      if (kind === "dir") this.readdirCache.set(id, new Map());
+      this.enqueue(() => this.inner.create(parent, name, id, kind, attrsSnapshot));
+    });
   }
 
   async unlink(parent: NodeId, name: string): Promise<void> {
-    const victim = await this.lookup(parent, name);
-    if (!victim) throw new VfsError("ENOENT", name);
-    if (victim.attrs.kind === "dir") {
-      const kids = await this.readdir(victim.id);
-      if (kids.length > 0) throw new VfsError("ENOTEMPTY", name);
-    }
-    this.lookupCache.set(this.key(parent, name), NEG);
-    this.readdirCache.get(parent)?.delete(name);
-    this.dropVictim(victim.id, victim.attrs.kind);
-    this.enqueue(() => this.inner.unlink(parent, name));
+    return this.withNsLock(async () => {
+      this.checkReserved(name);
+      const victim = await this.lookup(parent, name);
+      if (!victim) throw new VfsError("ENOENT", name);
+      if (victim.attrs.kind === "dir") {
+        const kids = await this.readdir(victim.id);
+        if (kids.length > 0) throw new VfsError("ENOTEMPTY", name);
+      }
+      this.lookupCache.set(this.key(parent, name), NEG);
+      this.readdirCache.get(parent)?.delete(name);
+      this.dropVictim(victim.id, victim.attrs.kind);
+      this.enqueue(() => this.inner.unlink(parent, name));
+    });
   }
 
   async rename(fromParent: NodeId, fromName: string, toParent: NodeId, toName: string): Promise<void> {
-    const moving = await this.lookup(fromParent, fromName);
-    if (!moving) throw new VfsError("ENOENT", fromName);
-    const displaced = await this.lookup(toParent, toName);
-    if (displaced && displaced.id !== moving.id) {
-      if (displaced.attrs.kind === "dir") {
-        if (moving.attrs.kind !== "dir") throw new VfsError("EISDIR", toName);
-        if ((await this.readdir(displaced.id)).length > 0) throw new VfsError("ENOTEMPTY", toName);
-      } else if (moving.attrs.kind === "dir") {
-        throw new VfsError("ENOTDIR", toName);
+    return this.withNsLock(async () => {
+      this.checkReserved(fromName, toName);
+      const moving = await this.lookup(fromParent, fromName);
+      if (!moving) throw new VfsError("ENOENT", fromName);
+      const displaced = await this.lookup(toParent, toName);
+      if (displaced && displaced.id !== moving.id) {
+        if (displaced.attrs.kind === "dir") {
+          if (moving.attrs.kind !== "dir") throw new VfsError("EISDIR", toName);
+          if ((await this.readdir(displaced.id)).length > 0) throw new VfsError("ENOTEMPTY", toName);
+        } else if (moving.attrs.kind === "dir") {
+          throw new VfsError("ENOTDIR", toName);
+        }
       }
-    }
-    if (displaced && moving.id === displaced.id) {
-      this.enqueue(() => this.inner.rename(fromParent, fromName, toParent, toName)); // POSIX no-op
-      return;
-    }
-    this.enqueue(() => this.inner.rename(fromParent, fromName, toParent, toName));
-    this.lookupCache.set(this.key(fromParent, fromName), NEG);
-    this.readdirCache.get(fromParent)?.delete(fromName);
-    if (displaced) this.dropVictim(displaced.id, displaced.attrs.kind);
-    // The moving node keeps its id and its attrCache entry untouched —
-    // only the (parent, name) → id mapping moves, so there's no attrs to
-    // go stale.
-    this.lookupCache.set(this.key(toParent, toName), { id: moving.id, kind: moving.attrs.kind });
-    this.readdirCache.get(toParent)?.set(toName, { name: toName, childId: moving.id, kind: moving.attrs.kind });
+      if (displaced && moving.id === displaced.id) {
+        this.enqueue(() => this.inner.rename(fromParent, fromName, toParent, toName)); // POSIX no-op
+        return;
+      }
+      this.enqueue(() => this.inner.rename(fromParent, fromName, toParent, toName));
+      this.lookupCache.set(this.key(fromParent, fromName), NEG);
+      this.readdirCache.get(fromParent)?.delete(fromName);
+      if (displaced) this.dropVictim(displaced.id, displaced.attrs.kind);
+      // The moving node keeps its id and its attrCache entry untouched —
+      // only the (parent, name) → id mapping moves, so there's no attrs to
+      // go stale.
+      this.lookupCache.set(this.key(toParent, toName), { id: moving.id, kind: moving.attrs.kind });
+      this.readdirCache.get(toParent)?.set(toName, { name: toName, childId: moving.id, kind: moving.attrs.kind });
+    });
   }
 
   async setattr(id: NodeId, attrs: Partial<Pick<Attrs, "mode" | "mtimeMs" | "ctimeMs">>): Promise<void> {

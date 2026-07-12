@@ -236,6 +236,16 @@ export function runBackendConformance(
       });
     });
 
+    describe("reserved names (capability-gated)", () => {
+      it("reserved names are hidden and immutable", async (ctx) => {
+        const reserved = be.caps.reservedNames?.[0];
+        if (!reserved) return ctx.skip();
+        await expect(be.create(root, reserved, ulid(), "file")).rejects.toMatchObject({ errno: "EPERM" });
+        expect((await be.readdir(root)).map((d) => d.name)).not.toContain(reserved);
+        expect(await be.lookup(root, reserved)).toBeNull();
+      });
+    });
+
     describe("flush", () => {
       it("flush() resolves (durability point)", async () => {
         await be.create(root, "f", ulid(), "file");

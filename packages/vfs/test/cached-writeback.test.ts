@@ -290,4 +290,38 @@ describe("CachedBackend write-back", () => {
     await wb.flush();
     expect(dec.decode(await inner.read(f, 0, 100))).toBe("version C");
   });
+
+  it("concurrent same-name creates: exactly one wins, loser gets EEXIST, queue stays clean", async () => {
+    const results = await Promise.allSettled([
+      be.create(root, "x", ulid(), "file"),
+      be.create(root, "x", ulid(), "file"),
+    ]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const rej = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    expect(rej).toHaveLength(1);
+    expect(rej[0]!.reason).toMatchObject({ errno: "EEXIST" });
+    await be.flush(); // must not throw
+    expect((await be.readdir(root)).map((d) => d.name)).toEqual(["x"]);
+  });
+
+  it("reserved names are rejected synchronously with EPERM and never poison the queue", async () => {
+    const inner = new MemoryBackend();
+    const reserved = new Proxy(inner, {
+      get(target, prop, receiver) {
+        if (prop === "caps") return { ...target.caps, reservedNames: [".wash-attrs"] };
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as unknown as WashBackend;
+    const wb = new CachedBackend(reserved, { flushDelayMs: 60_000 });
+    const r = await wb.root();
+    await expect(wb.create(r, ".wash-attrs", ulid(), "file")).rejects.toMatchObject({ errno: "EPERM" });
+    const f = ulid();
+    await wb.create(r, "ok", f, "file");
+    await expect(wb.rename(r, "ok", r, ".wash-attrs")).rejects.toMatchObject({ errno: "EPERM" });
+    await expect(wb.link!(r, ".wash-attrs", f)).rejects.toMatchObject({ errno: "EPERM" });
+    await expect(wb.unlink(r, ".wash-attrs")).rejects.toMatchObject({ errno: "EPERM" });
+    await wb.flush(); // queue clean, nothing poisoned
+    expect((await wb.readdir(r)).map((d) => d.name)).toEqual(["ok"]);
+  });
 });

@@ -96,6 +96,15 @@ describe("Vfs metadata ops", () => {
     expect((await vfs.stat("/mnt")).kind).toBe("dir"); // mount still routes
   });
 
+  it("renaming an ancestor of an active mountpoint throws EBUSY", async () => {
+    await vfs.mkdir("/d");
+    await vfs.mkdir("/d/m");
+    await vfs.mount("/d/m", new MemoryBackend());
+    await expect(vfs.rename("/d", "/e")).rejects.toMatchObject({ errno: "EBUSY" });
+    expect((await vfs.stat("/d/m")).kind).toBe("dir"); // mount still routes
+    expect(await vfs.exists("/e")).toBe(false);
+  });
+
   it("recursive mkdir rejects existing non-directory components", async () => {
     await vfs.writeFile("/file", "x");
     await expect(vfs.mkdir("/file", { recursive: true })).rejects.toMatchObject({ errno: "EEXIST" });

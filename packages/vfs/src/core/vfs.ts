@@ -44,6 +44,30 @@ export class Vfs {
   private mounts: Mount[] = []; // sorted longest path first
   private fds = new FdTable();
 
+  // Per-node append serialization: O_APPEND writes read current EOF then
+  // write at that offset (getattr→write is not atomic on the backend), so
+  // two concurrent appenders on the same node must not interleave their
+  // getattr/write pair or the second write silently clobbers the first
+  // (lost update — both compute the same `pos`).
+  private appendLocks = new Map<NodeId, Promise<unknown>>();
+
+  private withAppendLock<T>(id: NodeId, fn: () => Promise<T>): Promise<T> {
+    const prev = this.appendLocks.get(id) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    // `gate` is a fresh settled-tracking promise distinct from `run` — using
+    // it (not `run`) as the map value and cleanup key means the identity
+    // check below reliably matches only the most recent locker for `id`.
+    const gate = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.appendLocks.set(id, gate);
+    void gate.then(() => {
+      if (this.appendLocks.get(id) === gate) this.appendLocks.delete(id);
+    });
+    return run;
+  }
+
   async mount(path: string, backend: WashBackend, opts: { exclusive?: boolean } = {}): Promise<void> {
     const p = normalize(path);
     if (this.mounts.length === 0 && p !== "/") throw new VfsError("EINVAL", "first mount must be /");
@@ -66,6 +90,11 @@ export class Vfs {
 
   private isMountpoint(p: string): boolean {
     return p !== "/" && this.mounts.some((m) => m.path === p);
+  }
+
+  private isMountpointAncestor(p: string): boolean {
+    const prefix = p === "/" ? "/" : p + "/";
+    return this.mounts.some((m) => m.path !== "/" && m.path.startsWith(prefix));
   }
 
   private mountFor(path: string): Mount {
@@ -197,6 +226,7 @@ export class Vfs {
     const f = normalize(from);
     const t = normalize(to);
     if (this.isMountpoint(f) || this.isMountpoint(t)) throw new VfsError("EBUSY", this.isMountpoint(f) ? f : t);
+    if (this.isMountpointAncestor(f)) throw new VfsError("EBUSY", f);
     if (t === f) return;
     const src = await this.resolveParent(f);
     const dst = await this.resolveParent(t);
@@ -289,9 +319,15 @@ export class Vfs {
   async write(fd: number, data: Uint8Array, opts: { position?: number } = {}): Promise<number> {
     const f = this.fds.get(fd);
     if (!canWrite(f.flags)) throw new VfsError("EBADF", String(fd));
-    let pos: number;
-    if (isAppend(f.flags)) pos = (await f.backend.getattr(f.id)).size;
-    else pos = opts.position ?? f.pos;
+    if (isAppend(f.flags)) {
+      return this.withAppendLock(f.id, async () => {
+        const pos = (await f.backend.getattr(f.id)).size;
+        await f.backend.write(f.id, pos, data);
+        if (opts.position === undefined) f.pos = pos + data.byteLength;
+        return data.byteLength;
+      });
+    }
+    const pos = opts.position ?? f.pos;
     await f.backend.write(f.id, pos, data);
     if (opts.position === undefined) f.pos = pos + data.byteLength;
     return data.byteLength;

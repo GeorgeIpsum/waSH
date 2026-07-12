@@ -71,4 +71,16 @@ describe("Vfs file io", () => {
     await vfs.close(fd);
     expect(await vfs.readTextFile("/f3")).toBe("hello!");
   });
+
+  it("concurrent appends both land (O_APPEND atomicity)", async () => {
+    await vfs.writeFile("/log", "");
+    const fd1 = await vfs.open("/log", "a");
+    const fd2 = await vfs.open("/log", "a");
+    await Promise.all([vfs.write(fd1, enc.encode("A")), vfs.write(fd2, enc.encode("B"))]);
+    await vfs.close(fd1);
+    await vfs.close(fd2);
+    const out = await vfs.readTextFile("/log");
+    expect(out.length).toBe(2);
+    expect(out.split("").sort().join("")).toBe("AB");
+  });
 });
