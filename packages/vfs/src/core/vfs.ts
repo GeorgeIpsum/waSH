@@ -225,7 +225,9 @@ export class Vfs {
       target = { backend, id };
     }
     const file = this.fds.alloc(target.backend, target.id, flags);
-    if (isAppend(flags)) file.pos = (await target.backend.getattr(target.id)).size;
+    // O_APPEND affects writes only (write() re-derives EOF per call);
+    // "a+" fds read from the start, so only write-only append flags seed pos.
+    if (flags === "a" || flags === "ax") file.pos = (await target.backend.getattr(target.id)).size;
     return file.fd;
   }
 

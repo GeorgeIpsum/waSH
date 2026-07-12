@@ -62,4 +62,13 @@ describe("Vfs file io", () => {
     await vfs.truncate("/t", 3);
     expect(await vfs.readTextFile("/t")).toBe("abc");
   });
+
+  it("a+ opens with read cursor at 0 while writes still append", async () => {
+    await vfs.writeFile("/f3", "hello");
+    const fd = await vfs.open("/f3", "a+");
+    expect(new TextDecoder().decode(await vfs.read(fd, 5))).toBe("hello");
+    await vfs.write(fd, new TextEncoder().encode("!"));
+    await vfs.close(fd);
+    expect(await vfs.readTextFile("/f3")).toBe("hello!");
+  });
 });
