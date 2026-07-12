@@ -84,4 +84,25 @@ describe("Vfs metadata ops", () => {
     await vfs.rm("/t", { recursive: true });
     expect(await vfs.exists("/t")).toBe(false);
   });
+
+  it("rename/unlink/rmdir reject active mountpoints with EBUSY", async () => {
+    await vfs.mkdir("/mnt");
+    await vfs.mount("/mnt", new MemoryBackend());
+    await vfs.mkdir("/a");
+    await expect(vfs.rename("/a", "/mnt")).rejects.toMatchObject({ errno: "EBUSY" });
+    await expect(vfs.rename("/mnt", "/x")).rejects.toMatchObject({ errno: "EBUSY" });
+    await expect(vfs.unlink("/mnt")).rejects.toMatchObject({ errno: "EBUSY" });
+    await expect(vfs.rmdir("/mnt")).rejects.toMatchObject({ errno: "EBUSY" });
+    expect((await vfs.stat("/mnt")).kind).toBe("dir"); // mount still routes
+  });
+
+  it("recursive mkdir rejects existing non-directory components", async () => {
+    await vfs.writeFile("/file", "x");
+    await expect(vfs.mkdir("/file", { recursive: true })).rejects.toMatchObject({ errno: "EEXIST" });
+    await expect(vfs.mkdir("/file/x/y", { recursive: true })).rejects.toMatchObject({ errno: "ENOTDIR" });
+    await vfs.mkdir("/real");
+    await vfs.symlink("/real", "/ln");
+    await vfs.mkdir("/ln/sub", { recursive: true }); // dir-symlink component is fine
+    expect((await vfs.stat("/real/sub")).kind).toBe("dir");
+  });
 });

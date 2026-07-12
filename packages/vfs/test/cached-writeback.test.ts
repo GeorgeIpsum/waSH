@@ -230,6 +230,35 @@ describe("CachedBackend write-back", () => {
     }
   });
 
+  it("concurrent same-file writes serialize instead of losing updates", async () => {
+    const inner = new MemoryBackend();
+    const f = ulid();
+    const root0 = await inner.root();
+    await inner.create(root0, "f", f, "file");
+    await inner.write(f, 0, enc.encode("\0\0")); // pre-existing 2-byte content on `inner`
+    const slowRead = new Proxy(inner, {
+      get(target, prop, receiver) {
+        const v = Reflect.get(target, prop, receiver);
+        if (prop === "read") {
+          return async (...args: unknown[]) => {
+            await new Promise<void>((r) => setTimeout(r, 10));
+            return (v as (...a: unknown[]) => Promise<unknown>).apply(target, args);
+          };
+        }
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as unknown as WashBackend;
+    const wb = new CachedBackend(slowRead, { flushDelayMs: 60_000 });
+    const root = await wb.root();
+    // wb has no cache yet for `f`; both writes below must materialize
+    // (read-through) from the same base content via the delayed inner.read.
+    await Promise.all([wb.write(f, 0, enc.encode("A")), wb.write(f, 1, enc.encode("B"))]);
+    expect(dec.decode(await wb.read(f, 0, 10))).toBe("AB");
+    expect((await wb.getattr(f)).size).toBe(2);
+    await wb.flush();
+    expect(dec.decode(await inner.read(f, 0, 10))).toBe("AB");
+  });
+
   it("re-dirtying a file mid-flush still converges to durability", async () => {
     const inner = new MemoryBackend();
     const slow = new Proxy(inner, {

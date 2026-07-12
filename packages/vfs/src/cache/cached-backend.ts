@@ -70,6 +70,29 @@ export class CachedBackend implements WashBackend {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private flushing: Promise<void> | null = null;
 
+  // Per-node mutation serialization: `write`/`truncate` both read-modify-write
+  // the dirty buffer (materialize → mutate → dirtyData.set), so two concurrent
+  // callers on the same node must not interleave their bodies or the second
+  // `dirtyData.set` silently clobbers the first's bytes (lost update).
+  private nodeLocks = new Map<NodeId, Promise<unknown>>();
+
+  private withNodeLock<T>(id: NodeId, fn: () => Promise<T>): Promise<T> {
+    const prev = this.nodeLocks.get(id) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    // `gate` is a fresh settled-tracking promise distinct from `run` — using
+    // it (not `run`) as the map value and cleanup key means the identity
+    // check below reliably matches only the most recent locker for `id`.
+    const gate = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.nodeLocks.set(id, gate);
+    void gate.then(() => {
+      if (this.nodeLocks.get(id) === gate) this.nodeLocks.delete(id);
+    });
+    return run;
+  }
+
   /** Invoked (fire-and-forget) when an auto-triggered flush rejects. */
   onFlushError?: (err: unknown) => void;
 
@@ -361,35 +384,39 @@ export class CachedBackend implements WashBackend {
   }
 
   async write(id: NodeId, offset: number, data: Uint8Array): Promise<void> {
-    const attrs = await this.getattr(id);
-    if (attrs.kind === "dir") throw new VfsError("EISDIR");
-    const cur = await this.materialize(id, attrs);
-    const end = Math.max(cur.byteLength, offset + data.byteLength);
-    const next = new Uint8Array(end);
-    next.set(cur, 0);
-    next.set(data, offset);
-    this.queueContentFlush(id);
-    this.dirtyData.set(id, next);
-    const hit = this.attrCache.get(id);
-    if (hit) {
-      hit.size = end;
-      hit.mtimeMs = Date.now();
-    }
+    return this.withNodeLock(id, async () => {
+      const attrs = await this.getattr(id);
+      if (attrs.kind === "dir") throw new VfsError("EISDIR");
+      const cur = await this.materialize(id, attrs);
+      const end = Math.max(cur.byteLength, offset + data.byteLength);
+      const next = new Uint8Array(end);
+      next.set(cur, 0);
+      next.set(data, offset);
+      this.queueContentFlush(id);
+      this.dirtyData.set(id, next);
+      const hit = this.attrCache.get(id);
+      if (hit) {
+        hit.size = end;
+        hit.mtimeMs = Date.now();
+      }
+    });
   }
 
   async truncate(id: NodeId, size: number): Promise<void> {
-    const attrs = await this.getattr(id);
-    if (attrs.kind === "dir") throw new VfsError("EISDIR");
-    const cur = await this.materialize(id, attrs);
-    const next = new Uint8Array(size);
-    next.set(cur.slice(0, Math.min(size, cur.byteLength)), 0);
-    this.queueContentFlush(id);
-    this.dirtyData.set(id, next);
-    const hit = this.attrCache.get(id);
-    if (hit) {
-      hit.size = size;
-      hit.mtimeMs = Date.now();
-    }
+    return this.withNodeLock(id, async () => {
+      const attrs = await this.getattr(id);
+      if (attrs.kind === "dir") throw new VfsError("EISDIR");
+      const cur = await this.materialize(id, attrs);
+      const next = new Uint8Array(size);
+      next.set(cur.slice(0, Math.min(size, cur.byteLength)), 0);
+      this.queueContentFlush(id);
+      this.dirtyData.set(id, next);
+      const hit = this.attrCache.get(id);
+      if (hit) {
+        hit.size = size;
+        hit.mtimeMs = Date.now();
+      }
+    });
   }
 
   async read(id: NodeId, offset: number, length: number): Promise<Uint8Array> {

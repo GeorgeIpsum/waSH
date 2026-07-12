@@ -64,6 +64,10 @@ export class Vfs {
     }
   }
 
+  private isMountpoint(p: string): boolean {
+    return p !== "/" && this.mounts.some((m) => m.path === p);
+  }
+
   private mountFor(path: string): Mount {
     const m = this.mounts.find((m) => path === m.path || path.startsWith(m.path === "/" ? "/" : m.path + "/"));
     if (!m) throw new VfsError("ENOENT", path);
@@ -137,9 +141,16 @@ export class Vfs {
     if (opts.recursive) {
       const segs = split(path);
       let walked = "";
-      for (const seg of segs) {
-        walked += "/" + seg;
-        if (!(await this.exists(walked))) await this.mkdir(walked);
+      for (let i = 0; i < segs.length; i++) {
+        walked += "/" + segs[i]!;
+        if (await this.exists(walked)) {
+          const attrs = await this.stat(walked); // follows symlinks: dir-symlink components are fine
+          if (attrs.kind !== "dir") {
+            throw new VfsError(i === segs.length - 1 ? "EEXIST" : "ENOTDIR", walked);
+          }
+        } else {
+          await this.mkdir(walked);
+        }
       }
       return;
     }
@@ -155,6 +166,7 @@ export class Vfs {
   }
 
   async unlink(path: string): Promise<void> {
+    if (this.isMountpoint(normalize(path))) throw new VfsError("EBUSY", path);
     const r = await this.resolve(path, { followLast: false });
     if (r.attrs.kind === "dir") throw new VfsError("EISDIR", path);
     if (r.parentId === null) throw new VfsError("EINVAL", path);
@@ -162,6 +174,7 @@ export class Vfs {
   }
 
   async rmdir(path: string): Promise<void> {
+    if (this.isMountpoint(normalize(path))) throw new VfsError("EBUSY", path);
     const r = await this.resolve(path, { followLast: false });
     if (r.attrs.kind !== "dir") throw new VfsError("ENOTDIR", path);
     if (r.parentId === null) throw new VfsError("EINVAL", path);
@@ -183,6 +196,7 @@ export class Vfs {
   async rename(from: string, to: string): Promise<void> {
     const f = normalize(from);
     const t = normalize(to);
+    if (this.isMountpoint(f) || this.isMountpoint(t)) throw new VfsError("EBUSY", this.isMountpoint(f) ? f : t);
     if (t === f) return;
     const src = await this.resolveParent(f);
     const dst = await this.resolveParent(t);
@@ -199,7 +213,7 @@ export class Vfs {
 
   async symlink(target: string, linkPath: string): Promise<void> {
     const { backend, dirId, name } = await this.resolveParent(linkPath);
-    if (backend.caps.symlinks !== "native" || !backend.symlink) throw new VfsError("EPERM", linkPath);
+    if (backend.caps.symlinks !== "supported" || !backend.symlink) throw new VfsError("EPERM", linkPath);
     if (await backend.lookup(dirId, name)) throw new VfsError("EEXIST", linkPath);
     await backend.symlink(dirId, name, ulid(), target);
   }

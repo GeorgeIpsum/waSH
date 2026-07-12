@@ -25,9 +25,16 @@ export interface NodeInfo {
 }
 
 export interface BackendCaps {
-  symlinks: "native" | "none";
+  symlinks: "supported" | "none";
   hardlinks: boolean;
   atomicDirRename: boolean;
+  /** Cost class of this backend's `rename` — O(1) rename vs. a subtree copy/walk. */
+  renameCost: "O1" | "subtree";
+  /**
+   * Names hidden from `readdir`/`lookup` and rejected with EPERM on user
+   * mutation — enforced by backends that declare it.
+   */
+  reservedNames?: string[];
 }
 
 /**

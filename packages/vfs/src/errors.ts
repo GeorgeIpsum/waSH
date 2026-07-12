@@ -1,6 +1,6 @@
 export type Errno =
   | "ENOENT" | "EEXIST" | "ENOTDIR" | "EISDIR" | "ENOTEMPTY"
-  | "EINVAL" | "ELOOP" | "EBADF" | "EXDEV" | "EPERM" | "ENOSYS";
+  | "EINVAL" | "ELOOP" | "EBADF" | "EXDEV" | "EPERM" | "ENOSYS" | "EBUSY";
 
 export class VfsError extends Error {
   constructor(public readonly errno: Errno, public readonly path?: string) {

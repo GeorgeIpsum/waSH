@@ -179,7 +179,7 @@ export function runBackendConformance(
 
     describe("symlinks (capability-gated)", () => {
       it("create + readlink roundtrip", async (ctx) => {
-        if (be.caps.symlinks !== "native") return ctx.skip();
+        if (be.caps.symlinks !== "supported") return ctx.skip();
         const s = ulid();
         await be.symlink!(root, "ln", s, "/t");
         expect(await be.readlink!(s)).toBe("/t");
@@ -187,7 +187,7 @@ export function runBackendConformance(
       });
 
       it("readlink on a regular file throws EINVAL", async (ctx) => {
-        if (be.caps.symlinks !== "native") return ctx.skip();
+        if (be.caps.symlinks !== "supported") return ctx.skip();
         const f = ulid();
         await be.create(root, "f", f, "file");
         await expect(be.readlink!(f)).rejects.toMatchObject({ errno: "EINVAL" });
@@ -222,6 +222,17 @@ export function runBackendConformance(
         const f = ulid();
         await be.create(root, "f", f, "file");
         await expect(be.link!(root, "f", d)).rejects.toMatchObject({ errno: "EEXIST" });
+      });
+
+      it("rename between two names of the same node is a POSIX no-op", async (ctx) => {
+        if (!be.caps.hardlinks) return ctx.skip();
+        const f = ulid();
+        await be.create(root, "a", f, "file");
+        await be.link!(root, "b", f);
+        await be.rename(root, "a", root, "b");
+        expect((await be.lookup(root, "a"))?.id).toBe(f);
+        expect((await be.lookup(root, "b"))?.id).toBe(f);
+        expect((await be.getattr(f)).nlink).toBe(2);
       });
     });
 
