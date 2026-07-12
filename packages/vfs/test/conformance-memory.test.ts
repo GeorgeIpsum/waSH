@@ -3,4 +3,7 @@ import { MemoryBackend } from "../src/backend/memory.js";
 import { CachedBackend } from "../src/cache/cached-backend.js";
 
 runBackendConformance("MemoryBackend", () => new MemoryBackend());
-runBackendConformance("CachedBackend(MemoryBackend)", () => new CachedBackend(new MemoryBackend()));
+runBackendConformance(
+  "CachedBackend(MemoryBackend, writeback)",
+  () => new CachedBackend(new MemoryBackend(), { flushDelayMs: 1 }),
+);

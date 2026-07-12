@@ -67,6 +67,7 @@ describe("CachedBackend read caches", () => {
   it("mutating returned attrs does not corrupt the cache", async () => {
     const f = ulid();
     await be.create(root, "f", f, "file");
+    await be.flush(); // writeback: `inner` only sees the create after a flush
     const be2 = new CachedBackend(inner); // fresh wrapper → cache-miss path
     const info = await be2.lookup(root, "f");
     info!.attrs.size = 999999;
