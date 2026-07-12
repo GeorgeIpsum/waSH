@@ -99,6 +99,7 @@ export class MemoryBackend implements WashBackend {
 
   async write(id: NodeId, offset: number, data: Uint8Array): Promise<void> {
     const n = this.fileNode(id);
+    if (data.byteLength === 0) return;
     const end = offset + data.byteLength;
     if (end > n.data.byteLength) {
       const grown = new Uint8Array(end);

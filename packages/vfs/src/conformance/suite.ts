@@ -127,6 +127,18 @@ export function runBackendConformance(
         await expect(be.read(root, 0, 1)).rejects.toMatchObject({ errno: "EISDIR" });
         await expect(be.write(root, 0, enc.encode("x"))).rejects.toMatchObject({ errno: "EISDIR" });
       });
+
+      it("zero-length writes are a complete no-op", async () => {
+        const f = ulid();
+        await be.create(root, "z", f, "file");
+        await be.write(f, 0, enc.encode("abc"));
+        const before = await be.getattr(f);
+        await be.write(f, 100, new Uint8Array(0));
+        const after = await be.getattr(f);
+        expect(after.size).toBe(3);
+        expect(after.mtimeMs).toBe(before.mtimeMs);
+        expect((await be.read(f, 0, 10)).byteLength).toBe(3);
+      });
     });
 
     describe("unlink and rename", () => {

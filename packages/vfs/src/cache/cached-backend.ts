@@ -428,6 +428,7 @@ export class CachedBackend implements WashBackend {
     return this.withNodeLock(id, async () => {
       const attrs = await this.getattr(id);
       if (attrs.kind === "dir") throw new VfsError("EISDIR");
+      if (data.byteLength === 0) return;
       const cur = await this.materialize(id, attrs);
       const end = Math.max(cur.byteLength, offset + data.byteLength);
       const next = new Uint8Array(end);

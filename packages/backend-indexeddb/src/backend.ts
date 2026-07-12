@@ -277,28 +277,27 @@ export class IndexedDBBackend implements WashBackend {
   async write(id: NodeId, offset: number, data: Uint8Array): Promise<void> {
     return this.withTx(async (tx) => {
       const rec = await this.requireFile(tx, id);
+      if (data.byteLength === 0) return;
       const store = tx.objectStore("data");
       const end = offset + data.byteLength;
-      if (data.byteLength > 0) {
-        const first = Math.floor(offset / this.chunkSize);
-        const last = Math.floor((end - 1) / this.chunkSize);
-        for (let idx = first; idx <= last; idx++) {
-          const chunkStart = idx * this.chunkSize;
-          const from = Math.max(offset, chunkStart);
-          const to = Math.min(end, chunkStart + this.chunkSize);
-          const slice = data.subarray(from - offset, to - offset);
-          let chunk: Uint8Array;
-          if (slice.byteLength === this.chunkSize) {
-            chunk = slice.slice(); // full-chunk overwrite: skip the read
-          } else {
-            const existing = (await req(store.get([id, idx]))) as Uint8Array | undefined;
-            const size = Math.max(existing?.byteLength ?? 0, to - chunkStart);
-            chunk = new Uint8Array(size);
-            if (existing) chunk.set(existing, 0);
-            chunk.set(slice, from - chunkStart);
-          }
-          await req(store.put(chunk, [id, idx]));
+      const first = Math.floor(offset / this.chunkSize);
+      const last = Math.floor((end - 1) / this.chunkSize);
+      for (let idx = first; idx <= last; idx++) {
+        const chunkStart = idx * this.chunkSize;
+        const from = Math.max(offset, chunkStart);
+        const to = Math.min(end, chunkStart + this.chunkSize);
+        const slice = data.subarray(from - offset, to - offset);
+        let chunk: Uint8Array;
+        if (slice.byteLength === this.chunkSize) {
+          chunk = slice.slice(); // full-chunk overwrite: skip the read
+        } else {
+          const existing = (await req(store.get([id, idx]))) as Uint8Array | undefined;
+          const size = Math.max(existing?.byteLength ?? 0, to - chunkStart);
+          chunk = new Uint8Array(size);
+          if (existing) chunk.set(existing, 0);
+          chunk.set(slice, from - chunkStart);
         }
+        await req(store.put(chunk, [id, idx]));
       }
       if (end > rec.size) rec.size = end;
       rec.mtimeMs = Date.now();
