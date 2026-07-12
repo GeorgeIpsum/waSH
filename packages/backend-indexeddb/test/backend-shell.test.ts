@@ -2,6 +2,18 @@ import { describe, it, expect } from "vitest";
 import { IndexedDBBackend } from "../src/backend.js";
 import { ulid } from "@wash/vfs";
 
+// setImmediate is Node-only; setTimeout(0) alone can starve on some Node event-loop
+// phases and reintroduce the flake it's meant to avoid. Prefer the macrotask-queue
+// primitive when present (Node), otherwise fall back to setTimeout (browser).
+const settleEvents = (): Promise<void> =>
+  new Promise((resolve) => {
+    if (typeof globalThis.setImmediate === "function") {
+      globalThis.setImmediate(resolve);
+    } else {
+      setTimeout(resolve, 0);
+    }
+  });
+
 describe("IndexedDBBackend shell", () => {
   it("open bootstraps a root dir inode and persists it across reopen", async () => {
     const name = `sh-${ulid()}`;
@@ -63,7 +75,7 @@ describe("IndexedDBBackend shell", () => {
     const root = await be.root();
     await be.setattr(root, { mtimeMs: 1 }); // opens the shared txn
     (be as unknown as { tx: IDBTransaction }).tx.abort(); // simulate quota/forced abort
-    await new Promise((r) => setImmediate(r)); // abort event fires asynchronously (matches fake-indexeddb's dispatch)
+    await settleEvents(); // abort event fires asynchronously (matches fake-indexeddb's dispatch)
     await expect(be.setattr(root, { mtimeMs: 2 })).rejects.toBeTruthy(); // poisoned, no suffix txn
     await expect(be.flush()).rejects.toBeTruthy(); // abort surfaced exactly once
     await be.setattr(root, { mtimeMs: 3 }); // cleared: fresh txn works
