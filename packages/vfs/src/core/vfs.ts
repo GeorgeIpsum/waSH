@@ -3,6 +3,7 @@ import { VfsError } from "../errors.js";
 import { normalize, split } from "./path.js";
 import { ulid } from "../ulid.js";
 import type { Dirent } from "../types.js";
+import { FdTable, canRead, canWrite, isAppend, type OpenFlag } from "./fd.js";
 
 const MAX_SYMLINK_HOPS = 40;
 
@@ -20,6 +21,7 @@ export interface ResolvedNode {
 
 export class Vfs {
   private mounts: Mount[] = []; // sorted longest path first
+  private fds = new FdTable();
 
   async mount(path: string, backend: WashBackend): Promise<void> {
     const p = normalize(path);
@@ -203,5 +205,87 @@ export class Vfs {
       if (e instanceof VfsError && (e.errno === "ENOENT" || e.errno === "ENOTDIR")) return false;
       throw e;
     }
+  }
+
+  async open(path: string, flags: OpenFlag): Promise<number> {
+    const p = normalize(path);
+    let target: { backend: WashBackend; id: NodeId };
+    try {
+      const r = await this.resolve(p);
+      if (r.attrs.kind === "dir") throw new VfsError("EISDIR", p);
+      if (flags === "wx" || flags === "ax") throw new VfsError("EEXIST", p);
+      if (flags === "w" || flags === "w+") await r.backend.truncate(r.id, 0);
+      target = { backend: r.backend, id: r.id };
+    } catch (e) {
+      if (!(e instanceof VfsError) || e.errno !== "ENOENT") throw e;
+      if (flags === "r" || flags === "r+") throw e;
+      const { backend, dirId, name } = await this.resolveParent(p);
+      const id = ulid();
+      await backend.create(dirId, name, id, "file");
+      target = { backend, id };
+    }
+    const file = this.fds.alloc(target.backend, target.id, flags);
+    if (isAppend(flags)) file.pos = (await target.backend.getattr(target.id)).size;
+    return file.fd;
+  }
+
+  async read(fd: number, length: number, opts: { position?: number } = {}): Promise<Uint8Array> {
+    const f = this.fds.get(fd);
+    if (!canRead(f.flags)) throw new VfsError("EBADF", String(fd));
+    const pos = opts.position ?? f.pos;
+    const out = await f.backend.read(f.id, pos, length);
+    if (opts.position === undefined) f.pos += out.byteLength;
+    return out;
+  }
+
+  async write(fd: number, data: Uint8Array, opts: { position?: number } = {}): Promise<number> {
+    const f = this.fds.get(fd);
+    if (!canWrite(f.flags)) throw new VfsError("EBADF", String(fd));
+    let pos: number;
+    if (isAppend(f.flags)) pos = (await f.backend.getattr(f.id)).size;
+    else pos = opts.position ?? f.pos;
+    await f.backend.write(f.id, pos, data);
+    if (opts.position === undefined) f.pos = pos + data.byteLength;
+    return data.byteLength;
+  }
+
+  async close(fd: number): Promise<void> {
+    this.fds.close(fd);
+  }
+
+  async readFile(path: string): Promise<Uint8Array> {
+    const r = await this.resolve(path);
+    if (r.attrs.kind === "dir") throw new VfsError("EISDIR", path);
+    return r.backend.read(r.id, 0, r.attrs.size);
+  }
+
+  async readTextFile(path: string): Promise<string> {
+    return new TextDecoder().decode(await this.readFile(path));
+  }
+
+  async writeFile(path: string, data: Uint8Array | string): Promise<void> {
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    const fd = await this.open(path, "w");
+    try {
+      await this.write(fd, bytes);
+    } finally {
+      await this.close(fd);
+    }
+  }
+
+  async appendFile(path: string, data: Uint8Array | string): Promise<void> {
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    const fd = await this.open(path, "a");
+    try {
+      await this.write(fd, bytes);
+    } finally {
+      await this.close(fd);
+    }
+  }
+
+  async truncate(path: string, size = 0): Promise<void> {
+    const r = await this.resolve(path);
+    if (r.attrs.kind === "dir") throw new VfsError("EISDIR", path);
+    await r.backend.truncate(r.id, size);
   }
 }
