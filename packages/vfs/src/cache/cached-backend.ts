@@ -27,9 +27,25 @@ function mkAttrs(kind: NodeKind, overrides?: Partial<Attrs>): Attrs {
   };
 }
 
+/** Cached identity of a directory entry — never carries attrs (see class doc). */
+interface LookupEntry {
+  id: NodeId;
+  kind: NodeKind;
+}
+
+/**
+ * `attrCache` is the single source of truth for a node's Attrs; it is the
+ * only map that ever stores an Attrs object, and every entry in it is a
+ * live object mutated in place by write/truncate/setattr/link/unlink so
+ * that all names aliasing the same node (hardlinks) observe the same
+ * state. `lookupCache` therefore stores only `{ id, kind }` — never attrs —
+ * so two directory entries for the same node can never hold divergent copies.
+ * Callers always get a defensive copy (via `getattr`/`lookup`), so mutating
+ * a returned `Attrs` can never corrupt the cache.
+ */
 export class CachedBackend implements WashBackend {
   readonly caps: BackendCaps;
-  private lookupCache = new Map<string, NodeInfo | typeof NEG>();
+  private lookupCache = new Map<string, LookupEntry | typeof NEG>();
   private attrCache = new Map<NodeId, Attrs>();
   private readdirCache = new Map<NodeId, Map<string, Dirent>>();
 
@@ -54,9 +70,18 @@ export class CachedBackend implements WashBackend {
   link?: (parent: NodeId, name: string, id: NodeId) => Promise<void> = async (parent, name, id): Promise<void> => {
     if (!this.inner.link) throw new Error("unsupported");
     await this.inner.link(parent, name, id);
-    const attrs = await this.inner.getattr(id);
-    this.attrCache.set(id, attrs);
-    this.primeEntry(parent, name, id, attrs.kind, attrs);
+    // Never replace the attrCache entry: mutate it in place so every other
+    // name aliasing this node (existing hardlinks) observes the same nlink
+    // bump instead of going stale.
+    let attrs = this.attrCache.get(id);
+    if (attrs) {
+      attrs.nlink += 1;
+    } else {
+      attrs = { ...(await this.inner.getattr(id)) };
+      this.attrCache.set(id, attrs);
+    }
+    this.lookupCache.set(this.key(parent, name), { id, kind: attrs.kind });
+    this.readdirCache.get(parent)?.set(name, { name, childId: id, kind: attrs.kind });
   };
 
   constructor(protected inner: WashBackend, protected opts: { flushDelayMs?: number } = {}) {
@@ -71,15 +96,30 @@ export class CachedBackend implements WashBackend {
   }
 
   private primeEntry(parent: NodeId, name: string, id: NodeId, kind: NodeKind, attrs: Attrs): void {
-    this.lookupCache.set(this.key(parent, name), { id, attrs });
+    this.lookupCache.set(this.key(parent, name), { id, kind });
     this.attrCache.set(id, attrs);
     this.readdirCache.get(parent)?.set(name, { name, childId: id, kind });
   }
 
-  private dropEntry(parent: NodeId, name: string, id?: NodeId): void {
-    this.lookupCache.set(this.key(parent, name), NEG);
-    this.readdirCache.get(parent)?.delete(name);
-    if (id) this.attrCache.delete(id);
+  /**
+   * Removes a node from the caches after it loses a name (unlink, or being
+   * displaced by rename). Directories can't have hardlinks, so their attr +
+   * readdir entries are always dropped outright. Files/symlinks may still be
+   * reachable via other names, so their cached attrs are only mutated
+   * in-place (nlink decrement) and evicted once nlink drops to zero — mirrors
+   * the GC semantics every WashBackend implements.
+   */
+  private dropVictim(id: NodeId, kind: NodeKind): void {
+    if (kind === "dir") {
+      this.attrCache.delete(id);
+      this.readdirCache.delete(id);
+      return;
+    }
+    const hit = this.attrCache.get(id);
+    if (hit) {
+      hit.nlink -= 1;
+      if (hit.nlink <= 0) this.attrCache.delete(id);
+    }
   }
 
   async root(): Promise<NodeId> {
@@ -90,11 +130,15 @@ export class CachedBackend implements WashBackend {
     const k = this.key(parent, name);
     const hit = this.lookupCache.get(k);
     if (hit === NEG) return null;
-    if (hit) return { id: hit.id, attrs: { ...hit.attrs } };
+    if (hit) {
+      const attrs = await this.getattr(hit.id);
+      return { id: hit.id, attrs };
+    }
     const info = await this.inner.lookup(parent, name);
-    this.lookupCache.set(k, info ?? NEG);
-    if (info) this.attrCache.set(info.id, info.attrs);
-    return info;
+    this.lookupCache.set(k, info ? { id: info.id, kind: info.attrs.kind } : NEG);
+    if (!info) return null;
+    this.attrCache.set(info.id, { ...info.attrs });
+    return { id: info.id, attrs: { ...info.attrs } };
   }
 
   async getattr(id: NodeId): Promise<Attrs> {
@@ -121,17 +165,25 @@ export class CachedBackend implements WashBackend {
   async unlink(parent: NodeId, name: string): Promise<void> {
     const victim = await this.lookup(parent, name);
     await this.inner.unlink(parent, name);
-    this.dropEntry(parent, name, victim?.id);
-    if (victim) this.readdirCache.delete(victim.id);
+    this.lookupCache.set(this.key(parent, name), NEG);
+    this.readdirCache.get(parent)?.delete(name);
+    if (victim) this.dropVictim(victim.id, victim.attrs.kind);
   }
 
   async rename(fromParent: NodeId, fromName: string, toParent: NodeId, toName: string): Promise<void> {
     const moving = await this.lookup(fromParent, fromName);
     const displaced = await this.lookup(toParent, toName);
     await this.inner.rename(fromParent, fromName, toParent, toName);
-    this.dropEntry(fromParent, fromName);
-    if (displaced) this.attrCache.delete(displaced.id);
-    if (moving) this.primeEntry(toParent, toName, moving.id, moving.attrs.kind, moving.attrs);
+    this.lookupCache.set(this.key(fromParent, fromName), NEG);
+    this.readdirCache.get(fromParent)?.delete(fromName);
+    if (displaced) this.dropVictim(displaced.id, displaced.attrs.kind);
+    if (moving) {
+      // The moving node keeps its id and its attrCache entry untouched —
+      // only the (parent, name) → id mapping moves, so there's no attrs to
+      // go stale.
+      this.lookupCache.set(this.key(toParent, toName), { id: moving.id, kind: moving.attrs.kind });
+      this.readdirCache.get(toParent)?.set(toName, { name: toName, childId: moving.id, kind: moving.attrs.kind });
+    }
   }
 
   async setattr(id: NodeId, attrs: Partial<Pick<Attrs, "mode" | "mtimeMs" | "ctimeMs">>): Promise<void> {

@@ -63,4 +63,28 @@ describe("CachedBackend read caches", () => {
     expect(await be.lookup(root, "f")).toBeNull();
     expect((await be.lookup(d, "g"))?.id).toBe(f);
   });
+
+  it("mutating returned attrs does not corrupt the cache", async () => {
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    const be2 = new CachedBackend(inner); // fresh wrapper → cache-miss path
+    const info = await be2.lookup(root, "f");
+    info!.attrs.size = 999999;
+    expect((await be2.lookup(root, "f"))?.attrs.size).toBe(0);
+    expect((await be2.getattr(f)).size).toBe(0);
+  });
+
+  it("hardlink aliases stay coherent through write/link/unlink", async () => {
+    const f = ulid();
+    await be.create(root, "a", f, "file");
+    await be.lookup(root, "a");
+    await be.link!(root, "b", f);
+    await be.write(f, 0, new TextEncoder().encode("xyz"));
+    expect((await be.lookup(root, "a"))?.attrs.size).toBe(3);
+    expect((await be.lookup(root, "b"))?.attrs.size).toBe(3);
+    expect((await be.lookup(root, "b"))?.attrs.nlink).toBe(2);
+    await be.unlink(root, "a");
+    expect((await be.lookup(root, "b"))?.attrs.nlink).toBe(1);
+    expect((await be.getattr(f)).size).toBe(3);
+  });
 });
