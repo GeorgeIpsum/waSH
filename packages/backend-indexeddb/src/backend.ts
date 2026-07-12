@@ -238,10 +238,96 @@ export class IndexedDBBackend implements WashBackend {
     });
   }
 
+  private chunkRange(id: NodeId, first = 0, last: number = Infinity): IDBKeyRange {
+    return IDBKeyRange.bound([id, first], [id, last]);
+  }
+
+  private async requireFile(tx: IDBTransaction, id: NodeId): Promise<InodeRecord> {
+    const rec = await this.getInode(tx, id);
+    if (rec.kind === "dir") throw new VfsError("EISDIR");
+    return rec;
+  }
+
+  async read(id: NodeId, offset: number, length: number): Promise<Uint8Array> {
+    return this.withTx(async (tx) => {
+      const rec = await this.requireFile(tx, id);
+      if (offset >= rec.size || length === 0) return new Uint8Array(0);
+      const end = Math.min(offset + length, rec.size);
+      const out = new Uint8Array(end - offset); // zero-initialized: sparse chunks stay zeros
+      const first = Math.floor(offset / this.chunkSize);
+      const last = Math.floor((end - 1) / this.chunkSize);
+      const store = tx.objectStore("data");
+      const range = this.chunkRange(id, first, last);
+      const keysReq = store.getAllKeys(range);
+      const valsReq = store.getAll(range);
+      const keys = (await req(keysReq)) as [NodeId, number][];
+      const vals = (await req(valsReq)) as Uint8Array[];
+      for (let i = 0; i < keys.length; i++) {
+        const idx = keys[i]![1];
+        const chunk = vals[i]!;
+        const chunkStart = idx * this.chunkSize;
+        const from = Math.max(offset, chunkStart);
+        const to = Math.min(end, chunkStart + chunk.byteLength);
+        if (to > from) out.set(chunk.subarray(from - chunkStart, to - chunkStart), from - offset);
+      }
+      return out;
+    });
+  }
+
+  async write(id: NodeId, offset: number, data: Uint8Array): Promise<void> {
+    return this.withTx(async (tx) => {
+      const rec = await this.requireFile(tx, id);
+      const store = tx.objectStore("data");
+      const end = offset + data.byteLength;
+      if (data.byteLength > 0) {
+        const first = Math.floor(offset / this.chunkSize);
+        const last = Math.floor((end - 1) / this.chunkSize);
+        for (let idx = first; idx <= last; idx++) {
+          const chunkStart = idx * this.chunkSize;
+          const from = Math.max(offset, chunkStart);
+          const to = Math.min(end, chunkStart + this.chunkSize);
+          const slice = data.subarray(from - offset, to - offset);
+          let chunk: Uint8Array;
+          if (slice.byteLength === this.chunkSize) {
+            chunk = slice.slice(); // full-chunk overwrite: skip the read
+          } else {
+            const existing = (await req(store.get([id, idx]))) as Uint8Array | undefined;
+            const size = Math.max(existing?.byteLength ?? 0, to - chunkStart);
+            chunk = new Uint8Array(size);
+            if (existing) chunk.set(existing, 0);
+            chunk.set(slice, from - chunkStart);
+          }
+          await req(store.put(chunk, [id, idx]));
+        }
+      }
+      if (end > rec.size) rec.size = end;
+      rec.mtimeMs = Date.now();
+      await req(tx.objectStore("inodes").put(rec, id));
+    });
+  }
+
+  async truncate(id: NodeId, size: number): Promise<void> {
+    return this.withTx(async (tx) => {
+      const rec = await this.requireFile(tx, id);
+      const store = tx.objectStore("data");
+      if (size < rec.size) {
+        const lastKeep = size === 0 ? -1 : Math.floor((size - 1) / this.chunkSize);
+        await req(store.delete(this.chunkRange(id, lastKeep + 1)));
+        if (lastKeep >= 0) {
+          const boundary = (await req(store.get([id, lastKeep]))) as Uint8Array | undefined;
+          const keep = size - lastKeep * this.chunkSize;
+          if (boundary && boundary.byteLength > keep) {
+            await req(store.put(boundary.slice(0, keep), [id, lastKeep]));
+          }
+        }
+      }
+      rec.size = size; // extend is sparse: missing chunks read as zeros
+      rec.mtimeMs = Date.now();
+      await req(tx.objectStore("inodes").put(rec, id));
+    });
+  }
+
   // Remaining contract ops land in Tasks 4–5.
-  async read(): Promise<Uint8Array> { throw new VfsError("ENOSYS"); }
-  async write(): Promise<void> { throw new VfsError("ENOSYS"); }
-  async truncate(): Promise<void> { throw new VfsError("ENOSYS"); }
   async unlink(): Promise<void> { throw new VfsError("ENOSYS"); }
   async rename(): Promise<void> { throw new VfsError("ENOSYS"); }
 }
