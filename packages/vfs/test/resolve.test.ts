@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { Vfs } from "../src/core/vfs.js";
 import { MemoryBackend } from "../src/backend/memory.js";
-import { normalize } from "../src/core/path.js";
+import { normalize, split } from "../src/core/path.js";
 
 describe("normalize", () => {
   it("normalizes dots, slashes, and parent refs", () => {
@@ -11,6 +11,10 @@ describe("normalize", () => {
   });
   it("rejects relative paths", () => {
     expect(() => normalize("a/b")).toThrowError(/EINVAL/);
+  });
+  it("split returns normalized segments; root splits to empty", () => {
+    expect(split("/a/b/../c//")).toEqual(["a", "c"]);
+    expect(split("/")).toEqual([]);
   });
 });
 
@@ -27,6 +31,12 @@ describe("Vfs resolution", () => {
 
   it("throws ENOENT for missing paths and ENOTDIR through files", async () => {
     await expect(vfs.stat("/missing")).rejects.toMatchObject({ errno: "ENOENT", path: "/missing" });
+    const be = new MemoryBackend();
+    vfs = new Vfs();
+    await vfs.mount("/", be);
+    const { ulid } = await import("../src/ulid.js");
+    await be.create(await be.root(), "f.txt", ulid(), "file");
+    await expect(vfs.stat("/f.txt/child")).rejects.toMatchObject({ errno: "ENOTDIR" });
   });
 
   it("resolves nested paths across a second mount", async () => {
