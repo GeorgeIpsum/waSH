@@ -7,3 +7,4 @@ runBackendConformance(
   "CachedBackend(MemoryBackend, writeback)",
   () => new CachedBackend(new MemoryBackend(), { flushDelayMs: 1 }),
 );
+runBackendConformance("CachedBackend(MemoryBackend)", () => new CachedBackend(new MemoryBackend()));

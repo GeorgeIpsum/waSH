@@ -89,6 +89,13 @@ describe("CachedBackend read caches", () => {
     expect((await be.getattr(f)).size).toBe(3);
   });
 
+  it("readdir returns copies, not live cache objects", async () => {
+    await be.create(root, "f", ulid(), "file");
+    const first = await be.readdir(root);
+    first[0]!.name = "corrupted";
+    expect((await be.readdir(root)).map((d) => d.name)).toEqual(["f"]);
+  });
+
   it("rename between two aliases of the same node is a cache-coherent no-op", async () => {
     const f = ulid();
     await be.create(root, "a", f, "file");

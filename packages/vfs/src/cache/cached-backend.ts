@@ -189,19 +189,22 @@ export class CachedBackend implements WashBackend {
   }
 
   async flush(): Promise<void> {
-    // If a flush is already in progress, wait for it, then still run a fresh
-    // cycle: ops enqueued while we were waiting (e.g. by a concurrent
-    // mutation that ran between two `await`s of the in-flight flush) must
-    // not be left stranded in the queue.
-    if (this.flushing) await this.flushing;
+    // Fully serialize concurrent callers: keep waiting (and re-checking)
+    // until no flush cycle is in flight, then start our own. This is a loop
+    // rather than a single `if` because a waiter can wake up to find another
+    // cycle already started in the meantime — a single check would let two
+    // callers both fall through and run concurrent drain loops against the
+    // same queue, racing `queue.shift()` against each other.
+    while (this.flushing) await this.flushing;
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = null;
     }
     const run = (async () => {
       while (this.queue.length > 0) {
-        const op = this.queue.shift()!;
-        await op();
+        const op = this.queue[0]!;
+        await op(); // rejection leaves the op at the head for retry — see dropVictim/enqueue docs
+        this.queue.shift();
       }
       await this.inner.flush();
     })();
@@ -244,11 +247,11 @@ export class CachedBackend implements WashBackend {
 
   async readdir(id: NodeId): Promise<Dirent[]> {
     const hit = this.readdirCache.get(id);
-    if (hit) return [...hit.values()];
+    if (hit) return [...hit.values()].map((d) => ({ ...d }));
     await this.drain(); // cache-miss read: never read stale
     const list = await this.inner.readdir(id);
     this.readdirCache.set(id, new Map(list.map((d) => [d.name, d])));
-    return list;
+    return list.map((d) => ({ ...d }));
   }
 
   async create(parent: NodeId, name: string, id: NodeId, kind: NodeKind, attrs?: Partial<Attrs>): Promise<void> {
@@ -258,9 +261,13 @@ export class CachedBackend implements WashBackend {
     // on a still-cold cache would go to `inner`, which doesn't have this
     // entry yet (it's only enqueued, not flushed).
     await this.readdir(parent);
-    this.primeEntry(parent, name, id, kind, mkAttrs(kind, attrs));
+    // Snapshot the caller-supplied `attrs` now: both the cache prime below
+    // and the enqueued closure must see the object as it was at call time,
+    // not whatever the caller mutates it to before the op is flushed.
+    const attrsSnapshot = attrs ? { ...attrs } : undefined;
+    this.primeEntry(parent, name, id, kind, mkAttrs(kind, attrsSnapshot));
     if (kind === "dir") this.readdirCache.set(id, new Map());
-    this.enqueue(() => this.inner.create(parent, name, id, kind, attrs));
+    this.enqueue(() => this.inner.create(parent, name, id, kind, attrsSnapshot));
   }
 
   async unlink(parent: NodeId, name: string): Promise<void> {
@@ -305,8 +312,11 @@ export class CachedBackend implements WashBackend {
 
   async setattr(id: NodeId, attrs: Partial<Pick<Attrs, "mode" | "mtimeMs" | "ctimeMs">>): Promise<void> {
     await this.getattr(id); // ENOENT if unknown; ensures attrCache is populated
-    Object.assign(this.attrCache.get(id)!, attrs);
-    this.enqueue(() => this.inner.setattr(id, attrs));
+    // Snapshot now: the cache mutation and the enqueued closure must both see
+    // `attrs` as it was at call time, not a later caller-side mutation.
+    const snapshot = { ...attrs };
+    Object.assign(this.attrCache.get(id)!, snapshot);
+    this.enqueue(() => this.inner.setattr(id, snapshot));
   }
 
   /** Reads the current bytes for `id`, preferring an unflushed dirty buffer. */
