@@ -87,4 +87,17 @@ describe("CachedBackend read caches", () => {
     expect((await be.lookup(root, "b"))?.attrs.nlink).toBe(1);
     expect((await be.getattr(f)).size).toBe(3);
   });
+
+  it("rename between two aliases of the same node is a cache-coherent no-op", async () => {
+    const f = ulid();
+    await be.create(root, "a", f, "file");
+    await be.link!(root, "b", f);
+    await be.rename(root, "a", root, "b");
+    expect((await be.lookup(root, "a"))?.id).toBe(f);
+    expect((await be.lookup(root, "b"))?.id).toBe(f);
+    expect((await be.getattr(f)).nlink).toBe(2);
+    await be.unlink(root, "b");
+    expect((await be.lookup(root, "a"))?.id).toBe(f);
+    expect((await be.getattr(f)).nlink).toBe(1);
+  });
 });

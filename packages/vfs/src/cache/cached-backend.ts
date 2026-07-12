@@ -145,7 +145,7 @@ export class CachedBackend implements WashBackend {
     const hit = this.attrCache.get(id);
     if (hit) return { ...hit };
     const attrs = await this.inner.getattr(id);
-    this.attrCache.set(id, attrs);
+    this.attrCache.set(id, { ...attrs });
     return { ...attrs };
   }
 
@@ -173,6 +173,10 @@ export class CachedBackend implements WashBackend {
   async rename(fromParent: NodeId, fromName: string, toParent: NodeId, toName: string): Promise<void> {
     const moving = await this.lookup(fromParent, fromName);
     const displaced = await this.lookup(toParent, toName);
+    if (moving && displaced && moving.id === displaced.id) {
+      await this.inner.rename(fromParent, fromName, toParent, toName); // POSIX no-op
+      return;
+    }
     await this.inner.rename(fromParent, fromName, toParent, toName);
     this.lookupCache.set(this.key(fromParent, fromName), NEG);
     this.readdirCache.get(fromParent)?.delete(fromName);
