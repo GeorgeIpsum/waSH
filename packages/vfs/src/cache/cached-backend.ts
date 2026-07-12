@@ -336,7 +336,7 @@ export class CachedBackend implements WashBackend {
    * negative lookups in dumped directories — is served from memory.
    */
   warm(dump: BackendDump): void {
-    if (this.queue.length > 0 || this.dirtyData.size > 0) {
+    if (this.queue.length > 0 || this.dirtyData.size > 0 || this.flushing !== null) {
       throw new VfsError("EINVAL", "warm() requires a clean cache");
     }
     for (const { id, attrs } of dump.inodes) {

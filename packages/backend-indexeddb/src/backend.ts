@@ -302,8 +302,12 @@ export class IndexedDBBackend implements WashBackend {
       const existing = await r(tx.objectStore("dirents").get(this.direntKey(parent, name)));
       if (existing) throw new VfsError("EEXIST", name);
       const now = Date.now();
+      // Spread caller-supplied `attrs` (e.g. an explicit mode) BEFORE the
+      // invariants that must always win: `kind` is the parameter, not
+      // whatever the caller's attrs object happens to carry, and every
+      // fresh node starts at nlink 1 regardless of caller input.
       const rec: InodeRecord = {
-        kind, size: 0, mode: this.defaultMode(kind), mtimeMs: now, ctimeMs: now, nlink: 1, ...attrs,
+        size: 0, mode: this.defaultMode(kind), mtimeMs: now, ctimeMs: now, ...attrs, kind, nlink: 1,
       };
       await r(tx.objectStore("inodes").put(rec, id));
       const dirent: DirentRecord = { name, childId: id, kind };

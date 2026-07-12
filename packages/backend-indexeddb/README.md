@@ -11,7 +11,7 @@ One database per mount, four object stores:
 
 | Store     | Key                    | Value                                              |
 |-----------|------------------------|-----------------------------------------------------|
-| `dirents` | `[parentId, name]`     | `{ childId, kind }`                                  |
+| `dirents` | `[parentId, name]`     | `{ name, childId, kind }`                            |
 | `inodes`  | `inodeId` (ULID)       | `{ kind, size, mode, mtimeMs, ctimeMs, nlink, target? }` |
 | `data`    | `[inodeId, chunkIdx]`  | `Uint8Array` (chunked content, default 64 KB chunks) |
 | `meta`    | `string`                | fs metadata (`rootId`, `schemaVersion`)              |
@@ -64,6 +64,10 @@ completion (or surfaces its abort reason) and only then lets the next batch
 start. Reads issued before a flush observe the batch's in-flight writes;
 nothing is durable until `flush()` (driven by `Vfs.fsync()` or
 `CachedBackend`'s flush timer) resolves.
+
+This scheme requires the runtime's IndexedDB implementation to keep a
+transaction alive across microtask continuations, not just synchronous
+request chains — true in Chromium, Firefox, and Safari ≥15.4.
 
 ## Testing
 
