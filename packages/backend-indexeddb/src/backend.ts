@@ -171,6 +171,17 @@ export class IndexedDBBackend implements WashBackend {
     return attrs;
   }
 
+  private direntKey(parent: NodeId, name: string): [NodeId, string] {
+    return [parent, name];
+  }
+
+  /** All dirent keys of one directory. IDB array-key ordering: [parent] sorts
+   * before every [parent, <string>], and [parent, []] sorts after (arrays sort
+   * after strings), so this range brackets exactly the directory's entries. */
+  private direntRange(parent: NodeId): IDBKeyRange {
+    return IDBKeyRange.bound([parent], [parent, []]);
+  }
+
   async getattr(id: NodeId): Promise<Attrs> {
     return this.withTx(async (tx) => this.stripTarget(await this.getInode(tx, id)));
   }
@@ -183,13 +194,54 @@ export class IndexedDBBackend implements WashBackend {
     });
   }
 
-  // Remaining contract ops land in Tasks 3–5.
-  async lookup(): Promise<NodeInfo | null> { throw new VfsError("ENOSYS"); }
-  async readdir(): Promise<Dirent[]> { throw new VfsError("ENOSYS"); }
+  async lookup(parent: NodeId, name: string): Promise<NodeInfo | null> {
+    return this.withTx(async (tx) => {
+      await this.requireDir(tx, parent);
+      const d = (await req(tx.objectStore("dirents").get(this.direntKey(parent, name)))) as DirentRecord | undefined;
+      if (!d) return null;
+      return { id: d.childId, attrs: this.stripTarget(await this.getInode(tx, d.childId)) };
+    });
+  }
+
+  async readdir(id: NodeId): Promise<Dirent[]> {
+    return this.withTx(async (tx) => {
+      await this.requireDir(tx, id);
+      const vals = (await req(tx.objectStore("dirents").getAll(this.direntRange(id)))) as DirentRecord[];
+      return vals.map((v) => ({ name: v.name, childId: v.childId, kind: v.kind }));
+    });
+  }
+
+  async readdirPlus(id: NodeId): Promise<(Dirent & { attrs: Attrs })[]> {
+    return this.withTx(async (tx) => {
+      await this.requireDir(tx, id);
+      const vals = (await req(tx.objectStore("dirents").getAll(this.direntRange(id)))) as DirentRecord[];
+      const out: (Dirent & { attrs: Attrs })[] = [];
+      for (const v of vals) {
+        out.push({ name: v.name, childId: v.childId, kind: v.kind, attrs: this.stripTarget(await this.getInode(tx, v.childId)) });
+      }
+      return out;
+    });
+  }
+
+  async create(parent: NodeId, name: string, id: NodeId, kind: NodeKind, attrs?: Partial<Attrs>): Promise<void> {
+    return this.withTx(async (tx) => {
+      await this.requireDir(tx, parent);
+      const existing = await req(tx.objectStore("dirents").get(this.direntKey(parent, name)));
+      if (existing) throw new VfsError("EEXIST", name);
+      const now = Date.now();
+      const rec: InodeRecord = {
+        kind, size: 0, mode: this.defaultMode(kind), mtimeMs: now, ctimeMs: now, nlink: 1, ...attrs,
+      };
+      await req(tx.objectStore("inodes").put(rec, id));
+      const dirent: DirentRecord = { name, childId: id, kind };
+      await req(tx.objectStore("dirents").put(dirent, this.direntKey(parent, name)));
+    });
+  }
+
+  // Remaining contract ops land in Tasks 4–5.
   async read(): Promise<Uint8Array> { throw new VfsError("ENOSYS"); }
   async write(): Promise<void> { throw new VfsError("ENOSYS"); }
   async truncate(): Promise<void> { throw new VfsError("ENOSYS"); }
-  async create(): Promise<void> { throw new VfsError("ENOSYS"); }
   async unlink(): Promise<void> { throw new VfsError("ENOSYS"); }
   async rename(): Promise<void> { throw new VfsError("ENOSYS"); }
 }
