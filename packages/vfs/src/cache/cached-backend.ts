@@ -258,7 +258,15 @@ export class CachedBackend implements WashBackend {
     const run = (async () => {
       while (this.queue.length > 0) {
         const op = this.queue[0]!;
-        await op(); // rejection leaves the op at the head for retry — see dropVictim/enqueue docs
+        try {
+          await op(); // rejection leaves the op at the head for retry — see dropVictim/enqueue docs
+        } catch (e) {
+          // Give the backend its durability-point callback even though the
+          // drain failed — backends like IndexedDB clear their sticky abort
+          // poison in flush(); without this the queue head can never retry.
+          await this.inner.flush().catch(() => {});
+          throw e;
+        }
         this.queue.shift();
       }
       await this.inner.flush();

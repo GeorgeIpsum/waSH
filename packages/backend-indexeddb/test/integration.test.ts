@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { Vfs, CachedBackend, MemoryBackend, ulid } from "@wash/vfs";
+import { Vfs, CachedBackend, MemoryBackend, ulid, type WashBackend } from "@wash/vfs";
 import { IndexedDBBackend } from "../src/backend.js";
 
 describe("Vfs + CachedBackend + IndexedDBBackend end-to-end", () => {
@@ -43,5 +43,37 @@ describe("Vfs + CachedBackend + IndexedDBBackend end-to-end", () => {
     await vfs.fsync();
     expect(await vfs.readTextFile("/idb/direct.txt")).toBe("y");
     be.close();
+  });
+
+  it("a transient abort mid-batch fails one fsync, then the mount recovers", async () => {
+    const idb = await IndexedDBBackend.open(`abort-recover-${ulid()}`);
+    let armed = true;
+    const sabotaged = new Proxy(idb, {
+      get(target, prop, receiver) {
+        const v = Reflect.get(target, prop, receiver);
+        if (prop === "create") {
+          return async (...args: unknown[]) => {
+            const out = await (v as (...a: unknown[]) => Promise<unknown>).apply(target, args);
+            if (armed) {
+              armed = false;
+              (target as unknown as { tx: IDBTransaction }).tx.abort(); // quota-style failure mid-batch
+            }
+            return out;
+          };
+        }
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as unknown as WashBackend;
+    const cached = new CachedBackend(sabotaged, { flushDelayMs: 60_000 });
+    const root = await cached.root();
+    await cached.create(root, "a", ulid(), "file");
+    const bId = ulid();
+    await cached.create(root, "b", bId, "file");
+    await expect(cached.flush()).rejects.toBeTruthy(); // abort surfaced once
+    await cached.flush(); // MUST recover (pre-fix: rejects forever)
+    expect(cached.pendingOps()).toBe(0);
+    expect((await idb.lookup(root, "b"))?.id).toBe(bId);
+    // Known residual gap (tracked pre-Plan-4 journaling): "a" was dequeued into
+    // the aborted batch and is not replayed — cache has it, inner does not.
   });
 });

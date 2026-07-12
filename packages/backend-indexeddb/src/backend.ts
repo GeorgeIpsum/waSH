@@ -153,10 +153,16 @@ export class IndexedDBBackend implements WashBackend {
    * rejects with the abort reason (spec §10: flush failures fail the next
    * fsync) and clears the poison so the caller can retry.
    *
-   * Residual gap (accepted, tracked): ops that already resolved into an
-   * aborted batch were dequeued by the write-back layer and are not
-   * replayed — the cache stays ahead of inner until those paths are
-   * rewritten again. Full recovery needs journal-until-flush-confirmed in
+   * Residual gap (accepted, tracked): an abort that rolled back
+   * already-dequeued ops leaves the cache ahead of inner permanently until
+   * CachedBackend journaling lands (tracked pre-Plan-4) — those ops were
+   * shifted off the write-back queue before the batch aborted, so they are
+   * never replayed. With the settle-on-failure fix in
+   * `CachedBackend.flush()` (it calls `inner.flush()` on a drain failure
+   * too, not only after a clean drain), fsync itself recovers after
+   * reporting the abort once: the poison clears here, so the *next*
+   * fsync succeeds again instead of throwing forever. Full recovery of the
+   * dequeued-prefix divergence still needs journal-until-flush-confirmed in
    * CachedBackend, tracked alongside the fsync-strict contract work
    * (pre-Plan-4).
    */
