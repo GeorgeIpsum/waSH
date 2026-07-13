@@ -96,6 +96,27 @@ describe("OpfsBackend create/unlink", () => {
     await be.close();
   });
 
+  // Codex wave-6 finding 3: discardPooled used to run BEFORE removeEntry, swallowing
+  // any flush failure unconditionally — if removeEntry then failed, the file survived
+  // but its durability failure had already been silently discarded. Fixed by closing
+  // the pooled handle via closePooled (which queues a flush failure into
+  // pendingFlushErrors like a normal eviction, rather than swallowing it up front) and
+  // only splicing that entry back out as moot once removeEntry actually confirms the
+  // delete. This test only arms "removeEntry" (not "evictFlush"), so it exercises the
+  // ordering fix itself (delete-fails -> file survives, with its map/node entries
+  // intact) rather than the compound double-fault case.
+  it("unlink surfaces a delete failure and preserves the flush poison", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("bytes"));
+    await (be as unknown as { call: (op: string, a: unknown[]) => Promise<unknown> }).call("__injectFault", ["removeEntry", 0]);
+    await expect(be.unlink(root, "f")).rejects.toBeTruthy();
+    expect((await be.lookup(root, "f"))?.id).toBe(f); // still present
+    await be.close();
+  });
+
   it("recreating a name after a failed sidecar cleanup does not inherit stale metadata", async () => {
     const rootName = testRoot();
     const be = await OpfsBackend.open(rootName, { testHooks: true });

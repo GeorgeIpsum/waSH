@@ -713,19 +713,41 @@ const ops: Record<string, OpFn> = {
     const entry = children.get(name);
     if (!entry) throw new VfsError("ENOENT", name);
     const child = node(entry.id);
+    // poisonStart/poisonCount capture the slice of pendingFlushErrors (if any)
+    // introduced by the file branch's closePooled call below — see its comment for
+    // why the swallow-vs-surface decision can't be made until AFTER removeEntry
+    // confirms the delete actually happened.
+    let poisonStart = -1;
+    let poisonCount = 0;
     if (child.kind === "dir") {
       requireDir(child);
       const grand = await ensureChildren(entry.id, child);
       if (grand.size > 0) throw new VfsError("ENOTEMPTY", name);
       await child.dir.removeEntry(SIDECAR_NAME).catch(() => {}); // sidecar-only dir is empty
     } else {
-      discardPooled(entry.id); // content is being destroyed — a flush failure here must not poison fsync
+      // The pooled sync-access handle must be closed before removeEntry below can
+      // succeed (an open handle holds the file's exclusive lock) — but whether a
+      // flush failure here is truly "moot" depends on removeEntry actually
+      // succeeding. Using closePooled (not discardPooled) queues any flush failure
+      // into pendingFlushErrors like a normal eviction would, rather than swallowing
+      // it up front; only once removeEntry below CONFIRMS the bytes are gone do we
+      // splice that entry back out as moot (same pattern as rename's displaced-entry
+      // discard). If removeEntry instead fails, the file survives and a lost flush
+      // is a real durability loss that must stay reported, not be discarded before
+      // its outcome was even known.
+      poisonStart = pendingFlushErrors.length;
+      closePooled(entry.id);
+      poisonCount = pendingFlushErrors.length - poisonStart;
     }
     try {
+      maybeFault("removeEntry");
       await rec.dir.removeEntry(name);
     } catch (e) {
       errnoFromDom(e, name);
     }
+    // removeEntry succeeded — the bytes really are gone, so any flush failure
+    // closePooled captured above is now moot.
+    if (poisonCount > 0) pendingFlushErrors.splice(poisonStart, poisonCount);
     children.delete(name);
     nodes.delete(entry.id);
     rec.mtimeMs = Date.now();
@@ -970,6 +992,14 @@ const ops: Record<string, OpFn> = {
       }
     }
 
+    // PHASE A (primary move) and PHASE B (displaced-shadow resolution) share a single
+    // try/catch whose catch inspects committed state, rather than each having its own
+    // separate handling — see the finding-1/finding-2 write-up. The two P1s this
+    // replaces were the same root problem: failure handling here didn't distinguish
+    // "failed BEFORE committing anything at toName" from "failed AFTER the source is
+    // physically+logically at toName," and the displaced shadow needs deterministic
+    // handling in BOTH shapes.
+    let deferredError: unknown;
     try {
       if (movingRec.kind === "dir") {
         requireDir(movingRec);
@@ -981,113 +1011,159 @@ const ops: Record<string, OpFn> = {
       // movingRec.parentId/name are now rebound to toParent/toName (the move helper's
       // final act above).
     } catch (e) {
-      // Truth-preserving failure: a move helper's own parentId/name rebind is its
-      // final act (moveFileEntry) — or is committed once every physical piece is
-      // relocated (moveTree), independently of any later fallible step such as
-      // moveTree's post-rebind old-dir cleanup. If that rebind already landed here,
-      // even though the op as a whole is about to fail, the dentry maps must be made
-      // to match it NOW, before any restore/rethrow below — maps always match the
-      // last committed rebind, even on a failed op. When the rebind never landed
-      // (the far more common case), fall through to the pre-existing
-      // displaced-entry restore path instead.
-      if (movingRec.parentId === toParent && movingRec.name === toName) {
-        fromChildren.delete(fromName);
-        toChildren.set(toName, moving);
-        fp.mtimeMs = Date.now();
-        tp.mtimeMs = Date.now();
+      // Truth-preserving check: a move helper's own parentId/name rebind is its final
+      // act (moveFileEntry) — or is committed once every physical piece is relocated
+      // (moveTree), independently of any later fallible step such as moveTree's
+      // post-rebind old-dir cleanup. sourceCommitted distinguishes the two failure
+      // shapes this op must handle differently.
+      const sourceCommitted = movingRec.parentId === toParent && movingRec.name === toName;
+      if (!sourceCommitted) {
+        // PHASE A never landed (the far more common case): fromName still
+        // truthfully holds the source (disk and memory agree) — this is a clean
+        // abort. Resolve the displaced shadow (if any) back onto `toName` before
+        // rethrowing.
+        if (displaced && shadowName !== undefined) {
+          const dispRec = node(displaced.id);
+          if (dispRec.kind === "dir") {
+            // Directory moves are non-atomic (BackendCaps.renameCost === "subtree"):
+            // moveTree's FIRST fallible step (getDirectoryHandle(toName, {create:
+            // true})) may already have created `toName`, and its child loop rebinds
+            // each child NodeRec as it recurses — independently of the parent's OWN
+            // rebind, which lands only once every child has moved. So "source not
+            // committed" here does NOT mean `toName` is disk-only debris: some
+            // descendant NodeRecs may already be truthfully rebound to live
+            // physically under it. Recursive-deleting or shadow-rebinding on top of
+            // a partial `toName` would destroy or shadow those already-relocated
+            // children. Detect the partial case precisely rather than assume either
+            // way: does `toName` exist on disk at all right now?
+            let strayExists = true;
+            try {
+              await tp.dir.getDirectoryHandle(toName);
+            } catch (probeErr) {
+              if ((probeErr as { name?: string } | null)?.name === "NotFoundError") strayExists = false;
+            }
+            // Absent: safe to move the shadow straight back under its original name.
+            // Present (a genuine partial left by THIS failed attempt): do not touch
+            // it — recover the displaced entry under a fresh, discoverable name
+            // instead, and leave the partial `toName` as documented
+            // non-atomic-failure debris (accepted for v1: renameCost === "subtree").
+            const restoreName = strayExists ? `${toName}.wash-recovered-${ulid()}` : toName;
+            try {
+              requireDir(dispRec);
+              await moveTree(dispRec, displaced.id, toParent, tp.dir, restoreName);
+              // dispRec.name is now restoreName (rebound by the move helper above).
+              toChildren.set(restoreName, displaced);
+              if (tp.sidecar![shadowName]) {
+                tp.sidecar = renameSidecarEntry(tp.sidecar!, shadowName, restoreName);
+                await writeSidecarFile(tp);
+              }
+            } catch {
+              // Double failure: the data still survives on disk under the
+              // discoverable shadow name. A move helper's rebind is unconditionally
+              // its last act, so a thrown restore never reached it — read
+              // dispRec.name fresh (rather than assuming shadowName) so in-memory
+              // maps always match the rec's last successfully-committed rebind.
+              toChildren.set(dispRec.name, displaced);
+            }
+          } else {
+            // File (and symlink) moves are atomic: native FileSystemFileHandle.move()
+            // either fully lands or doesn't, and the copy+delete fallback commits
+            // rec.parentId/name as its unconditional last act (see moveFileEntry's
+            // header comment) — so "source not committed" here really does mean
+            // nothing of this failed attempt reached `toName`. Any stray entry there
+            // is disk-only debris from that same attempt, safe to clear before
+            // restoring the shadow on top of it.
+            await tp.dir.removeEntry(toName).catch(() => {});
+            try {
+              requireFile(dispRec);
+              await moveFileEntry(dispRec, displaced.id, toParent, tp.dir, toName);
+              // dispRec.name is now toName (rebound by the move helper above).
+              toChildren.set(toName, displaced);
+              // The shadow's sidecar record travels back with it, overwriting
+              // whatever the pre-move transport above wrote to `toName` (that
+              // annotation described the entry that just failed to move in, not the
+              // restored displaced entry).
+              if (tp.sidecar![shadowName]) {
+                tp.sidecar = renameSidecarEntry(tp.sidecar!, shadowName, toName);
+                await writeSidecarFile(tp);
+              }
+            } catch {
+              toChildren.set(dispRec.name, displaced);
+            }
+          }
+        }
         throw e;
       }
-      // If the pre-move sidecar write above landed, tp.sidecar[toName] now holds an
-      // annotation for a name the primary move never reached. On this failure path
-      // that's either tolerated garbage (no displaced entry: `toName` never becomes a
-      // real disk entry, and ensureChildren only overlays sidecar metadata onto names
-      // that exist on disk) or it gets overwritten below when the displaced entry's
-      // own record is renamed back from `shadowName` onto `toName`.
-      if (displaced && shadowName !== undefined) {
-        const dispRec = node(displaced.id);
-        // Best-effort restore: move the shadow back to `toName` so the displaced
-        // entry survives the failed rename under its original name. Because the move
-        // helper reads its own oldName from dispRec at call time (not from a stale
-        // caller-held copy), and dispRec.name is currently shadowName (rebound when it
-        // was shadowed above), the helper's trailing source-cleanup correctly targets
-        // shadowName here — not toName, which the primary move never reached.
-        try {
-          if (dispRec.kind === "dir") {
-            requireDir(dispRec);
-            await moveTree(dispRec, displaced.id, toParent, tp.dir, toName);
-          } else {
-            requireFile(dispRec);
-            await moveFileEntry(dispRec, displaced.id, toParent, tp.dir, toName);
-          }
-          // dispRec.name is now toName (rebound by the move helper above).
-          toChildren.set(toName, displaced);
-          // The shadow's sidecar record travels back with it, overwriting whatever
-          // the pre-move transport above wrote to `toName` (that annotation described
-          // the entry that just failed to move in, not the restored displaced entry).
-          if (tp.sidecar![shadowName]) {
-            tp.sidecar = renameSidecarEntry(tp.sidecar!, shadowName, toName);
-            await writeSidecarFile(tp);
-          }
-        } catch {
-          // Double failure: the data still survives on disk under the discoverable
-          // shadow name. A move helper's parentId/name rebind is unconditionally its
-          // last two statements, so a thrown restore never reached them — dispRec.name
-          // is still shadowName here. Read it fresh (rather than assuming shadowName)
-          // so in-memory maps always match the rec's last successfully-committed
-          // rebind, whatever that was.
-          toChildren.set(dispRec.name, displaced);
-        }
-      }
-      throw e;
+      // PHASE A committed but a later step threw (moveTree's post-rebind-cleanup —
+      // its best-effort old-dir removeEntry, the only fallible step after the
+      // rebind). Defer the error and fall through to the shared post-commit path
+      // below, so the displaced shadow is resolved on THIS path too (finding 2)
+      // before rethrowing — this used to run only on the happy path, leaving a
+      // post-commit-cleanup failure's displaced shadow stranded and invisible to
+      // toChildren.
+      deferredError = e;
     }
 
-    // The primary move committed — this is the point of no return. Commit the dentry
-    // maps and parent mtimes immediately, before any further (best-effort) cleanup
-    // below, so a later failure in that cleanup can never leave the maps stale.
-    // movingRec.parentId/name were already rebound to toParent/toName by the move
-    // helper above; only the dentry maps need updating here.
+    // PHASE A committed — either cleanly, or via the deferred post-rebind-cleanup
+    // failure above. This is the point of no return either way: commit the dentry
+    // maps and parent mtimes now, before any further (best-effort) cleanup below, so
+    // a later failure in that cleanup can never leave the maps stale. movingRec's
+    // parentId/name were already rebound to toParent/toName by the move helper
+    // above; only the dentry maps need updating here.
     fromChildren.delete(fromName);
     toChildren.set(toName, moving);
     fp.mtimeMs = Date.now();
     tp.mtimeMs = Date.now();
 
-    // The source move succeeded — the destination is now confirmed replaced, so it is
-    // finally safe to irreversibly discard the shadowed, displaced entry. This is
-    // deliberately the LAST step of the displacement handling.
+    // The source is confirmed at `toName` — the destination is truly replaced, so it
+    // is finally safe to irreversibly discard the shadowed, displaced entry. Runs on
+    // BOTH commit paths above (clean success and the deferred post-rebind-cleanup
+    // failure alike) — see finding 2.
     if (displaced && shadowName !== undefined) {
-      const dispRec = node(displaced.id);
-      if (dispRec.kind === "dir") {
-        requireDir(dispRec);
-        await dispRec.dir.removeEntry(SIDECAR_NAME).catch(() => {});
-      } else {
-        discardPooled(displaced.id); // content is being destroyed — must not poison fsync
-        // The primary move succeeded, so the displaced entry's bytes really are being
-        // intentionally destroyed now — if the closePooled teardown above queued any
-        // entries into pendingFlushErrors, those entries describe bytes nobody will
-        // ever read again and must not fail a later, unrelated fsync. Splice out only
-        // the slice THIS op introduced (by index range, not by value) — an
-        // already-queued entry from some earlier, unrelated failure sits BEFORE that
-        // range, and the moved source's own close (during the primary move above, if
-        // ITS flush also failed) sits AFTER it; both stay reported. On the restore
-        // path (primary move failed, shadow moved back to `toName`) this line is
-        // never reached, so that poison correctly stays live — the file survives the
-        // failed rename, so a real flush failure against it still matters.
-        if (displacedPoisonCount > 0) pendingFlushErrors.splice(displacedPoisonStart, displacedPoisonCount);
-      }
-      // Defense-in-depth: the shadow name is our own throwaway, never exposed to a
-      // caller, so it can never legitimately be "already gone" except via a prior
-      // partial failure in this very op — tolerate only that.
       try {
-        await tp.dir.removeEntry(shadowName);
-      } catch (e) {
-        if ((e as { name?: string } | null)?.name !== "NotFoundError") errnoFromDom(e, shadowName);
-      }
-      nodes.delete(displaced.id);
-      // The shadow name never existed before this rename and is gone now — drop its
-      // (moved-aside) sidecar record so it doesn't linger as unreachable garbage.
-      if (tp.sidecar![shadowName]) {
-        tp.sidecar = setSidecarEntry(tp.sidecar!, shadowName, { mode: undefined, symlink: undefined });
-        await writeSidecarFile(tp);
+        const dispRec = node(displaced.id);
+        if (dispRec.kind === "dir") {
+          requireDir(dispRec);
+          await dispRec.dir.removeEntry(SIDECAR_NAME).catch(() => {});
+        } else {
+          discardPooled(displaced.id); // content is being destroyed — must not poison fsync
+          // The source move succeeded, so the displaced entry's bytes really are being
+          // intentionally destroyed now — if the closePooled teardown above queued any
+          // entries into pendingFlushErrors, those entries describe bytes nobody will
+          // ever read again and must not fail a later, unrelated fsync. Splice out only
+          // the slice THIS op introduced (by index range, not by value) — an
+          // already-queued entry from some earlier, unrelated failure sits BEFORE that
+          // range, and the moved source's own close (during the primary move above, if
+          // ITS flush also failed) sits AFTER it; both stay reported. On the restore
+          // path (primary move failed, shadow moved back to `toName`) this block is
+          // never reached, so that poison correctly stays live — the file survives the
+          // failed rename, so a real flush failure against it still matters.
+          if (displacedPoisonCount > 0) pendingFlushErrors.splice(displacedPoisonStart, displacedPoisonCount);
+        }
+        // Defense-in-depth: the shadow name is our own throwaway, never exposed to a
+        // caller, so it can never legitimately be "already gone" except via a prior
+        // partial failure in this very op — tolerate only that.
+        try {
+          await tp.dir.removeEntry(shadowName);
+        } catch (e) {
+          if ((e as { name?: string } | null)?.name !== "NotFoundError") errnoFromDom(e, shadowName);
+        }
+        nodes.delete(displaced.id);
+        // The shadow name never existed before this rename and is gone now — drop its
+        // (moved-aside) sidecar record so it doesn't linger as unreachable garbage.
+        if (tp.sidecar![shadowName]) {
+          tp.sidecar = setSidecarEntry(tp.sidecar!, shadowName, { mode: undefined, symlink: undefined });
+          await writeSidecarFile(tp);
+        }
+      } catch (discardErr) {
+        // A deferred post-rebind-cleanup failure (finding 2's path) is already
+        // pending: that original error — not this best-effort discard's own failure —
+        // is what the op reports. The dentry maps are already truth-preserving
+        // regardless (committed above), so any residual shadow debris here is
+        // discoverable garbage, same tolerance as other best-effort cleanups in this
+        // file. On the pure happy path (no deferred error) this rethrows exactly as
+        // before.
+        if (deferredError === undefined) throw discardErr;
       }
     }
 
@@ -1107,6 +1183,7 @@ const ops: Record<string, OpFn> = {
       }
     }
 
+    if (deferredError !== undefined) throw deferredError;
     return { value: undefined };
   },
 };
