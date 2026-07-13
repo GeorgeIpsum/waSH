@@ -114,4 +114,26 @@ describe("Vfs metadata ops", () => {
     await vfs.mkdir("/ln/sub", { recursive: true }); // dir-symlink component is fine
     expect((await vfs.stat("/real/sub")).kind).toBe("dir");
   });
+
+  it("rm -r refuses an active mountpoint without touching its contents", async () => {
+    await vfs.mkdir("/mnt");
+    await vfs.mount("/mnt", new MemoryBackend());
+    await vfs.writeFile("/mnt/precious", "data");
+    await expect(vfs.rm("/mnt", { recursive: true })).rejects.toMatchObject({ errno: "EBUSY" });
+    expect(await vfs.readTextFile("/mnt/precious")).toBe("data");
+  });
+
+  it("rm -r of an ancestor stops at a nested mountpoint without deleting mounted contents", async () => {
+    await vfs.mkdir("/d");
+    await vfs.mkdir("/d/m");
+    await vfs.mount("/d/m", new MemoryBackend());
+    await vfs.writeFile("/d/m/keep", "x");
+    await expect(vfs.rm("/d", { recursive: true })).rejects.toMatchObject({ errno: "EBUSY" });
+    expect(await vfs.readTextFile("/d/m/keep")).toBe("x");
+  });
+
+  it("mount rejects a non-directory mountpoint", async () => {
+    await vfs.writeFile("/f", "x");
+    await expect(vfs.mount("/f", new MemoryBackend())).rejects.toMatchObject({ errno: "ENOTDIR" });
+  });
 });

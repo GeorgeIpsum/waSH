@@ -72,7 +72,10 @@ export class Vfs {
     const p = normalize(path);
     if (this.mounts.length === 0 && p !== "/") throw new VfsError("EINVAL", "first mount must be /");
     if (this.mounts.some((m) => m.path === p)) throw new VfsError("EEXIST", p);
-    if (p !== "/") await this.resolve(p); // mountpoint must exist on parent mount
+    if (p !== "/") {
+      const at = await this.resolve(p); // mountpoint must exist on parent mount
+      if (at.attrs.kind !== "dir") throw new VfsError("ENOTDIR", p);
+    }
     let release: (() => void) | undefined;
     const locks = (globalThis as { navigator?: { locks?: LockManagerLike } }).navigator?.locks;
     if (opts.exclusive && locks) {
@@ -211,6 +214,8 @@ export class Vfs {
   }
 
   async rm(path: string, opts: { recursive?: boolean } = {}): Promise<void> {
+    const p = normalize(path);
+    if (this.isMountpoint(p)) throw new VfsError("EBUSY", p);
     const attrs = await this.lstat(path);
     if (attrs.kind === "dir") {
       if (!opts.recursive) return this.rmdir(path);
