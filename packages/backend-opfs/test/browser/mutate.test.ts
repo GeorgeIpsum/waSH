@@ -96,6 +96,32 @@ describe("OpfsBackend create/unlink", () => {
     await be.close();
   });
 
+  it("recreating a name after a failed sidecar cleanup does not inherit stale metadata", async () => {
+    const rootName = testRoot();
+    const be = await OpfsBackend.open(rootName, { testHooks: true });
+    const root = await be.root();
+    const f1 = ulid();
+    // This create's own sidecar write (mode 0o700 → non-default) happens BEFORE
+    // __injectFault is armed below, so it succeeds untouched and is not part of the
+    // fault-site count.
+    await be.create(root, "x", f1, "file", { mode: 0o700 }); // sidecar record written
+    // skip=0: the very next maybeFault("sidecarWrite") trigger fails. The only
+    // writeSidecarFile call between here and that trigger is unlink's own best-effort
+    // cleanup write below — so skip=0 lands exactly on the unlink cleanup, not on some
+    // earlier create.
+    await (be as unknown as { call: (op: string, a: unknown[]) => Promise<unknown> }).call("__injectFault", ["sidecarWrite", 0]);
+    await be.unlink(root, "x"); // cleanup write fails, swallowed by design → stale record on disk
+    const f2 = ulid();
+    await be.create(root, "x", f2, "file"); // default mode — pre-fix: skips sidecar entirely
+    expect((await be.lookup(root, "x"))?.attrs.mode).toBe(0o644);
+    await be.close();
+
+    const be2 = await OpfsBackend.open(rootName);
+    const root2 = await be2.root();
+    expect((await be2.lookup(root2, "x"))?.attrs.mode).toBe(0o644); // pre-fix: stale 0o700 applied
+    await be2.close();
+  });
+
   it("created entries persist across reopen", async () => {
     const rootName = testRoot();
     const be = await OpfsBackend.open(rootName);

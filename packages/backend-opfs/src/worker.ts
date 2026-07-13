@@ -604,6 +604,16 @@ const ops: Record<string, OpFn> = {
 
   async close(): Promise<OpResult> {
     pool.clear(true);
+    // close() is often the LAST durability checkpoint a caller will ever see for this
+    // worker — the client tears the worker down right after this resolves/rejects, so
+    // any eviction-flush failure poisoned by the clear() above must be surfaced NOW.
+    // Left unreported here it would vanish for good (the worker that could have
+    // reported it on a later flush no longer exists). One-shot, same as flush().
+    if (pendingFlushError) {
+      const e = pendingFlushError;
+      pendingFlushError = null;
+      throw e;
+    }
     return { value: undefined };
   },
 
@@ -626,11 +636,23 @@ const ops: Record<string, OpFn> = {
       errnoFromDom(e, name);
     }
     const mode = attrs?.mode !== undefined ? attrs.mode & 0o777 : defaultMode(kind);
-    if (mode !== defaultMode(kind)) {
+    // A stale sidecar record can already be sitting at `name` — e.g. left behind by an
+    // unlink whose best-effort cleanup write itself failed under quota pressure (that
+    // failure is swallowed by design; see unlink below). A default-mode create used to
+    // skip the sidecar entirely, silently inheriting that stale record on the next
+    // reopen (ensureChildren applies sidecar metadata to whatever disk entry currently
+    // occupies the name). Always check for one. A non-default create must also write
+    // an explicit `symlink: undefined` alongside `mode`, not just `{ mode }`:
+    // setSidecarEntry MERGES onto the existing entry rather than replacing it, so a
+    // stale `symlink` field from an old record would otherwise survive untouched.
+    await ensureSidecar(rec);
+    if (rec.sidecar![name] || mode !== defaultMode(kind)) {
       const prevSidecar = rec.sidecar;
       try {
-        await ensureSidecar(rec);
-        rec.sidecar = setSidecarEntry(rec.sidecar!, name, { mode });
+        rec.sidecar = setSidecarEntry(rec.sidecar!, name, {
+          mode: mode !== defaultMode(kind) ? mode : undefined,
+          symlink: undefined,
+        });
         await writeSidecarFile(rec);
       } catch (e) {
         // Roll back the disk create so a failed op leaves no residue: the in-memory
@@ -677,15 +699,26 @@ const ops: Record<string, OpFn> = {
     nodes.delete(entry.id);
     rec.mtimeMs = Date.now();
     try {
-      // Best-effort: a stale sidecar entry for a deleted name is harmless garbage —
-      // ensureChildren only overlays sidecar metadata onto names that still exist on
-      // disk, so the orphaned entry is inert and gets dropped on the next successful
-      // sidecar write for this directory. Swallowing here keeps the disk+memory commit
-      // (above) authoritative even if this cleanup fails (e.g. quota).
+      // Best-effort: a stale sidecar entry for a deleted name is harmless garbage while
+      // the name stays deleted — ensureChildren only overlays sidecar metadata onto
+      // names that still exist on disk. It stops being harmless the moment a NEW entry
+      // is created at this same name (create's own stale-record check, above, is what
+      // clears it then) — which is exactly why, unlike the swallow below, a FAILED
+      // write here must not optimistically update rec.sidecar in memory: if the write
+      // never reached disk, memory has to keep reporting the record as present so a
+      // later create at this name still sees it and clears it for real, rather than
+      // wrongly believing (from an in-memory-only clear) that there is nothing left to
+      // clear while the stale record silently persists on disk.
       await ensureSidecar(rec);
       if (rec.sidecar![name]) {
+        const prevSidecar = rec.sidecar;
         rec.sidecar = setSidecarEntry(rec.sidecar!, name, { mode: undefined, symlink: undefined });
-        await writeSidecarFile(rec);
+        try {
+          await writeSidecarFile(rec);
+        } catch (e) {
+          rec.sidecar = prevSidecar;
+          throw e;
+        }
       }
     } catch {
       // swallowed — see comment above.
@@ -712,7 +745,11 @@ const ops: Record<string, OpFn> = {
     const prevSidecar = rec.sidecar;
     try {
       await ensureSidecar(rec);
-      rec.sidecar = setSidecarEntry(rec.sidecar!, name, { symlink: target });
+      // Explicit `mode: undefined` clears any stale mode field a leftover record for
+      // `name` might carry — setSidecarEntry merges onto the existing entry rather
+      // than replacing it, so a bare `{ symlink: target }` patch would otherwise let
+      // that stale field survive (see create's own audit above for the mirror case).
+      rec.sidecar = setSidecarEntry(rec.sidecar!, name, { symlink: target, mode: undefined });
       await writeSidecarFile(rec);
     } catch (e) {
       rec.sidecar = prevSidecar;

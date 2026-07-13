@@ -117,4 +117,16 @@ describe("OpfsBackend content", () => {
     await be.flush(); // cleared
     await be.close();
   });
+
+  it("close() surfaces a final flush failure instead of pretending durability", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, new TextEncoder().encode("dirty"));
+    await (be as unknown as { call: (op: string, a: unknown[]) => Promise<unknown> }).call("__injectFault", ["evictFlush", 0]);
+    await expect(be.close()).rejects.toMatchObject({ errno: "ENOSPC" });
+    // worker is still torn down: subsequent calls reject immediately
+    await expect(be.getattr(root)).rejects.toBeTruthy();
+  });
 });

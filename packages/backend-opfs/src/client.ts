@@ -68,10 +68,17 @@ export class OpfsBackend implements WashBackend {
 
   async close(): Promise<void> {
     if (this.closed) return;
-    await this.call("close", []);
-    this.closed = true;
-    this.worker.terminate();
-    this.failAllPending(new Error("OpfsBackend closed"));
+    try {
+      await this.call("close", []);
+    } finally {
+      // The worker is torn down and pending calls are failed EVEN when the close RPC
+      // itself rejects (e.g. it surfaced a final poisoned flush failure) — close is
+      // often the last durability checkpoint a caller sees, so that rejection must
+      // propagate to the caller rather than being masked by cleanup.
+      this.closed = true;
+      this.worker.terminate();
+      this.failAllPending(new VfsError("EBADF", "backend closed"));
+    }
   }
 
   async root(): Promise<NodeId> {
