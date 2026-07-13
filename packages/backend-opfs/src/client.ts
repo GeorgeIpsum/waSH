@@ -58,7 +58,7 @@ export class OpfsBackend implements WashBackend {
   }
 
   private call(op: string, args: unknown[], transfer: Transferable[] = []): Promise<unknown> {
-    if (this.closed) return Promise.reject(new Error("OpfsBackend is closed"));
+    if (this.closed) return Promise.reject(new VfsError("EBADF", "backend closed"));
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       this.pending.set(id, { resolve, reject });

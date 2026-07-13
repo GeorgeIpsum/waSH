@@ -19,6 +19,12 @@ export class Lru<K, V> {
     return v;
   }
 
+  /** Like `get`, but never refreshes recency — for callers that only inspect the
+   * current pool state (getattr, flush) without treating the access as a "use". */
+  peek(k: K): V | undefined {
+    return this.map.get(k);
+  }
+
   set(k: K, v: V): void {
     this.map.delete(k);
     this.map.set(k, v);

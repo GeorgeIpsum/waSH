@@ -74,6 +74,20 @@ this down). `.wash-attrs` is declared in `caps.reservedNames`: the backend
 hides it from `readdir`/`lookup` and rejects user `create`/`unlink`/`rename`
 targeting that name with `EPERM` (precedent: `.git`).
 
+**`.wash-shadow-*` is crash residue, not a reserved name.** A directory
+rename that displaces an existing entry moves the displaced entry aside to a
+throwaway `.wash-shadow-<ulid>` name first (see `worker.ts`'s shadow-rename
+comment), only discarding it once the primary move has confirmed success.
+Ops run strictly sequentially through one in-worker chain, so no reader ever
+observes this name mid-op — but if the *worker itself* dies mid-rename (tab
+closed, OOM-killed, browser crash), a `.wash-shadow-*` entry can be left
+behind on disk. Unlike `.wash-attrs`, this prefix is **not** in
+`caps.reservedNames`: it is deliberately left as ordinary, visible,
+`readdir`-able garbage rather than hidden magic, so a user (or `wash rm`) can
+find and remove it like any other file. `open()` does not scan for or
+auto-clean these on mount; recovering from a mid-rename crash is a manual
+step for now.
+
 **File mtime tracks `File.lastModified`, free.** A file's mtime is
 `File.lastModified` unless something in the *current* worker session says
 otherwise: an in-session `write`/`truncate` or an explicit

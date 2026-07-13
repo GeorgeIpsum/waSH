@@ -448,7 +448,7 @@ const ops: Record<string, OpFn> = {
 
   async flush(): Promise<OpResult> {
     for (const id of [...pool.keys()]) {
-      const h = pool.get(id);
+      const h = pool.peek(id);
       try {
         h?.flush();
       } catch {
@@ -794,7 +794,7 @@ async function attrsOf(id: NodeId, rec: NodeRec): Promise<Attrs> {
   let size = 0;
   let mtimeMs = rec.mtimeMs;
   if (rec.kind === "file" && rec.file) {
-    const pooled = pool.get(id);
+    const pooled = pool.peek(id);
     if (pooled) {
       // A pooled sync-access handle is authoritative over getFile(): unflushed
       // writes/truncates are invisible to getFile() until flush(), but getSize()

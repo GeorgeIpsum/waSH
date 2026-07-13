@@ -14,6 +14,18 @@ describe("Lru", () => {
     expect([...lru.keys()].sort()).toEqual(["a", "c"]);
   });
 
+  it("peek reads without refreshing recency", () => {
+    const evicted: string[] = [];
+    const lru = new Lru<string, number>(2, (k) => evicted.push(k));
+    lru.set("a", 1);
+    lru.set("b", 2);
+    expect(lru.peek("a")).toBe(1); // does NOT refresh a's recency
+    lru.set("c", 3); // evicts a (still least-recently-used), not b
+    expect(evicted).toEqual(["a"]);
+    expect(lru.peek("a")).toBeUndefined();
+    expect([...lru.keys()].sort()).toEqual(["b", "c"]);
+  });
+
   it("delete and clear control eviction callbacks explicitly", () => {
     const onEvict = vi.fn();
     const lru = new Lru<string, number>(4, onEvict);

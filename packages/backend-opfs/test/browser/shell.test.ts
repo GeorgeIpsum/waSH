@@ -64,6 +64,6 @@ describe("OpfsBackend shell", () => {
     const root = await be.root();
     await be.close();
     await be.close(); // second close: no hang
-    await expect(be.getattr(root)).rejects.toThrow(/closed/);
+    await expect(be.getattr(root)).rejects.toMatchObject({ errno: "EBADF" });
   });
 });

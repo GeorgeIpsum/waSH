@@ -264,6 +264,12 @@ export function runBackendConformance(
         expect((await be.readdir(root)).map((d) => d.name)).not.toContain(reserved);
         expect(await be.lookup(root, reserved)).toBeNull();
       });
+
+      it("symlink onto a reserved name is rejected", async (ctx) => {
+        const reserved = be.caps.reservedNames?.[0];
+        if (!reserved || be.caps.symlinks !== "supported" || !be.symlink) return ctx.skip();
+        await expect(be.symlink(root, reserved, ulid(), "/t")).rejects.toMatchObject({ errno: "EPERM" });
+      });
     });
 
     describe("flush", () => {
