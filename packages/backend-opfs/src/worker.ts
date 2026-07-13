@@ -1,7 +1,15 @@
 /// <reference lib="webworker" />
-import type { Attrs, NodeId, NodeKind } from "@wash/vfs";
+import type { Attrs, Dirent, NodeId, NodeInfo, NodeKind } from "@wash/vfs";
 import { VfsError, ulid } from "@wash/vfs";
 import type { RpcRequest, RpcResponse } from "./rpc.js";
+import {
+  parseSidecar,
+  serializeSidecar,
+  setSidecarEntry,
+  renameSidecarEntry,
+  isEmptySidecar,
+  type Sidecar,
+} from "./sidecar.js";
 
 export const SIDECAR_NAME = ".wash-attrs";
 
@@ -15,9 +23,11 @@ interface NodeRec {
   mode: number;
   mtimeMs: number;
   ctimeMs: number;
+  /** Set by setattr: an explicit utimes wins over File.lastModified in attrsOf. */
+  mtimeExplicit?: boolean;
   children?: Map<string, { id: NodeId; kind: NodeKind }>; // dirs (excludes the sidecar)
   childrenComplete?: boolean;
-  sidecar?: Record<string, { mode?: number; symlink?: string }>; // dirs, lazy
+  sidecar?: Sidecar; // dirs, lazy
 }
 
 const nodes = new Map<NodeId, NodeRec>();
@@ -44,6 +54,84 @@ export function errnoFromDom(e: unknown, path?: string): never {
   throw e;
 }
 
+function requireDir(rec: NodeRec): asserts rec is NodeRec & { dir: FileSystemDirectoryHandle } {
+  if (rec.kind !== "dir" || !rec.dir) throw new VfsError("ENOTDIR");
+}
+
+async function ensureSidecar(rec: NodeRec & { dir: FileSystemDirectoryHandle }): Promise<Sidecar> {
+  if (rec.sidecar) return rec.sidecar;
+  try {
+    const fh = await rec.dir.getFileHandle(SIDECAR_NAME);
+    rec.sidecar = parseSidecar(await (await fh.getFile()).text());
+  } catch {
+    rec.sidecar = {};
+  }
+  return rec.sidecar;
+}
+
+async function writeSidecarFile(rec: NodeRec & { dir: FileSystemDirectoryHandle }): Promise<void> {
+  const sidecar = rec.sidecar ?? {};
+  if (isEmptySidecar(sidecar)) {
+    await rec.dir.removeEntry(SIDECAR_NAME).catch(() => {});
+    return;
+  }
+  const fh = await rec.dir.getFileHandle(SIDECAR_NAME, { create: true });
+  const handle = await fh.createSyncAccessHandle();
+  try {
+    const bytes = new TextEncoder().encode(serializeSidecar(sidecar));
+    handle.truncate(0);
+    handle.write(bytes, { at: 0 });
+    handle.flush();
+  } finally {
+    handle.close();
+  }
+}
+
+function registerChild(
+  parentId: NodeId,
+  name: string,
+  kind: NodeKind,
+  handles: { dir?: FileSystemDirectoryHandle; file?: FileSystemFileHandle },
+  opts: { id?: NodeId; mode?: number; target?: string } = {},
+): NodeId {
+  const id = opts.id ?? ulid();
+  const now = Date.now();
+  nodes.set(id, {
+    kind, parentId, name,
+    dir: handles.dir, file: handles.file,
+    target: opts.target,
+    mode: opts.mode ?? defaultMode(kind),
+    mtimeMs: now, ctimeMs: now,
+  });
+  const parent = node(parentId);
+  parent.children ??= new Map();
+  parent.children.set(name, { id, kind });
+  return id;
+}
+
+async function ensureChildren(
+  id: NodeId,
+  rec: NodeRec & { dir: FileSystemDirectoryHandle },
+): Promise<Map<string, { id: NodeId; kind: NodeKind }>> {
+  if (rec.childrenComplete && rec.children) return rec.children;
+  const sidecar = await ensureSidecar(rec);
+  rec.children ??= new Map();
+  for await (const [name, handle] of rec.dir.entries()) {
+    if (name === SIDECAR_NAME) continue;
+    if (rec.children.has(name)) continue;
+    const meta = sidecar[name];
+    if (handle.kind === "directory") {
+      registerChild(id, name, "dir", { dir: handle as FileSystemDirectoryHandle }, { mode: meta?.mode });
+    } else if (meta?.symlink !== undefined) {
+      registerChild(id, name, "symlink", { file: handle as FileSystemFileHandle }, { mode: meta.mode, target: meta.symlink });
+    } else {
+      registerChild(id, name, "file", { file: handle as FileSystemFileHandle }, { mode: meta?.mode });
+    }
+  }
+  rec.childrenComplete = true;
+  return rec.children;
+}
+
 type OpResult = { value: unknown; transfer?: Transferable[] };
 type OpFn = (...args: never[]) => Promise<OpResult>;
 
@@ -67,6 +155,48 @@ const ops: Record<string, OpFn> = {
     return { value: attrs };
   },
 
+  async lookup(parent: NodeId, name: string): Promise<OpResult> {
+    const rec = node(parent);
+    requireDir(rec);
+    if (name === SIDECAR_NAME) return { value: null };
+    const children = await ensureChildren(parent, rec);
+    const entry = children.get(name);
+    if (!entry) return { value: null };
+    const info: NodeInfo = { id: entry.id, attrs: await attrsOf(node(entry.id)) };
+    return { value: info };
+  },
+
+  async readdir(id: NodeId): Promise<OpResult> {
+    const rec = node(id);
+    requireDir(rec);
+    const children = await ensureChildren(id, rec);
+    const out: Dirent[] = [];
+    for (const [name, e] of children) out.push({ name, childId: e.id, kind: e.kind });
+    return { value: out };
+  },
+
+  async setattr(id: NodeId, attrs: Partial<Pick<Attrs, "mode" | "mtimeMs" | "ctimeMs">>): Promise<OpResult> {
+    const rec = node(id);
+    if (attrs.mtimeMs !== undefined) {
+      rec.mtimeMs = attrs.mtimeMs;
+      rec.mtimeExplicit = true;
+    }
+    if (attrs.ctimeMs !== undefined) rec.ctimeMs = attrs.ctimeMs;
+    if (attrs.mode !== undefined) {
+      rec.mode = attrs.mode & 0o777;
+      if (rec.parentId !== null) {
+        const parent = node(rec.parentId);
+        requireDir(parent);
+        await ensureSidecar(parent);
+        parent.sidecar = setSidecarEntry(parent.sidecar!, rec.name, {
+          mode: rec.mode === defaultMode(rec.kind) ? undefined : rec.mode,
+        });
+        await writeSidecarFile(parent);
+      }
+    }
+    return { value: undefined };
+  },
+
   async flush(): Promise<OpResult> {
     return { value: undefined }; // pooled-handle flushing arrives in Task 5
   },
@@ -82,7 +212,7 @@ async function attrsOf(rec: NodeRec): Promise<Attrs> {
   if (rec.kind === "file" && rec.file) {
     const f = await rec.file.getFile();
     size = f.size;
-    mtimeMs = rec.mtimeMs > f.lastModified ? rec.mtimeMs : f.lastModified;
+    mtimeMs = rec.mtimeExplicit || rec.mtimeMs > f.lastModified ? rec.mtimeMs : f.lastModified;
   } else if (rec.kind === "symlink") {
     size = rec.target?.length ?? 0;
   }
