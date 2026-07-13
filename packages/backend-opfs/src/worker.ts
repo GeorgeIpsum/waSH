@@ -39,21 +39,25 @@ let poolSize = 64;
 // `testHooks: true`): `armed === null` is the fast path that makes every
 // `maybeFault` call a no-op in production, with zero allocation. Only when a
 // test opts in does `open` allocate the map and register `__injectFault`.
-// The value is a skip count: a site armed with N lets the first N triggers
-// through untouched (decrementing), then disarms and throws on trigger N+1 —
-// this lets a test single out which of several call sites for the same named
-// site (e.g. a shadow-rename's aside move vs. its primary move) actually fails.
-let armed: Map<string, number> | null = null;
+// Each site is armed with a skip count and a times count: a site armed with
+// `skip` N lets the first N triggers through untouched (decrementing), then
+// fires on each of the next `times` consecutive triggers (decrementing that
+// counter instead) before disarming — this lets a test single out which of
+// several call sites for the same named site (e.g. a shadow-rename's aside
+// move vs. its primary move) actually fails, and, when `times > 1`, fail more
+// than one consecutive trigger of the same site (e.g. two evictions in a row).
+let armed: Map<string, { skip: number; times: number }> | null = null;
 
 function maybeFault(site: string): void {
   if (armed === null) return;
-  const remaining = armed.get(site);
-  if (remaining === undefined) return;
-  if (remaining > 0) {
-    armed.set(site, remaining - 1);
+  const state = armed.get(site);
+  if (state === undefined) return;
+  if (state.skip > 0) {
+    state.skip--;
     return;
   }
-  armed.delete(site);
+  state.times--;
+  if (state.times <= 0) armed.delete(site);
   throw new DOMException("injected quota failure", "QuotaExceededError");
 }
 
@@ -61,8 +65,15 @@ function maybeFault(site: string): void {
 // (close() below always runs regardless), so there is no handle left for a later
 // `fsync` to flush or report on. Recording the failure here and surfacing it on the
 // NEXT `flush` op (see below) ensures that loss is reported rather than silently
-// dropped. Only the first such failure is kept — see the `flush` op comment for why.
-let pendingFlushError: VfsError | null = null;
+// dropped. List-based (not a single slot): every poisoning site pushes unconditionally,
+// so two independent eviction failures (e.g. rename's displaced-close AND the moved
+// source's own close, in one overwrite) are BOTH recorded rather than the second being
+// dropped because a single slot was already occupied. `flush`/`close` still only ever
+// report the first entry and then clear the whole list (see their comments) — the list
+// exists so that rename's successful-overwrite discard path can splice out exactly the
+// entries ITS OWN displaced-close introduced, without erasing an unrelated entry queued
+// before or after it.
+let pendingFlushErrors: VfsError[] = [];
 
 function makePool(capacity: number): Lru<NodeId, FileSystemSyncAccessHandle> {
   return new Lru(capacity, (_id, h) => {
@@ -82,7 +93,7 @@ function makePool(capacity: number): Lru<NodeId, FileSystemSyncAccessHandle> {
       // close() itself failed (e.g. already closed) — nothing more we can do beyond the
       // flush-failure poisoning below, which already captured the real durability loss.
     }
-    if (flushFailed && !pendingFlushError) pendingFlushError = toVfs(flushError);
+    if (flushFailed) pendingFlushErrors.push(toVfs(flushError));
   });
 }
 
@@ -168,7 +179,20 @@ async function writeSidecarFile(rec: NodeRec & { dir: FileSystemDirectoryHandle 
     maybeFault("sidecarWrite");
     const sidecar = rec.sidecar ?? {};
     if (isEmptySidecar(sidecar)) {
-      await rec.dir.removeEntry(SIDECAR_NAME).catch(() => {});
+      // Unlike other best-effort sidecar cleanups in this file (which tolerate a
+      // stale-but-harmless record left behind), THIS delete is the write path for
+      // a legitimate mutation (e.g. chmod-back-to-default) that the caller is
+      // depending on to actually land — silently swallowing a real failure here
+      // would let that mutation "succeed" while the stale record persists on disk
+      // and gets re-applied on the next reopen. Tolerate only the file already
+      // being gone (NotFoundError); anything else must surface so callers (which
+      // already treat writeSidecarFile as fallible-with-rollback) can roll back.
+      maybeFault("sidecarDelete");
+      try {
+        await rec.dir.removeEntry(SIDECAR_NAME);
+      } catch (e) {
+        if ((e as { name?: string } | null)?.name !== "NotFoundError") throw e;
+      }
       return;
     }
     const fh = await rec.dir.getFileHandle(SIDECAR_NAME, { create: true });
@@ -450,9 +474,11 @@ const ops: Record<string, OpFn> = {
     if (testHooks) {
       armed = new Map();
       // Only ever present when a test opted in. `skip` (default 0) lets that
-      // many earlier triggers of `site` through before the one that fires.
-      ops.__injectFault = async (site: string, skip = 0): Promise<OpResult> => {
-        armed!.set(site, skip);
+      // many earlier triggers of `site` through before the first one that
+      // fires; `times` (default 1) is how many consecutive triggers after the
+      // skip fire before the site disarms.
+      ops.__injectFault = async (site: string, skip = 0, times = 1): Promise<OpResult> => {
+        armed!.set(site, { skip, times });
         return { value: undefined };
       };
     }
@@ -567,15 +593,19 @@ const ops: Record<string, OpFn> = {
   },
 
   async flush(): Promise<OpResult> {
-    // A poisoned eviction flush (see pendingFlushError above) takes priority: it
+    // A poisoned eviction flush (see pendingFlushErrors above) takes priority: it
     // describes data that is ALREADY unrecoverably lost, from a handle that no longer
     // exists to retry against, so it must be reported before this flush even looks at
-    // the handles it currently holds. One-shot: cleared on report so a caller that
-    // retries after seeing the failure gets a clean flush next time (matching every
-    // other fault-injection recovery test in this suite).
-    if (pendingFlushError) {
-      const e = pendingFlushError;
-      pendingFlushError = null;
+    // the handles it currently holds. Reports only the first queued entry and clears
+    // the WHOLE list — matching the pre-list "one-shot" behavior (a caller that retries
+    // after seeing the failure gets a clean flush next time), now extended to however
+    // many entries accumulated. Any entries beyond the first are dropped on report,
+    // same as the old single-slot's "first wins" — the list exists so that unrelated
+    // entries survive rename's own targeted splice, not so every entry is eventually
+    // surfaced one by one.
+    if (pendingFlushErrors.length > 0) {
+      const e = pendingFlushErrors[0];
+      pendingFlushErrors = [];
       throw e;
     }
     // Ops run strictly sequentially through `chain` (see bottom of file) and nothing
@@ -606,12 +636,13 @@ const ops: Record<string, OpFn> = {
     pool.clear(true);
     // close() is often the LAST durability checkpoint a caller will ever see for this
     // worker — the client tears the worker down right after this resolves/rejects, so
-    // any eviction-flush failure poisoned by the clear() above must be surfaced NOW.
+    // any eviction-flush failure queued by the clear() above must be surfaced NOW.
     // Left unreported here it would vanish for good (the worker that could have
-    // reported it on a later flush no longer exists). One-shot, same as flush().
-    if (pendingFlushError) {
-      const e = pendingFlushError;
-      pendingFlushError = null;
+    // reported it on a later flush no longer exists). Reports the first queued entry
+    // and clears the whole list, same as flush() above.
+    if (pendingFlushErrors.length > 0) {
+      const e = pendingFlushErrors[0];
+      pendingFlushErrors = [];
       throw e;
     }
     return { value: undefined };
@@ -824,12 +855,15 @@ const ops: Record<string, OpFn> = {
     // strictly sequentially through the `chain` (see bottom of file), so no
     // interleaved readdir can ever observe a `.wash-shadow-*` name.
     let shadowName: string | undefined;
-    // Set only when the closePooled call just below (displaced-entry teardown) is
-    // itself what newly poisons pendingFlushError — as opposed to a poison that was
-    // already pending beforehand, from some earlier, unrelated failure, which must
-    // stay reported. Used by the discard phase to clear ONLY the poison this op
-    // introduced for bytes it is about to intentionally destroy anyway.
-    let displacedIntroducedPoison = false;
+    // Captures the slice of pendingFlushErrors (if any) introduced by the closePooled
+    // call just below (displaced-entry teardown) — as opposed to entries already
+    // queued beforehand (from some earlier, unrelated failure) or appended AFTER (e.g.
+    // the moved source's own close, during the primary move further down), both of
+    // which must stay reported. Used by the discard phase to splice out ONLY the
+    // poison this op introduced for bytes it is about to intentionally destroy anyway,
+    // leaving any unrelated entry — before or after it — untouched.
+    let displacedPoisonStart = -1;
+    let displacedPoisonCount = 0;
     if (displaced) {
       const dispRec = node(displaced.id);
       if (dispRec.kind === "dir") {
@@ -839,34 +873,62 @@ const ops: Record<string, OpFn> = {
         if (grand.size > 0) throw new VfsError("ENOTEMPTY", toName);
       } else {
         if (movingRec.kind === "dir") throw new VfsError("ENOTDIR", toName);
-        const poisonBefore = pendingFlushError;
+        displacedPoisonStart = pendingFlushErrors.length;
         closePooled(displaced.id);
-        displacedIntroducedPoison = poisonBefore === null && pendingFlushError !== null;
+        displacedPoisonCount = pendingFlushErrors.length - displacedPoisonStart;
       }
       shadowName = `.wash-shadow-${ulid()}`;
-      if (dispRec.kind === "dir") {
-        requireDir(dispRec);
-        await moveTree(dispRec, displaced.id, toParent, tp.dir, shadowName);
-      } else {
-        requireFile(dispRec);
-        await moveFileEntry(dispRec, displaced.id, toParent, tp.dir, shadowName);
+
+      // The displaced entry's OWN sidecar record (mode/symlink) still lives under
+      // `toName`. Move it to `shadowName` FIRST, before any physical change below — a
+      // failure here is then a CLEAN ABORT: nothing has moved yet (physically or in
+      // the dentry maps), so a caller retry safely re-observes pre-op state. The old
+      // order ran this step LAST (after the physical aside-move and the toChildren
+      // delete below), so a failure here used to leave the displaced entry already
+      // relocated on disk to `shadowName` and dropped from `toChildren` — stranded and
+      // invisible to a cached retry. See finding 1 write-up.
+      await ensureSidecar(tp);
+      const prevTpSidecarAside = tp.sidecar;
+      let hadAsideRecord = false;
+      if (tp.sidecar![toName]) {
+        hadAsideRecord = true;
+        try {
+          tp.sidecar = renameSidecarEntry(tp.sidecar!, toName, shadowName);
+          await writeSidecarFile(tp);
+        } catch (e) {
+          // Clean abort: nothing has moved yet, so roll the in-memory sidecar back to
+          // its pre-write snapshot — disk never received the write (writeSidecarFile's
+          // maybeFault check/handle-open failure happens before any bytes are
+          // written), so memory must not disagree with it.
+          tp.sidecar = prevTpSidecarAside;
+          throw e;
+        }
+      }
+
+      // THEN the physical aside-move. If THIS throws, the sidecar record just moved
+      // above must be moved back — the physical entry never left `toName`, so its
+      // record shouldn't claim otherwise. Memory is authoritative; the disk write is
+      // best-effort (a stale shadow-named record for a name that was never created is
+      // tolerated garbage, same convention as elsewhere in this file).
+      try {
+        if (dispRec.kind === "dir") {
+          requireDir(dispRec);
+          await moveTree(dispRec, displaced.id, toParent, tp.dir, shadowName);
+        } else {
+          requireFile(dispRec);
+          await moveFileEntry(dispRec, displaced.id, toParent, tp.dir, shadowName);
+        }
+      } catch (e) {
+        if (hadAsideRecord) {
+          tp.sidecar = renameSidecarEntry(tp.sidecar!, shadowName, toName);
+          await writeSidecarFile(tp).catch(() => {});
+        }
+        throw e;
       }
       // dispRec.name is now shadowName (rebound by the move helper above) — the
       // dentry map must be updated in lockstep so it never lists a name the disk
       // doesn't have. Ops are sequential; nothing observes this mid-op.
       toChildren.delete(toName);
-
-      // The displaced entry's OWN sidecar record (mode/symlink) still lives under
-      // `toName` even though the entry itself just physically moved to `shadowName` —
-      // MOVE it (not clear it) so it stays correctly attributed to wherever the entry
-      // currently lives. If the primary move below fails, the restore path renames
-      // this record back to `toName` alongside the physical restore; if it succeeds,
-      // the discard phase drops the now-orphaned shadow record for good.
-      await ensureSidecar(tp);
-      if (tp.sidecar![toName]) {
-        tp.sidecar = renameSidecarEntry(tp.sidecar!, toName, shadowName);
-        await writeSidecarFile(tp);
-      }
     } else {
       // No displaced entry, but a stale sidecar record can still be sitting at
       // `toName` (e.g. left behind by an unlink whose best-effort sidecar cleanup
@@ -1000,16 +1062,17 @@ const ops: Record<string, OpFn> = {
       } else {
         discardPooled(displaced.id); // content is being destroyed — must not poison fsync
         // The primary move succeeded, so the displaced entry's bytes really are being
-        // intentionally destroyed now — if the closePooled teardown above was what
-        // set pendingFlushError (rather than some earlier, unrelated failure already
-        // pending before it), that poison describes bytes nobody will ever read
-        // again and must not fail a later, unrelated fsync. Clear only what THIS op
-        // introduced; an already-pending poison from before stays reported. On the
-        // restore path (primary move failed, shadow moved back to `toName`) this
-        // line is never reached, so that poison correctly stays live — the file
-        // survives the failed rename, so a real flush failure against it still
-        // matters.
-        if (displacedIntroducedPoison) pendingFlushError = null;
+        // intentionally destroyed now — if the closePooled teardown above queued any
+        // entries into pendingFlushErrors, those entries describe bytes nobody will
+        // ever read again and must not fail a later, unrelated fsync. Splice out only
+        // the slice THIS op introduced (by index range, not by value) — an
+        // already-queued entry from some earlier, unrelated failure sits BEFORE that
+        // range, and the moved source's own close (during the primary move above, if
+        // ITS flush also failed) sits AFTER it; both stay reported. On the restore
+        // path (primary move failed, shadow moved back to `toName`) this line is
+        // never reached, so that poison correctly stays live — the file survives the
+        // failed rename, so a real flush failure against it still matters.
+        if (displacedPoisonCount > 0) pendingFlushErrors.splice(displacedPoisonStart, displacedPoisonCount);
       }
       // Defense-in-depth: the shadow name is our own throwaway, never exposed to a
       // caller, so it can never legitimately be "already gone" except via a prior

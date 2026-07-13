@@ -138,6 +138,23 @@ describe("OpfsBackend namespace reads", () => {
     await be.close();
   });
 
+  it("failed empty-sidecar delete surfaces and rolls back the chmod", async () => {
+    const rootName = testRoot();
+    const be = await OpfsBackend.open(rootName, { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file", { mode: 0o700 });
+    await (be as unknown as { call: (op: string, a: unknown[]) => Promise<unknown> }).call("__injectFault", ["sidecarDelete", 0]);
+    await expect(be.setattr(f, { mode: 0o644 })).rejects.toMatchObject({ errno: "ENOSPC" });
+    expect((await be.getattr(f)).mode).toBe(0o700); // rolled back, consistent with disk
+    await be.setattr(f, { mode: 0o644 }); // retry clean
+    await be.close();
+    const be2 = await OpfsBackend.open(rootName);
+    const root2 = await be2.root();
+    expect((await be2.lookup(root2, "f"))?.attrs.mode).toBe(0o644);
+    await be2.close();
+  });
+
   it("readdir on a file throws ENOTDIR; getattr of unknown id ENOENT", async () => {
     const rootName = testRoot();
     const origin = await navigator.storage.getDirectory();

@@ -236,4 +236,38 @@ describe("OpfsBackend rename", () => {
     await be.flush(); // must resolve: those bytes were intentionally destroyed
     await be.close();
   });
+
+  it("shadow-phase sidecar failure aborts cleanly; displaced target never stranded", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    const a = ulid();
+    const victim = ulid();
+    await be.create(root, "a", a, "file");
+    await be.symlink(root, "victim", victim, "/t"); // displaced entry WITH sidecar metadata
+    await (be as unknown as { call: (op: string, args: unknown[]) => Promise<unknown> }).call("__injectFault", ["sidecarWrite", 0]);
+    await expect(be.rename(root, "a", root, "victim")).rejects.toMatchObject({ errno: "ENOSPC" });
+    // clean abort: victim still present and intact, no shadows anywhere
+    expect((await be.lookup(root, "victim"))?.id).toBe(victim);
+    expect(await be.readlink(victim)).toBe("/t");
+    expect((await be.readdir(root)).map((d) => d.name).sort()).toEqual(["a", "victim"]);
+    await be.rename(root, "a", root, "victim"); // retry clean
+    expect((await be.lookup(root, "victim"))?.id).toBe(a);
+    await be.close();
+  });
+
+  it("source flush poison survives the overwrite-success clear", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    const src = ulid();
+    const dst = ulid();
+    await be.create(root, "src", src, "file");
+    await be.create(root, "dst", dst, "file");
+    await be.write(dst, 0, enc.encode("dirty-displaced"));
+    await be.write(src, 0, enc.encode("dirty-source"));
+    await (be as unknown as { call: (op: string, args: unknown[]) => Promise<unknown> }).call("__injectFault", ["evictFlush", 0, 2]); // both closes fail
+    await be.rename(root, "src", root, "dst"); // succeeds
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" }); // source poison retained
+    await be.flush(); // cleared after one report
+    await be.close();
+  });
 });
