@@ -447,14 +447,27 @@ const ops: Record<string, OpFn> = {
   },
 
   async flush(): Promise<OpResult> {
+    // Ops run strictly sequentially through `chain` (see bottom of file) and nothing
+    // in this loop mutates the pool, so there is no benign "handle closed under us"
+    // case here: a thrown flush is a REAL durability failure (e.g. quota) and must be
+    // surfaced, not swallowed — silently continuing would let fsync report success
+    // while OPFS actually rejected the write. Flush every pooled handle regardless (one
+    // bad handle must not leave the rest unflushed) and remember only the first error.
+    let firstError: unknown;
+    let failed = false;
     for (const id of [...pool.keys()]) {
       const h = pool.peek(id);
       try {
+        maybeFault("handleFlush");
         h?.flush();
-      } catch {
-        /* closed under us */
+      } catch (e) {
+        if (!failed) {
+          failed = true;
+          firstError = e;
+        }
       }
     }
+    if (failed) errnoFromDom(firstError);
     return { value: undefined };
   },
 
@@ -692,6 +705,33 @@ const ops: Record<string, OpFn> = {
       }
     }
 
+    // Transport the moving entry's OWN sidecar record (mode/symlink) to the
+    // destination BEFORE the primary move — the point of no return. Doing this here,
+    // rather than as a trailing step after the move, means a failure aborts cleanly:
+    // nothing has moved yet, so the dentry maps (still keyed on `fromName`) and disk
+    // (still holding the entry under `fromName`) stay in lockstep, and a caller retry
+    // (e.g. CachedBackend's) safely re-observes pre-op state. Were this deferred until
+    // after the primary move instead, an ENOSPC here would reject the op while
+    // movingRec/disk already say `toName` but the dentry maps still say `fromName` —
+    // exactly the stale-map divergence this ordering exists to prevent.
+    await ensureSidecar(fp);
+    const entryMeta = fp.sidecar![fromName];
+    if (entryMeta) {
+      await ensureSidecar(tp);
+      const prevTpSidecar = tp.sidecar;
+      try {
+        tp.sidecar = setSidecarEntry(tp.sidecar!, toName, entryMeta);
+        await writeSidecarFile(tp);
+      } catch (e) {
+        // Clean abort: nothing has moved yet, so roll the in-memory sidecar back to
+        // its pre-write snapshot to keep memory in lockstep with disk — disk never
+        // received the write (writeSidecarFile's maybeFault check/handle-open failure
+        // happens before any bytes are written), so memory must not disagree with it.
+        tp.sidecar = prevTpSidecar;
+        throw e;
+      }
+    }
+
     try {
       if (movingRec.kind === "dir") {
         requireDir(movingRec);
@@ -701,10 +741,14 @@ const ops: Record<string, OpFn> = {
         await moveFileEntry(movingRec, moving.id, toParent, tp.dir, toName);
       }
       // movingRec.parentId/name are now rebound to toParent/toName (the move helper's
-      // final act above) — this happens immediately on move success, before the
-      // sidecar transport below (which can itself throw), so a throw there can never
-      // leave a stale name on the moved entry.
+      // final act above).
     } catch (e) {
+      // If the pre-move sidecar write above landed, tp.sidecar[toName] now holds an
+      // annotation for a name the primary move never reached. On this failure path
+      // that's either tolerated garbage (no displaced entry: `toName` never becomes a
+      // real disk entry, and ensureChildren only overlays sidecar metadata onto names
+      // that exist on disk) or it gets overwritten below when the displaced entry's
+      // own record is renamed back from `shadowName` onto `toName`.
       if (displaced && shadowName !== undefined) {
         const dispRec = node(displaced.id);
         // Best-effort restore: move the shadow back to `toName` so the displaced
@@ -723,7 +767,9 @@ const ops: Record<string, OpFn> = {
           }
           // dispRec.name is now toName (rebound by the move helper above).
           toChildren.set(toName, displaced);
-          // The shadow's sidecar record travels back with it.
+          // The shadow's sidecar record travels back with it, overwriting whatever
+          // the pre-move transport above wrote to `toName` (that annotation described
+          // the entry that just failed to move in, not the restored displaced entry).
           if (tp.sidecar![shadowName]) {
             tp.sidecar = renameSidecarEntry(tp.sidecar!, shadowName, toName);
             await writeSidecarFile(tp);
@@ -740,6 +786,16 @@ const ops: Record<string, OpFn> = {
       }
       throw e;
     }
+
+    // The primary move committed — this is the point of no return. Commit the dentry
+    // maps and parent mtimes immediately, before any further (best-effort) cleanup
+    // below, so a later failure in that cleanup can never leave the maps stale.
+    // movingRec.parentId/name were already rebound to toParent/toName by the move
+    // helper above; only the dentry maps need updating here.
+    fromChildren.delete(fromName);
+    toChildren.set(toName, moving);
+    fp.mtimeMs = Date.now();
+    tp.mtimeMs = Date.now();
 
     // The source move succeeded — the destination is now confirmed replaced, so it is
     // finally safe to irreversibly discard the shadowed, displaced entry. This is
@@ -769,23 +825,22 @@ const ops: Record<string, OpFn> = {
       }
     }
 
-    // transport the entry's OWN sidecar record (mode/symlink) between parents
-    await ensureSidecar(fp);
-    const entryMeta = fp.sidecar![fromName];
+    // Source-side sidecar cleanup: drop the entry's OWN record from its old parent,
+    // now that it lives at the destination (written above, before the primary move).
+    // Best-effort and swallowed, same convention as unlink: a stale annotation left
+    // behind under a name this entry no longer occupies is tolerated garbage —
+    // ensureChildren only overlays sidecar metadata onto names that still exist on
+    // disk — and the primary move plus the dentry commit above are already durable
+    // regardless of whether this last cleanup step succeeds.
     if (entryMeta) {
-      fp.sidecar = setSidecarEntry(fp.sidecar!, fromName, { mode: undefined, symlink: undefined });
-      await writeSidecarFile(fp);
-      await ensureSidecar(tp);
-      tp.sidecar = setSidecarEntry(tp.sidecar!, toName, entryMeta);
-      await writeSidecarFile(tp);
+      try {
+        fp.sidecar = setSidecarEntry(fp.sidecar!, fromName, { mode: undefined, symlink: undefined });
+        await writeSidecarFile(fp);
+      } catch {
+        // swallowed — see comment above.
+      }
     }
 
-    // movingRec.parentId/name were already rebound to toParent/toName by the move
-    // helper above; only the dentry maps need updating here.
-    fromChildren.delete(fromName);
-    toChildren.set(toName, moving);
-    fp.mtimeMs = Date.now();
-    tp.mtimeMs = Date.now();
     return { value: undefined };
   },
 };

@@ -151,6 +151,34 @@ describe("OpfsBackend rename", () => {
     await be2.close();
   });
 
+  it("rename with sidecar metadata aborts cleanly when the destination sidecar write fails", async () => {
+    const rootName = testRoot();
+    const be = await OpfsBackend.open(rootName, { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "exec.sh", f, "file", { mode: 0o755 }); // sidecarWrite #1 happens here (create)
+    await (be as unknown as { call: (op: string, a: unknown[]) => Promise<unknown> }).call("__injectFault", ["sidecarWrite", 0]);
+    await expect(be.rename(root, "exec.sh", root, "moved.sh")).rejects.toMatchObject({ errno: "ENOSPC" });
+    // clean abort: still at the old name, mode intact, maps consistent
+    const info = await be.lookup(root, "exec.sh");
+    expect(info?.id).toBe(f);
+    expect(info?.attrs.mode).toBe(0o755);
+    expect(await be.lookup(root, "moved.sh")).toBeNull();
+    // retry succeeds and metadata survives
+    await be.rename(root, "exec.sh", root, "moved.sh");
+    expect((await be.lookup(root, "moved.sh"))?.attrs.mode).toBe(0o755);
+    await be.close();
+
+    // reopen-proof: the in-session rec.mode is authoritative regardless of any
+    // sidecar corruption, so only a reopen (fresh discovery purely from disk +
+    // persisted sidecar JSON) can expose a lost/mistransported mode annotation.
+    const be2 = await OpfsBackend.open(rootName);
+    const root2 = await be2.root();
+    expect(await be2.lookup(root2, "exec.sh")).toBeNull();
+    expect((await be2.lookup(root2, "moved.sh"))?.attrs.mode).toBe(0o755);
+    await be2.close();
+  });
+
   it("overwrite renames leave no shadow residue", async () => {
     const be = await OpfsBackend.open(testRoot());
     const root = await be.root();
