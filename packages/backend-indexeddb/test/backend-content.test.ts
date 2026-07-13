@@ -73,4 +73,11 @@ describe("IndexedDBBackend content (small chunkSize to exercise boundaries)", ()
     expect((await be.read(file, 0, 10)).byteLength).toBe(3);
     await expect(be.write(root, 0, new Uint8Array(0))).rejects.toMatchObject({ errno: "EISDIR" });
   });
+
+  it("concurrent same-chunk writes on the raw backend both land", async () => {
+    await Promise.all([be.write(file, 0, enc.encode("A")), be.write(file, 1, enc.encode("B"))]);
+    const out = await be.read(file, 0, 10);
+    expect(out.byteLength).toBe(2);
+    expect(dec.decode(out)).toBe("AB");
+  });
 });

@@ -2,7 +2,7 @@ import type {
   Attrs, BackendCaps, BackendDump, Dirent, NodeId, NodeInfo, NodeKind, WashBackend,
 } from "@wash/vfs";
 import { CHUNK_SIZE, VfsError, ulid } from "@wash/vfs";
-import { STORE_NAMES, SCHEMA_VERSION, openDb, req, txDone } from "./idb.js";
+import { STORE_NAMES, SCHEMA_VERSION, openDb, req, reqTolerateConstraint, txDone } from "./idb.js";
 
 interface DirentRecord {
   name: string;
@@ -29,7 +29,7 @@ export interface IndexedDBBackendOptions {
  * over an independent counter, so one op's requests can never be miscounted
  * against another's attempt.
  */
-type ReqFn = <T>(request: IDBRequest<T>) => Promise<T>;
+type ReqFn = <T>(request: IDBRequest<T>, opts?: { tolerateConstraint?: boolean }) => Promise<T>;
 
 export class IndexedDBBackend implements WashBackend {
   readonly caps: BackendCaps = {
@@ -42,6 +42,30 @@ export class IndexedDBBackend implements WashBackend {
   private tx: IDBTransaction | null = null;
   private txCompletion: Promise<void> | null = null;
   private lastAbort: unknown = null;
+
+  /**
+   * Per-inode mutation serialization for `write`/`truncate` (Codex finding
+   * C). The blessed stack (Vfs + CachedBackend) already serializes mutations
+   * above this layer, but the raw backend is legal to use directly, and two
+   * overlapping same-chunk writes can otherwise both read-modify-write the
+   * same chunk with the last `put` silently winning. Same gate-pattern
+   * promise-chain lock as CachedBackend.
+   */
+  private nodeLocks = new Map<NodeId, Promise<unknown>>();
+
+  private withNodeLock<T>(id: NodeId, fn: () => Promise<T>): Promise<T> {
+    const prev = this.nodeLocks.get(id) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    const gate = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.nodeLocks.set(id, gate);
+    void gate.then(() => {
+      if (this.nodeLocks.get(id) === gate) this.nodeLocks.delete(id);
+    });
+    return run;
+  }
 
   private constructor(
     private readonly db: IDBDatabase,
@@ -136,9 +160,9 @@ export class IndexedDBBackend implements WashBackend {
       if (this.lastAbort) throw this.lastAbort;
       const tx = this.currentTx();
       let issued = 0;
-      const r: ReqFn = (request) => {
+      const r: ReqFn = (request, opts) => {
         issued++;
-        return req(request);
+        return opts?.tolerateConstraint ? reqTolerateConstraint(request) : req(request);
       };
       try {
         return await fn(tx, r);
@@ -219,6 +243,18 @@ export class IndexedDBBackend implements WashBackend {
 
   private direntKey(parent: NodeId, name: string): [NodeId, string] {
     return [parent, name];
+  }
+
+  /**
+   * Codex finding D: two overlapping ops racing to create the same
+   * (parent, name) dirent can both pass the get-based pre-check, then both
+   * `put`, with the second silently clobbering the first (orphaning its
+   * inode). `add` makes IDB itself enforce key uniqueness as the atomic
+   * backstop; the loser's `add` throws ConstraintError, which callers map to
+   * EEXIST after undoing their own earlier writes within the same txn.
+   */
+  private isConstraintError(e: unknown): boolean {
+    return (e as { name?: string } | null)?.name === "ConstraintError";
   }
 
   /** All dirent keys of one directory. IDB array-key ordering: [parent] sorts
@@ -311,7 +347,13 @@ export class IndexedDBBackend implements WashBackend {
       };
       await r(tx.objectStore("inodes").put(rec, id));
       const dirent: DirentRecord = { name, childId: id, kind };
-      await r(tx.objectStore("dirents").put(dirent, this.direntKey(parent, name)));
+      try {
+        await r(tx.objectStore("dirents").add(dirent, this.direntKey(parent, name)), { tolerateConstraint: true });
+      } catch (e) {
+        if (!this.isConstraintError(e)) throw e;
+        await r(tx.objectStore("inodes").delete(id));
+        throw new VfsError("EEXIST", name);
+      }
     });
   }
 
@@ -352,7 +394,7 @@ export class IndexedDBBackend implements WashBackend {
   }
 
   async write(id: NodeId, offset: number, data: Uint8Array): Promise<void> {
-    return this.withTx(async (tx, r) => {
+    return this.withNodeLock(id, () => this.withTx(async (tx, r) => {
       const rec = await this.requireFile(tx, r, id);
       if (data.byteLength === 0) return;
       const store = tx.objectStore("data");
@@ -379,11 +421,11 @@ export class IndexedDBBackend implements WashBackend {
       if (end > rec.size) rec.size = end;
       rec.mtimeMs = Date.now();
       await r(tx.objectStore("inodes").put(rec, id));
-    });
+    }));
   }
 
   async truncate(id: NodeId, size: number): Promise<void> {
-    return this.withTx(async (tx, r) => {
+    return this.withNodeLock(id, () => this.withTx(async (tx, r) => {
       const rec = await this.requireFile(tx, r, id);
       const store = tx.objectStore("data");
       if (size < rec.size) {
@@ -400,7 +442,7 @@ export class IndexedDBBackend implements WashBackend {
       rec.size = size; // extend is sparse: missing chunks read as zeros
       rec.mtimeMs = Date.now();
       await r(tx.objectStore("inodes").put(rec, id));
-    });
+    }));
   }
 
   private async dirHasChildren(tx: IDBTransaction, r: ReqFn, id: NodeId): Promise<boolean> {
@@ -472,7 +514,13 @@ export class IndexedDBBackend implements WashBackend {
       };
       await r(tx.objectStore("inodes").put(rec, id));
       const dirent: DirentRecord = { name, childId: id, kind: "symlink" };
-      await r(tx.objectStore("dirents").put(dirent, this.direntKey(parent, name)));
+      try {
+        await r(tx.objectStore("dirents").add(dirent, this.direntKey(parent, name)), { tolerateConstraint: true });
+      } catch (e) {
+        if (!this.isConstraintError(e)) throw e;
+        await r(tx.objectStore("inodes").delete(id));
+        throw new VfsError("EEXIST", name);
+      }
     });
   }
 
@@ -494,7 +542,14 @@ export class IndexedDBBackend implements WashBackend {
       rec.nlink += 1;
       await r(tx.objectStore("inodes").put(rec, id));
       const dirent: DirentRecord = { name, childId: id, kind: rec.kind };
-      await r(tx.objectStore("dirents").put(dirent, this.direntKey(parent, name)));
+      try {
+        await r(tx.objectStore("dirents").add(dirent, this.direntKey(parent, name)), { tolerateConstraint: true });
+      } catch (e) {
+        if (!this.isConstraintError(e)) throw e;
+        rec.nlink -= 1;
+        await r(tx.objectStore("inodes").put(rec, id));
+        throw new VfsError("EEXIST", name);
+      }
     });
   }
 }

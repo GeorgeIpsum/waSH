@@ -51,4 +51,20 @@ describe("IndexedDBBackend namespace", () => {
     expect(plus[0]!.name).toBe("f");
     expect(plus[0]!.attrs.kind).toBe("file");
   });
+
+  it("concurrent same-name creates: exactly one wins on the raw backend", async () => {
+    const results = await Promise.allSettled([
+      be.create(root, "dup", ulid(), "file"),
+      be.create(root, "dup", ulid(), "file"),
+    ]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const rej = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    expect(rej).toHaveLength(1);
+    expect(rej[0]!.reason).toMatchObject({ errno: "EEXIST" });
+    const entries = await be.readdir(root);
+    expect(entries.filter((d) => d.name === "dup")).toHaveLength(1);
+    // loser's inode must not be orphaned:
+    const winner = await be.lookup(root, "dup");
+    expect((await be.getattr(winner!.id)).nlink).toBe(1);
+  });
 });
