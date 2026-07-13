@@ -90,4 +90,51 @@ describe("OpfsBackend rename", () => {
     expect(dec.decode(await be2.read(deep2!.id, 0, 100))).toBe("deep-content");
     await be2.close();
   });
+
+  it("file-over-symlink overwrite clears stale sidecar metadata (reopen-proof)", async () => {
+    const rootName = testRoot();
+    const be = await OpfsBackend.open(rootName);
+    const root = await be.root();
+    await be.symlink(root, "target", ulid(), "/x");
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.rename(root, "f", root, "target");
+    expect((await be.lookup(root, "target"))?.attrs.kind).toBe("file");
+    await be.close();
+
+    const be2 = await OpfsBackend.open(rootName); // stale sidecar would misclassify here
+    const root2 = await be2.root();
+    const info = await be2.lookup(root2, "target");
+    expect(info?.attrs.kind).toBe("file");
+    await expect(be2.readlink(info!.id)).rejects.toMatchObject({ errno: "EINVAL" });
+    await be2.close();
+  });
+
+  it("mode metadata does not leak from a displaced entry", async () => {
+    const rootName = testRoot();
+    const be = await OpfsBackend.open(rootName);
+    const root = await be.root();
+    await be.create(root, "victim", ulid(), "file", { mode: 0o700 });
+    const f = ulid();
+    await be.create(root, "plain", f, "file"); // default 0o644, no sidecar record
+    await be.rename(root, "plain", root, "victim");
+    expect((await be.lookup(root, "victim"))?.attrs.mode).toBe(0o644);
+    await be.close();
+    const be2 = await OpfsBackend.open(rootName);
+    const root2 = await be2.root();
+    expect((await be2.lookup(root2, "victim"))?.attrs.mode).toBe(0o644);
+    await be2.close();
+  });
+
+  it("overwrite renames leave no shadow residue", async () => {
+    const be = await OpfsBackend.open(testRoot());
+    const root = await be.root();
+    const f1 = ulid();
+    const f2 = ulid();
+    await be.create(root, "a", f1, "file");
+    await be.create(root, "b", f2, "file");
+    await be.rename(root, "a", root, "b");
+    expect((await be.readdir(root)).map((d) => d.name)).toEqual(["b"]);
+    await be.close();
+  });
 });

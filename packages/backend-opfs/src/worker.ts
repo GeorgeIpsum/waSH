@@ -6,7 +6,6 @@ import {
   parseSidecar,
   serializeSidecar,
   setSidecarEntry,
-  renameSidecarEntry,
   isEmptySidecar,
   type Sidecar,
 } from "./sidecar.js";
@@ -205,7 +204,13 @@ async function moveFileEntry(
       h.close();
     }
     const oldParent = rec.parentId !== null ? node(rec.parentId) : null;
-    if (oldParent?.dir) await oldParent.dir.removeEntry(rec.name).catch(() => {});
+    if (oldParent?.dir) {
+      try {
+        await oldParent.dir.removeEntry(rec.name);
+      } catch (e) {
+        if ((e as { name?: string } | null)?.name !== "NotFoundError") errnoFromDom(e, rec.name);
+      }
+    }
     rec.file = destHandle;
   }
 }
@@ -227,17 +232,33 @@ async function moveTree(
       requireFile(child);
       await moveFileEntry(child, entry.id, destDir, childName);
     }
-    child.parentId = id; // unchanged parent NODE; only handles moved
+    child.parentId = id; // defensive: parent node identity is unchanged by subtree moves; only handles rebind
   }
   // transport the sidecar file itself
   await ensureSidecar(rec);
   const srcDirOld = rec.dir;
   rec.dir = destDir;
   if (!isEmptySidecar(rec.sidecar!)) await writeSidecarFile(rec);
-  await srcDirOld.removeEntry(SIDECAR_NAME).catch(() => {});
+  // By this point the subtree HAS already moved (non-atomic by design, per
+  // BackendCaps.renameCost === "subtree"): a failure below is surfaced to the caller
+  // rather than silently swallowed, so a phantom source directory/sidecar isn't left
+  // behind to be silently re-discovered with fresh ids on a later reopen.
+  // EXCEPTION: the old sidecar file may legitimately not exist (a directory with no
+  // attr overrides never had one) — tolerate only that NotFoundError.
+  try {
+    await srcDirOld.removeEntry(SIDECAR_NAME);
+  } catch (e) {
+    if ((e as { name?: string } | null)?.name !== "NotFoundError") errnoFromDom(e, rec.name);
+  }
   // remove the emptied source directory
   const oldParent = rec.parentId !== null ? node(rec.parentId) : null;
-  if (oldParent?.dir) await oldParent.dir.removeEntry(rec.name).catch(() => {});
+  if (oldParent?.dir) {
+    try {
+      await oldParent.dir.removeEntry(rec.name);
+    } catch (e) {
+      errnoFromDom(e, rec.name);
+    }
+  }
 }
 
 const ops: Record<string, OpFn> = {
@@ -505,6 +526,14 @@ const ops: Record<string, OpFn> = {
     const displaced = toChildren.get(toName);
     const movingRec = node(moving.id);
 
+    // Shadow-rename pattern: never destroy a displaced entry up front (a failed move
+    // must not lose data). It is first moved ASIDE to a collision-free shadow name in
+    // the same destination directory; only after the source has been confirmed moved
+    // into `toName` (below) is the shadow irreversibly discarded. If that source move
+    // instead throws, the shadow is restored back to `toName`. Ops in this worker run
+    // strictly sequentially through the `chain` (see bottom of file), so no
+    // interleaved readdir can ever observe a `.wash-shadow-*` name.
+    let shadowName: string | undefined;
     if (displaced) {
       const dispRec = node(displaced.id);
       if (dispRec.kind === "dir") {
@@ -512,24 +541,78 @@ const ops: Record<string, OpFn> = {
         requireDir(dispRec);
         const grand = await ensureChildren(displaced.id, dispRec);
         if (grand.size > 0) throw new VfsError("ENOTEMPTY", toName);
-        await dispRec.dir.removeEntry(SIDECAR_NAME).catch(() => {});
-        await tp.dir.removeEntry(toName);
-        nodes.delete(displaced.id);
       } else {
         if (movingRec.kind === "dir") throw new VfsError("ENOTDIR", toName);
         closePooled(displaced.id);
-        await tp.dir.removeEntry(toName);
-        nodes.delete(displaced.id);
+      }
+      shadowName = `.wash-shadow-${ulid()}`;
+      if (dispRec.kind === "dir") {
+        requireDir(dispRec);
+        await moveTree(dispRec, displaced.id, tp.dir, shadowName);
+      } else {
+        requireFile(dispRec);
+        await moveFileEntry(dispRec, displaced.id, tp.dir, shadowName);
       }
       toChildren.delete(toName);
+
+      // Unconditionally clear the destination name's stale sidecar record (mode/
+      // symlink) so a reopen after this overwrite never misclassifies the new entry
+      // using metadata left behind by whatever used to live at `toName`.
+      await ensureSidecar(tp);
+      if (tp.sidecar![toName]) {
+        tp.sidecar = setSidecarEntry(tp.sidecar!, toName, { mode: undefined, symlink: undefined });
+        await writeSidecarFile(tp);
+      }
     }
 
-    if (movingRec.kind === "dir") {
-      requireDir(movingRec);
-      await moveTree(movingRec, moving.id, tp.dir, toName);
-    } else {
-      requireFile(movingRec);
-      await moveFileEntry(movingRec, moving.id, tp.dir, toName);
+    try {
+      if (movingRec.kind === "dir") {
+        requireDir(movingRec);
+        await moveTree(movingRec, moving.id, tp.dir, toName);
+      } else {
+        requireFile(movingRec);
+        await moveFileEntry(movingRec, moving.id, tp.dir, toName);
+      }
+    } catch (e) {
+      if (displaced && shadowName !== undefined) {
+        const dispRec = node(displaced.id);
+        // Best-effort restore: move the shadow back to `toName` so the displaced
+        // entry survives the failed rename under its original name.
+        try {
+          if (dispRec.kind === "dir") {
+            requireDir(dispRec);
+            await moveTree(dispRec, displaced.id, tp.dir, toName);
+          } else {
+            requireFile(dispRec);
+            await moveFileEntry(dispRec, displaced.id, tp.dir, toName);
+          }
+          dispRec.name = toName;
+          toChildren.set(toName, displaced);
+        } catch {
+          // Double failure: the data still survives on disk under the discoverable
+          // shadow name. Keep the displaced NodeRec registered, rebound to it, so
+          // in-memory maps never point at a destroyed entry.
+          dispRec.name = shadowName;
+          toChildren.set(shadowName, displaced);
+        }
+      }
+      throw e;
+    }
+
+    // The source move succeeded — the destination is now confirmed replaced, so it is
+    // finally safe to irreversibly discard the shadowed, displaced entry. This is
+    // deliberately the LAST step of the displacement handling.
+    if (displaced && shadowName !== undefined) {
+      const dispRec = node(displaced.id);
+      if (dispRec.kind === "dir") {
+        requireDir(dispRec);
+        await dispRec.dir.removeEntry(SIDECAR_NAME).catch(() => {});
+        await tp.dir.removeEntry(shadowName);
+      } else {
+        closePooled(displaced.id);
+        await tp.dir.removeEntry(shadowName);
+      }
+      nodes.delete(displaced.id);
     }
 
     // transport the entry's OWN sidecar record (mode/symlink) between parents
