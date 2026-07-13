@@ -104,7 +104,7 @@ function ensure(op: string): OpFn {
 // so an artificial timeout would either fire on legitimate slow operations or be set
 // so high it's useless. Client-side failure hygiene (client.ts: onerror/onmessageerror
 // handlers, close()'s failAllPending) is what protects callers if the worker itself
-// dies or becomes unresponsive — it does not un-stick this queue, it only ensures
+// crashes or emits a malformed message — it does not un-stick this queue, it only ensures
 // callers aren't left hanging forever.
 let chain: Promise<void> = Promise.resolve();
 

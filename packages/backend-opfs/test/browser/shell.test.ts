@@ -52,5 +52,14 @@ describe("OpfsBackend shell", () => {
     const inflight = be.getattr(root); // posts to a dead worker: would hang forever pre-fix
     internals.worker.dispatchEvent(new ErrorEvent("error", { message: "boom" }));
     await expect(inflight).rejects.toThrow(/worker error/);
+    await be.close(); // close after worker death: should not hang
   }, 2000);
+
+  it("close() is idempotent and post-close calls reject immediately", { timeout: 2000 }, async () => {
+    const be = await OpfsBackend.open(testRoot());
+    const root = await be.root();
+    await be.close();
+    await be.close(); // second close: no hang
+    await expect(be.getattr(root)).rejects.toThrow(/closed/);
+  });
 });

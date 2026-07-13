@@ -22,6 +22,7 @@ export class OpfsBackend implements WashBackend {
   private nextId = 1;
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
   private rootId: NodeId = "";
+  private closed = false;
 
   private constructor(private readonly worker: Worker) {
     worker.onmessage = (ev: MessageEvent<RpcResponse>) => this.dispatch(ev.data);
@@ -41,6 +42,7 @@ export class OpfsBackend implements WashBackend {
   }
 
   private failAllPending(err: Error): void {
+    this.closed = true;
     for (const { reject } of this.pending.values()) reject(err);
     this.pending.clear();
   }
@@ -54,6 +56,7 @@ export class OpfsBackend implements WashBackend {
   }
 
   private call(op: string, args: unknown[], transfer: Transferable[] = []): Promise<unknown> {
+    if (this.closed) return Promise.reject(new Error("OpfsBackend is closed"));
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       this.pending.set(id, { resolve, reject });
@@ -62,7 +65,9 @@ export class OpfsBackend implements WashBackend {
   }
 
   async close(): Promise<void> {
+    if (this.closed) return;
     await this.call("close", []);
+    this.closed = true;
     this.worker.terminate();
     this.failAllPending(new Error("OpfsBackend closed"));
   }
