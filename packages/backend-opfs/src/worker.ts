@@ -384,6 +384,43 @@ const ops: Record<string, OpFn> = {
     }
     return { value: undefined };
   },
+
+  // Failure-ordering invariant: the in-memory dentry/node commit is the final step of
+  // every namespace mutation; fallible I/O (disk entry + sidecar) happens first with
+  // rollback, so a failed op never leaves memory ahead of disk — write-back retries
+  // must observe pre-op state.
+  async symlink(parent: NodeId, name: string, id: NodeId, target: string): Promise<OpResult> {
+    const rec = node(parent);
+    requireDir(rec);
+    if (name === SIDECAR_NAME) throw new VfsError("EPERM", name);
+    const children = await ensureChildren(parent, rec);
+    if (children.has(name)) throw new VfsError("EEXIST", name);
+    let file: FileSystemFileHandle;
+    try {
+      file = await rec.dir.getFileHandle(name, { create: true }); // zero-byte marker
+    } catch (e) {
+      errnoFromDom(e, name);
+    }
+    const prevSidecar = rec.sidecar;
+    try {
+      await ensureSidecar(rec);
+      rec.sidecar = setSidecarEntry(rec.sidecar!, name, { symlink: target });
+      await writeSidecarFile(rec);
+    } catch (e) {
+      rec.sidecar = prevSidecar;
+      await rec.dir.removeEntry(name).catch(() => {});
+      throw e;
+    }
+    registerChild(parent, name, "symlink", { file }, { id, target });
+    rec.mtimeMs = Date.now();
+    return { value: undefined };
+  },
+
+  async readlink(id: NodeId): Promise<OpResult> {
+    const rec = node(id);
+    if (rec.kind !== "symlink" || rec.target === undefined) throw new VfsError("EINVAL");
+    return { value: rec.target };
+  },
 };
 
 async function attrsOf(id: NodeId, rec: NodeRec): Promise<Attrs> {
