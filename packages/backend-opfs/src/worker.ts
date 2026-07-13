@@ -34,14 +34,22 @@ interface NodeRec {
 const nodes = new Map<NodeId, NodeRec>();
 let rootId: NodeId = "";
 let poolSize = 64;
-let pool: Lru<NodeId, FileSystemSyncAccessHandle> = new Lru(poolSize, (_id, h) => {
-  try {
-    h.flush();
-    h.close();
-  } catch {
-    /* already closed */
-  }
-});
+
+function makePool(capacity: number): Lru<NodeId, FileSystemSyncAccessHandle> {
+  return new Lru(capacity, (_id, h) => {
+    try {
+      try {
+        h.flush();
+      } finally {
+        h.close(); // must run even when flush throws: a leaked handle holds the file's exclusive lock
+      }
+    } catch {
+      // handle already closed, or close failed after a failed flush — nothing more we can do
+    }
+  });
+}
+
+let pool: Lru<NodeId, FileSystemSyncAccessHandle> = makePool(poolSize);
 
 function defaultMode(kind: NodeKind): number {
   return kind === "dir" ? 0o755 : kind === "symlink" ? 0o777 : 0o644;
@@ -172,14 +180,7 @@ function closePooled(id: NodeId): void {
 const ops: Record<string, OpFn> = {
   async open(rootDirName: string, poolSizeOpt: number): Promise<OpResult> {
     poolSize = poolSizeOpt;
-    pool = new Lru(poolSize, (_id, h) => {
-      try {
-        h.flush();
-        h.close();
-      } catch {
-        /* already closed */
-      }
-    });
+    pool = makePool(poolSize);
     const origin = await navigator.storage.getDirectory();
     const dir = await origin.getDirectoryHandle(rootDirName, { create: true });
     rootId = ulid();
