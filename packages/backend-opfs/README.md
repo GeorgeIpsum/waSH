@@ -47,7 +47,7 @@ const vfs = new Vfs();
 await vfs.mount("/", cached);
 await vfs.writeFile("/hello.txt", "hi");
 await vfs.fsync(); // durability point: flushes dirty sync-access handles
-be.close();
+await be.close();
 ```
 
 As with the IndexedDB backend, always wrap `OpfsBackend` in `CachedBackend`
@@ -74,13 +74,19 @@ this down). `.wash-attrs` is declared in `caps.reservedNames`: the backend
 hides it from `readdir`/`lookup` and rejects user `create`/`unlink`/`rename`
 targeting that name with `EPERM` (precedent: `.git`).
 
-**mtime is session-scoped for explicit `setattr`.** An explicit
-`utimes`/`setattr(mtimeMs)` call wins over `File.lastModified` only for the
-node's in-memory lifetime in the current worker session — the sidecar does
-not persist mtime, so after a close/reopen an explicit mtime set before the
-close is gone and mtime again tracks `File.lastModified` (updated on every
-write/truncate). This is a deliberate v1 scope cut, not a bug: content and
-mode are the durable, tested contract; mtime durability across reload is not.
+**File mtime tracks `File.lastModified`, free.** A file's mtime is
+`File.lastModified` unless something in the *current* worker session says
+otherwise: an in-session `write`/`truncate` or an explicit
+`setattr(mtimeMs)`/utimes stamps the node's in-memory mtime, which then wins
+over `File.lastModified` until the node is dropped from memory. Critically,
+merely *discovering* a file (on first lookup/readdir, or on reopen after a
+close) does **not** stamp an mtime — a freshly-discovered file's mtime falls
+straight through to `File.lastModified`, so mtimes for untouched files are
+accurate across a close/reopen. The sidecar does not persist mtime, so an
+explicit `setattr(mtimeMs)`/utimes call is session-scoped: after a
+close/reopen it is gone and mtime again tracks `File.lastModified`. Directory
+and symlink mtimes are always session-scoped (stamped at creation/discovery
+time; there is no `File.lastModified` equivalent for them to fall back to).
 
 **Symlink targets are POSIX-honest, not validated.** `readlink` returns
 whatever path string was passed to `symlink()`, even across a rename of an

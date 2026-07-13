@@ -108,7 +108,7 @@ function registerChild(
   name: string,
   kind: NodeKind,
   handles: { dir?: FileSystemDirectoryHandle; file?: FileSystemFileHandle },
-  opts: { id?: NodeId; mode?: number; target?: string } = {},
+  opts: { id?: NodeId; mode?: number; target?: string; mtimeMs?: number } = {},
 ): NodeId {
   const id = opts.id ?? ulid();
   const now = Date.now();
@@ -117,7 +117,7 @@ function registerChild(
     dir: handles.dir, file: handles.file,
     target: opts.target,
     mode: opts.mode ?? defaultMode(kind),
-    mtimeMs: now, ctimeMs: now,
+    mtimeMs: opts.mtimeMs ?? now, ctimeMs: now,
   });
   const parent = node(parentId);
   parent.children ??= new Map();
@@ -141,7 +141,10 @@ async function ensureChildren(
     } else if (meta?.symlink !== undefined) {
       registerChild(id, name, "symlink", { file: handle as FileSystemFileHandle }, { mode: meta.mode, target: meta.symlink });
     } else {
-      registerChild(id, name, "file", { file: handle as FileSystemFileHandle }, { mode: meta?.mode });
+      // mtimeMs: 0 lets attrsOf's max-style comparison fall through to File.lastModified
+      // for a freshly-discovered file (this rec was never written-to in this session, so
+      // there's no in-session mtime to preserve) — see README's mtime section.
+      registerChild(id, name, "file", { file: handle as FileSystemFileHandle }, { mode: meta?.mode, mtimeMs: 0 });
     }
   }
   rec.childrenComplete = true;
