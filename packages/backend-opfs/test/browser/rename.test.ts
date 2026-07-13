@@ -126,6 +126,31 @@ describe("OpfsBackend rename", () => {
     await be2.close();
   });
 
+  it("a fault-injected primary-move failure restores the displaced symlink intact (I3)", async () => {
+    const rootName = testRoot();
+    const be = await OpfsBackend.open(rootName, { testHooks: true });
+    const root = await be.root();
+    await be.symlink(root, "victimLn", ulid(), "/x");
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    // The shadow-aside move consumes trigger 0 (skip); skip=1 makes the
+    // PRIMARY move (f -> victimLn) the one that fails.
+    await (be as unknown as { call: (op: string, a: unknown[]) => Promise<unknown> }).call(
+      "__injectFault",
+      ["moveStep", 1],
+    );
+    await expect(be.rename(root, "f", root, "victimLn")).rejects.toMatchObject({ errno: "ENOSPC" });
+    expect((await be.lookup(root, "f"))?.id).toBe(f); // rename fully rolled back
+    await be.close();
+
+    const be2 = await OpfsBackend.open(rootName); // reopen-proof: sidecar must have traveled with the restore
+    const root2 = await be2.root();
+    const victim = await be2.lookup(root2, "victimLn");
+    expect(victim?.attrs.kind).toBe("symlink"); // pre-fix: plain file
+    expect(await be2.readlink(victim!.id)).toBe("/x");
+    await be2.close();
+  });
+
   it("overwrite renames leave no shadow residue", async () => {
     const be = await OpfsBackend.open(testRoot());
     const root = await be.root();

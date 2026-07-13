@@ -178,6 +178,14 @@ export function runBackendConformance(
         await expect(be.getattr(other)).rejects.toMatchObject({ errno: "ENOENT" });
       });
 
+      it("rename onto itself is a POSIX no-op", async () => {
+        const f = ulid();
+        await be.create(root, "self", f, "file");
+        await be.rename(root, "self", root, "self");
+        expect((await be.lookup(root, "self"))?.id).toBe(f);
+        expect((await be.readdir(root)).some((d) => d.name === "self")).toBe(true);
+      });
+
       it("rename dir-over-nonempty-dir throws ENOTEMPTY; file-over-dir EISDIR; dir-over-file ENOTDIR", async () => {
         const d1 = ulid(); const d2 = ulid();
         await be.create(root, "d1", d1, "dir");

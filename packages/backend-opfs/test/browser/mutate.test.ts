@@ -67,6 +67,22 @@ describe("OpfsBackend create/unlink", () => {
     await be.close();
   });
 
+  it("a fault-injected sidecar write during create leaves no residue (T4)", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    await (be as unknown as { call: (op: string, a: unknown[]) => Promise<unknown> }).call(
+      "__injectFault",
+      ["sidecarWrite"],
+    );
+    await expect(be.create(root, "x", ulid(), "file", { mode: 0o700 })).rejects.toMatchObject({ errno: "ENOSPC" });
+    expect(await be.lookup(root, "x")).toBeNull();
+    expect(await be.readdir(root)).toEqual([]);
+    const id2 = ulid();
+    await be.create(root, "x", id2, "file"); // default mode: no sidecar write involved, must succeed
+    expect((await be.lookup(root, "x"))?.id).toBe(id2);
+    await be.close();
+  });
+
   it("created entries persist across reopen", async () => {
     const rootName = testRoot();
     const be = await OpfsBackend.open(rootName);

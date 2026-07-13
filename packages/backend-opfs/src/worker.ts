@@ -6,6 +6,7 @@ import {
   parseSidecar,
   serializeSidecar,
   setSidecarEntry,
+  renameSidecarEntry,
   isEmptySidecar,
   type Sidecar,
 } from "./sidecar.js";
@@ -38,11 +39,20 @@ let poolSize = 64;
 // `testHooks: true`): `armed === null` is the fast path that makes every
 // `maybeFault` call a no-op in production, with zero allocation. Only when a
 // test opts in does `open` allocate the map and register `__injectFault`.
-let armed: Set<string> | null = null;
+// The value is a skip count: a site armed with N lets the first N triggers
+// through untouched (decrementing), then disarms and throws on trigger N+1 —
+// this lets a test single out which of several call sites for the same named
+// site (e.g. a shadow-rename's aside move vs. its primary move) actually fails.
+let armed: Map<string, number> | null = null;
 
 function maybeFault(site: string): void {
   if (armed === null) return;
-  if (!armed.has(site)) return;
+  const remaining = armed.get(site);
+  if (remaining === undefined) return;
+  if (remaining > 0) {
+    armed.set(site, remaining - 1);
+    return;
+  }
   armed.delete(site);
   throw new DOMException("injected quota failure", "QuotaExceededError");
 }
@@ -99,21 +109,25 @@ async function ensureSidecar(rec: NodeRec & { dir: FileSystemDirectoryHandle }):
 }
 
 async function writeSidecarFile(rec: NodeRec & { dir: FileSystemDirectoryHandle }): Promise<void> {
-  maybeFault("sidecarWrite");
-  const sidecar = rec.sidecar ?? {};
-  if (isEmptySidecar(sidecar)) {
-    await rec.dir.removeEntry(SIDECAR_NAME).catch(() => {});
-    return;
-  }
-  const fh = await rec.dir.getFileHandle(SIDECAR_NAME, { create: true });
-  const handle = await fh.createSyncAccessHandle();
   try {
-    const bytes = new TextEncoder().encode(serializeSidecar(sidecar));
-    handle.truncate(0);
-    handle.write(bytes, { at: 0 });
-    handle.flush();
-  } finally {
-    handle.close();
+    maybeFault("sidecarWrite");
+    const sidecar = rec.sidecar ?? {};
+    if (isEmptySidecar(sidecar)) {
+      await rec.dir.removeEntry(SIDECAR_NAME).catch(() => {});
+      return;
+    }
+    const fh = await rec.dir.getFileHandle(SIDECAR_NAME, { create: true });
+    const handle = await fh.createSyncAccessHandle();
+    try {
+      const bytes = new TextEncoder().encode(serializeSidecar(sidecar));
+      handle.truncate(0);
+      handle.write(bytes, { at: 0 });
+      handle.flush();
+    } finally {
+      handle.close();
+    }
+  } catch (e) {
+    errnoFromDom(e, rec.name);
   }
 }
 
@@ -214,34 +228,38 @@ async function moveFileEntry(
   destDir: FileSystemDirectoryHandle,
   newName: string,
 ): Promise<void> {
-  maybeFault("moveStep");
   const oldParent = rec.parentId !== null ? node(rec.parentId) : null;
   const oldName = rec.name;
-  closePooled(id); // sync handles lock the file
-  const movable = rec.file as MovableFileHandle;
-  if (typeof movable.move === "function") {
-    await movable.move(destDir, newName);
-    rec.file = await destDir.getFileHandle(newName);
-  } else {
-    // copy+delete fallback for engines without FileSystemFileHandle.move
-    const data = new Uint8Array(await (await rec.file.getFile()).arrayBuffer());
-    const destHandle = await destDir.getFileHandle(newName, { create: true });
-    const h = await destHandle.createSyncAccessHandle();
-    try {
-      h.truncate(0);
-      if (data.byteLength > 0) h.write(data, { at: 0 });
-      h.flush();
-    } finally {
-      h.close();
-    }
-    if (oldParent?.dir) {
+  try {
+    maybeFault("moveStep");
+    closePooled(id); // sync handles lock the file
+    const movable = rec.file as MovableFileHandle;
+    if (typeof movable.move === "function") {
+      await movable.move(destDir, newName);
+      rec.file = await destDir.getFileHandle(newName);
+    } else {
+      // copy+delete fallback for engines without FileSystemFileHandle.move
+      const data = new Uint8Array(await (await rec.file.getFile()).arrayBuffer());
+      const destHandle = await destDir.getFileHandle(newName, { create: true });
+      const h = await destHandle.createSyncAccessHandle();
       try {
-        await oldParent.dir.removeEntry(oldName);
-      } catch (e) {
-        if ((e as { name?: string } | null)?.name !== "NotFoundError") errnoFromDom(e, oldName);
+        h.truncate(0);
+        if (data.byteLength > 0) h.write(data, { at: 0 });
+        h.flush();
+      } finally {
+        h.close();
       }
+      if (oldParent?.dir) {
+        try {
+          await oldParent.dir.removeEntry(oldName);
+        } catch (e) {
+          if ((e as { name?: string } | null)?.name !== "NotFoundError") errnoFromDom(e, oldName);
+        }
+      }
+      rec.file = destHandle;
     }
-    rec.file = destHandle;
+  } catch (e) {
+    errnoFromDom(e, newName);
   }
   rec.parentId = destParentId;
   rec.name = newName;
@@ -256,7 +274,12 @@ async function moveTree(
 ): Promise<void> {
   const oldParent = rec.parentId !== null ? node(rec.parentId) : null;
   const oldName = rec.name;
-  const newDir = await destDir.getDirectoryHandle(newName, { create: true });
+  let newDir: FileSystemDirectoryHandle;
+  try {
+    newDir = await destDir.getDirectoryHandle(newName, { create: true });
+  } catch (e) {
+    errnoFromDom(e, newName);
+  }
   const children = await ensureChildren(id, rec);
   for (const [childName, entry] of children) {
     maybeFault("moveStep");
@@ -314,11 +337,11 @@ const ops: Record<string, OpFn> = {
       mode: 0o755, mtimeMs: now, ctimeMs: now,
     });
     if (testHooks) {
-      armed = new Set();
-      // Only ever present when a test opted in: one-shot per site — arming
-      // re-arms it (idempotent), firing disarms it.
-      ops.__injectFault = async (site: string): Promise<OpResult> => {
-        armed!.add(site);
+      armed = new Map();
+      // Only ever present when a test opted in. `skip` (default 0) lets that
+      // many earlier triggers of `site` through before the one that fires.
+      ops.__injectFault = async (site: string, skip = 0): Promise<OpResult> => {
+        armed!.set(site, skip);
         return { value: undefined };
       };
     }
@@ -591,6 +614,17 @@ const ops: Record<string, OpFn> = {
     if (!moving) throw new VfsError("ENOENT", fromName);
     const toChildren = await ensureChildren(toParent, tp);
     const displaced = toChildren.get(toName);
+    // POSIX no-op: renaming an entry onto another name that already resolves to the
+    // very same node (e.g. a symlinked-parent alias: fromParent/fromName and
+    // toParent/toName both reach one dentry) must not touch anything. Hardlinks are
+    // unsupported on this backend (caps.hardlinks === false), so id-equality here can
+    // only mean "the same dentry, reached two ways" — never two distinct links to one
+    // inode — which makes this check exact rather than a heuristic. Without this,
+    // the shadow-rename dance below would shadow-alias a rec to itself: the aside move
+    // rebinds it to a throwaway name, the "primary" move (the very same rec) rebinds
+    // it right back, and the subsequent shadow discard then fails (nothing left under
+    // the shadow name) with the whole op wedged mid-mutation.
+    if (displaced && displaced.id === moving.id) return { value: undefined };
     const movingRec = node(moving.id);
 
     // Shadow-rename pattern: never destroy a displaced entry up front (a failed move
@@ -625,9 +659,24 @@ const ops: Record<string, OpFn> = {
       // doesn't have. Ops are sequential; nothing observes this mid-op.
       toChildren.delete(toName);
 
-      // Unconditionally clear the destination name's stale sidecar record (mode/
-      // symlink) so a reopen after this overwrite never misclassifies the new entry
-      // using metadata left behind by whatever used to live at `toName`.
+      // The displaced entry's OWN sidecar record (mode/symlink) still lives under
+      // `toName` even though the entry itself just physically moved to `shadowName` —
+      // MOVE it (not clear it) so it stays correctly attributed to wherever the entry
+      // currently lives. If the primary move below fails, the restore path renames
+      // this record back to `toName` alongside the physical restore; if it succeeds,
+      // the discard phase drops the now-orphaned shadow record for good.
+      await ensureSidecar(tp);
+      if (tp.sidecar![toName]) {
+        tp.sidecar = renameSidecarEntry(tp.sidecar!, toName, shadowName);
+        await writeSidecarFile(tp);
+      }
+    } else {
+      // No displaced entry, but a stale sidecar record can still be sitting at
+      // `toName` (e.g. left behind by an unlink whose best-effort sidecar cleanup
+      // itself failed under quota pressure). setSidecarEntry merges rather than
+      // replaces, so leaving this in place would let the sidecar-transport step
+      // below merge stale fields (like a leftover `symlink` target) into the
+      // freshly-moved-in entry's own metadata. Clear it unconditionally up front.
       await ensureSidecar(tp);
       if (tp.sidecar![toName]) {
         tp.sidecar = setSidecarEntry(tp.sidecar!, toName, { mode: undefined, symlink: undefined });
@@ -666,6 +715,11 @@ const ops: Record<string, OpFn> = {
           }
           // dispRec.name is now toName (rebound by the move helper above).
           toChildren.set(toName, displaced);
+          // The shadow's sidecar record travels back with it.
+          if (tp.sidecar![shadowName]) {
+            tp.sidecar = renameSidecarEntry(tp.sidecar!, shadowName, toName);
+            await writeSidecarFile(tp);
+          }
         } catch {
           // Double failure: the data still survives on disk under the discoverable
           // shadow name. A move helper's parentId/name rebind is unconditionally its
@@ -687,12 +741,24 @@ const ops: Record<string, OpFn> = {
       if (dispRec.kind === "dir") {
         requireDir(dispRec);
         await dispRec.dir.removeEntry(SIDECAR_NAME).catch(() => {});
-        await tp.dir.removeEntry(shadowName);
       } else {
         closePooled(displaced.id);
+      }
+      // Defense-in-depth: the shadow name is our own throwaway, never exposed to a
+      // caller, so it can never legitimately be "already gone" except via a prior
+      // partial failure in this very op — tolerate only that.
+      try {
         await tp.dir.removeEntry(shadowName);
+      } catch (e) {
+        if ((e as { name?: string } | null)?.name !== "NotFoundError") errnoFromDom(e, shadowName);
       }
       nodes.delete(displaced.id);
+      // The shadow name never existed before this rename and is gone now — drop its
+      // (moved-aside) sidecar record so it doesn't linger as unreachable garbage.
+      if (tp.sidecar![shadowName]) {
+        tp.sidecar = setSidecarEntry(tp.sidecar!, shadowName, { mode: undefined, symlink: undefined });
+        await writeSidecarFile(tp);
+      }
     }
 
     // transport the entry's OWN sidecar record (mode/symlink) between parents

@@ -43,6 +43,22 @@ describe("Vfs + CachedBackend + OpfsBackend end-to-end", () => {
     await be2.close();
   });
 
+  it("rename through a symlinked parent aliasing the same entry does not wedge fsync", async () => {
+    const be = await OpfsBackend.open(testRoot());
+    const cached = new CachedBackend(be, { flushDelayMs: 60_000 });
+    const vfs = new Vfs();
+    await vfs.mount("/", cached);
+    await vfs.mkdir("/d");
+    await vfs.symlink("/d", "/l");
+    await vfs.writeFile("/d/f", "x");
+    await vfs.fsync();
+    await vfs.rename("/d/f", "/l/f"); // same entry via alias
+    await vfs.fsync(); // pre-fix: bricked forever
+    await vfs.fsync();
+    expect(await vfs.readTextFile("/d/f")).toBe("x");
+    await be.close();
+  });
+
   it("EXDEV across a memory mount and an OPFS mount", async () => {
     const be = await OpfsBackend.open(testRoot());
     const vfs = new Vfs();
