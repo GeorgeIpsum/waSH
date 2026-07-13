@@ -180,12 +180,25 @@ type MovableFileHandle = FileSystemFileHandle & {
   move?: (dest: FileSystemDirectoryHandle, name: string) => Promise<void>;
 };
 
+// Both move helpers below own the full rebind (handles + parentId + name) as their
+// final act; callers manage only dentry maps. Each captures the pre-move identity
+// (oldParent/oldName) FIRST, uses that captured identity for source-side cleanup, and
+// only overwrites rec.parentId/rec.name as its LAST statements, once the physical
+// move has committed. A NodeRec's name/parentId therefore always describe its last
+// successfully-committed physical location — if the move throws before those final
+// statements run, the rec still accurately names wherever the entry remains reachable
+// from on disk, so re-invoking a move helper on the same rec after a failure is safe
+// (e.g. the rename restore path below, which re-targets a rec whose primary move
+// already failed).
 async function moveFileEntry(
   rec: NodeRec & { file: FileSystemFileHandle },
   id: NodeId,
+  destParentId: NodeId,
   destDir: FileSystemDirectoryHandle,
   newName: string,
 ): Promise<void> {
+  const oldParent = rec.parentId !== null ? node(rec.parentId) : null;
+  const oldName = rec.name;
   closePooled(id); // sync handles lock the file
   const movable = rec.file as MovableFileHandle;
   if (typeof movable.move === "function") {
@@ -203,41 +216,44 @@ async function moveFileEntry(
     } finally {
       h.close();
     }
-    const oldParent = rec.parentId !== null ? node(rec.parentId) : null;
     if (oldParent?.dir) {
       try {
-        await oldParent.dir.removeEntry(rec.name);
+        await oldParent.dir.removeEntry(oldName);
       } catch (e) {
-        if ((e as { name?: string } | null)?.name !== "NotFoundError") errnoFromDom(e, rec.name);
+        if ((e as { name?: string } | null)?.name !== "NotFoundError") errnoFromDom(e, oldName);
       }
     }
     rec.file = destHandle;
   }
+  rec.parentId = destParentId;
+  rec.name = newName;
 }
 
 async function moveTree(
   rec: NodeRec & { dir: FileSystemDirectoryHandle },
   id: NodeId,
-  destParent: FileSystemDirectoryHandle,
+  destParentId: NodeId,
+  destDir: FileSystemDirectoryHandle,
   newName: string,
 ): Promise<void> {
-  const destDir = await destParent.getDirectoryHandle(newName, { create: true });
+  const oldParent = rec.parentId !== null ? node(rec.parentId) : null;
+  const oldName = rec.name;
+  const newDir = await destDir.getDirectoryHandle(newName, { create: true });
   const children = await ensureChildren(id, rec);
   for (const [childName, entry] of children) {
     const child = node(entry.id);
     if (child.kind === "dir") {
       requireDir(child);
-      await moveTree(child, entry.id, destDir, childName);
+      await moveTree(child, entry.id, id, newDir, childName);
     } else {
       requireFile(child);
-      await moveFileEntry(child, entry.id, destDir, childName);
+      await moveFileEntry(child, entry.id, id, newDir, childName);
     }
-    child.parentId = id; // defensive: parent node identity is unchanged by subtree moves; only handles rebind
   }
   // transport the sidecar file itself
   await ensureSidecar(rec);
   const srcDirOld = rec.dir;
-  rec.dir = destDir;
+  rec.dir = newDir;
   if (!isEmptySidecar(rec.sidecar!)) await writeSidecarFile(rec);
   // By this point the subtree HAS already moved (non-atomic by design, per
   // BackendCaps.renameCost === "subtree"): a failure below is surfaced to the caller
@@ -248,17 +264,22 @@ async function moveTree(
   try {
     await srcDirOld.removeEntry(SIDECAR_NAME);
   } catch (e) {
-    if ((e as { name?: string } | null)?.name !== "NotFoundError") errnoFromDom(e, rec.name);
+    if ((e as { name?: string } | null)?.name !== "NotFoundError") errnoFromDom(e, oldName);
   }
-  // remove the emptied source directory
-  const oldParent = rec.parentId !== null ? node(rec.parentId) : null;
+  // remove the emptied source directory — must use oldName/oldParent (captured above),
+  // NOT rec.name/rec.parentId: those are only overwritten below, as the last statements
+  // of this function, so a caller re-invoking this helper on a rec whose previous move
+  // attempt failed (e.g. the rename restore path) still finds the entry's true current
+  // on-disk name and location here.
   if (oldParent?.dir) {
     try {
-      await oldParent.dir.removeEntry(rec.name);
+      await oldParent.dir.removeEntry(oldName);
     } catch (e) {
-      errnoFromDom(e, rec.name);
+      errnoFromDom(e, oldName);
     }
   }
+  rec.parentId = destParentId;
+  rec.name = newName;
 }
 
 const ops: Record<string, OpFn> = {
@@ -548,11 +569,14 @@ const ops: Record<string, OpFn> = {
       shadowName = `.wash-shadow-${ulid()}`;
       if (dispRec.kind === "dir") {
         requireDir(dispRec);
-        await moveTree(dispRec, displaced.id, tp.dir, shadowName);
+        await moveTree(dispRec, displaced.id, toParent, tp.dir, shadowName);
       } else {
         requireFile(dispRec);
-        await moveFileEntry(dispRec, displaced.id, tp.dir, shadowName);
+        await moveFileEntry(dispRec, displaced.id, toParent, tp.dir, shadowName);
       }
+      // dispRec.name is now shadowName (rebound by the move helper above) — the
+      // dentry map must be updated in lockstep so it never lists a name the disk
+      // doesn't have. Ops are sequential; nothing observes this mid-op.
       toChildren.delete(toName);
 
       // Unconditionally clear the destination name's stale sidecar record (mode/
@@ -568,32 +592,42 @@ const ops: Record<string, OpFn> = {
     try {
       if (movingRec.kind === "dir") {
         requireDir(movingRec);
-        await moveTree(movingRec, moving.id, tp.dir, toName);
+        await moveTree(movingRec, moving.id, toParent, tp.dir, toName);
       } else {
         requireFile(movingRec);
-        await moveFileEntry(movingRec, moving.id, tp.dir, toName);
+        await moveFileEntry(movingRec, moving.id, toParent, tp.dir, toName);
       }
+      // movingRec.parentId/name are now rebound to toParent/toName (the move helper's
+      // final act above) — this happens immediately on move success, before the
+      // sidecar transport below (which can itself throw), so a throw there can never
+      // leave a stale name on the moved entry.
     } catch (e) {
       if (displaced && shadowName !== undefined) {
         const dispRec = node(displaced.id);
         // Best-effort restore: move the shadow back to `toName` so the displaced
-        // entry survives the failed rename under its original name.
+        // entry survives the failed rename under its original name. Because the move
+        // helper reads its own oldName from dispRec at call time (not from a stale
+        // caller-held copy), and dispRec.name is currently shadowName (rebound when it
+        // was shadowed above), the helper's trailing source-cleanup correctly targets
+        // shadowName here — not toName, which the primary move never reached.
         try {
           if (dispRec.kind === "dir") {
             requireDir(dispRec);
-            await moveTree(dispRec, displaced.id, tp.dir, toName);
+            await moveTree(dispRec, displaced.id, toParent, tp.dir, toName);
           } else {
             requireFile(dispRec);
-            await moveFileEntry(dispRec, displaced.id, tp.dir, toName);
+            await moveFileEntry(dispRec, displaced.id, toParent, tp.dir, toName);
           }
-          dispRec.name = toName;
+          // dispRec.name is now toName (rebound by the move helper above).
           toChildren.set(toName, displaced);
         } catch {
           // Double failure: the data still survives on disk under the discoverable
-          // shadow name. Keep the displaced NodeRec registered, rebound to it, so
-          // in-memory maps never point at a destroyed entry.
-          dispRec.name = shadowName;
-          toChildren.set(shadowName, displaced);
+          // shadow name. A move helper's parentId/name rebind is unconditionally its
+          // last two statements, so a thrown restore never reached them — dispRec.name
+          // is still shadowName here. Read it fresh (rather than assuming shadowName)
+          // so in-memory maps always match the rec's last successfully-committed
+          // rebind, whatever that was.
+          toChildren.set(dispRec.name, displaced);
         }
       }
       throw e;
@@ -626,10 +660,10 @@ const ops: Record<string, OpFn> = {
       await writeSidecarFile(tp);
     }
 
+    // movingRec.parentId/name were already rebound to toParent/toName by the move
+    // helper above; only the dentry maps need updating here.
     fromChildren.delete(fromName);
     toChildren.set(toName, moving);
-    movingRec.parentId = toParent;
-    movingRec.name = toName;
     fp.mtimeMs = Date.now();
     tp.mtimeMs = Date.now();
     return { value: undefined };
