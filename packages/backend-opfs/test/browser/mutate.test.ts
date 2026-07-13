@@ -56,6 +56,17 @@ describe("OpfsBackend create/unlink", () => {
     await be.close();
   });
 
+  it("a failed create leaves no residue and the directory stays usable", async () => {
+    const be = await OpfsBackend.open(testRoot());
+    const root = await be.root();
+    await expect(be.create(root, SIDECAR_NAME, ulid(), "file")).rejects.toMatchObject({ errno: "EPERM" });
+    expect((await be.readdir(root))).toEqual([]);
+    const f = ulid();
+    await be.create(root, "ok.txt", f, "file");
+    expect((await be.lookup(root, "ok.txt"))?.id).toBe(f);
+    await be.close();
+  });
+
   it("created entries persist across reopen", async () => {
     const rootName = testRoot();
     const be = await OpfsBackend.open(rootName);

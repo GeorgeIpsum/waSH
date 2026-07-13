@@ -209,6 +209,10 @@ const ops: Record<string, OpFn> = {
     return { value: undefined }; // pool teardown arrives in Task 5
   },
 
+  // Failure-ordering invariant: the in-memory dentry/node commit is the final step of
+  // every namespace mutation; fallible I/O (disk entry + sidecar) happens first with
+  // rollback (create) or is deferred-and-swallowed (unlink), so a failed op never
+  // leaves memory ahead of disk — write-back retries must observe pre-op state.
   async create(parent: NodeId, name: string, id: NodeId, kind: NodeKind, attrs?: Partial<Attrs>): Promise<OpResult> {
     const rec = node(parent);
     requireDir(rec);
@@ -224,18 +228,32 @@ const ops: Record<string, OpFn> = {
       errnoFromDom(e, name);
     }
     const mode = attrs?.mode !== undefined ? attrs.mode & 0o777 : defaultMode(kind);
+    if (mode !== defaultMode(kind)) {
+      const prevSidecar = rec.sidecar;
+      try {
+        await ensureSidecar(rec);
+        rec.sidecar = setSidecarEntry(rec.sidecar!, name, { mode });
+        await writeSidecarFile(rec);
+      } catch (e) {
+        // Roll back the disk create so a failed op leaves no residue: the in-memory
+        // dentry map is not yet touched (registerChild runs after this block), so
+        // undoing the disk side keeps memory and disk in lockstep on the failure path.
+        rec.sidecar = prevSidecar;
+        await rec.dir.removeEntry(name).catch(() => {});
+        throw e;
+      }
+    }
     registerChild(parent, name, kind, handles, { id, mode });
     if (attrs?.mtimeMs !== undefined) node(id).mtimeMs = attrs.mtimeMs;
     if (attrs?.ctimeMs !== undefined) node(id).ctimeMs = attrs.ctimeMs;
-    if (mode !== defaultMode(kind)) {
-      await ensureSidecar(rec);
-      rec.sidecar = setSidecarEntry(rec.sidecar!, name, { mode });
-      await writeSidecarFile(rec);
-    }
     rec.mtimeMs = Date.now();
     return { value: undefined };
   },
 
+  // Failure-ordering invariant: the in-memory dentry/node commit is the final step of
+  // every namespace mutation; fallible I/O (disk entry + sidecar) happens first with
+  // rollback (create) or is deferred-and-swallowed (unlink), so a failed op never
+  // leaves memory ahead of disk — write-back retries must observe pre-op state.
   async unlink(parent: NodeId, name: string): Promise<OpResult> {
     const rec = node(parent);
     requireDir(rec);
@@ -257,14 +275,23 @@ const ops: Record<string, OpFn> = {
     } catch (e) {
       errnoFromDom(e, name);
     }
-    await ensureSidecar(rec);
-    if (rec.sidecar![name]) {
-      rec.sidecar = setSidecarEntry(rec.sidecar!, name, { mode: undefined, symlink: undefined });
-      await writeSidecarFile(rec);
-    }
     children.delete(name);
     nodes.delete(entry.id);
     rec.mtimeMs = Date.now();
+    try {
+      // Best-effort: a stale sidecar entry for a deleted name is harmless garbage —
+      // ensureChildren only overlays sidecar metadata onto names that still exist on
+      // disk, so the orphaned entry is inert and gets dropped on the next successful
+      // sidecar write for this directory. Swallowing here keeps the disk+memory commit
+      // (above) authoritative even if this cleanup fails (e.g. quota).
+      await ensureSidecar(rec);
+      if (rec.sidecar![name]) {
+        rec.sidecar = setSidecarEntry(rec.sidecar!, name, { mode: undefined, symlink: undefined });
+        await writeSidecarFile(rec);
+      }
+    } catch {
+      // swallowed — see comment above.
+    }
     return { value: undefined };
   },
 };
