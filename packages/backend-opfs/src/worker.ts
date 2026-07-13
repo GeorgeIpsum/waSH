@@ -274,16 +274,19 @@ type MovableFileHandle = FileSystemFileHandle & {
   move?: (dest: FileSystemDirectoryHandle, name: string) => Promise<void>;
 };
 
-// Both move helpers below own the full rebind (handles + parentId + name) as their
-// final act; callers manage only dentry maps. Each captures the pre-move identity
-// (oldParent/oldName) FIRST, uses that captured identity for source-side cleanup, and
-// only overwrites rec.parentId/rec.name as its LAST statements, once the physical
-// move has committed. A NodeRec's name/parentId therefore always describe its last
-// successfully-committed physical location — if the move throws before those final
-// statements run, the rec still accurately names wherever the entry remains reachable
-// from on disk, so re-invoking a move helper on the same rec after a failure is safe
-// (e.g. the rename restore path below, which re-targets a rec whose primary move
-// already failed).
+// Both move helpers below own the full rebind (handles + parentId + name); callers
+// manage only dentry maps. Each captures the pre-move identity (oldParent/oldName)
+// FIRST and uses that captured identity for source-side cleanup, so a NodeRec's
+// name/parentId always describe its last successfully-committed physical location —
+// re-invoking a move helper on the same rec after a failure is safe (e.g. the rename
+// restore path below, which re-targets a rec whose primary move already failed).
+// moveFileEntry overwrites rec.parentId/rec.name as its unconditional LAST statements:
+// every fallible step precedes them, so a throw always means they never ran and the
+// rec still names the source. moveTree's rebind instead lands as soon as every
+// physical piece (sidecar + descendants) is relocated, followed by one more fallible,
+// best-effort step (removing the emptied source directory entry) that can still throw
+// AFTER the rebind — that failure is surfaced truthfully rather than un-committing
+// the rebind, since disk already agrees with it.
 async function moveFileEntry(
   rec: NodeRec & { file: FileSystemFileHandle },
   id: NodeId,
@@ -337,12 +340,63 @@ async function moveTree(
 ): Promise<void> {
   const oldParent = rec.parentId !== null ? node(rec.parentId) : null;
   const oldName = rec.name;
+  const srcDirOld = rec.dir;
   let newDir: FileSystemDirectoryHandle;
   try {
     newDir = await destDir.getDirectoryHandle(newName, { create: true });
   } catch (e) {
     errnoFromDom(e, newName);
   }
+
+  // Cache the sidecar content BEFORE it is physically relocated below: once cached,
+  // ensureChildren's own ensureSidecar call (inside the child loop, still reading via
+  // rec.dir === srcDirOld) returns this cached copy rather than re-reading disk —
+  // which would otherwise race the physical move and find the file already gone.
+  await ensureSidecar(rec);
+
+  // Physically transport the sidecar file itself, as the FIRST fallible step of the
+  // whole move and BEFORE the child loop: `rec` is still fully untouched here (dir,
+  // parentId, and name all still describe the source), so a failure here is a clean
+  // abort — nothing has moved yet, and the (possibly-just-created, still-empty) dest
+  // dir handle is removed best-effort before rethrowing so it doesn't linger as an
+  // empty phantom. rec.sidecar stays valid either way: its contents are unchanged,
+  // only its physical location moves. This replaces the old "write dest sidecar, then
+  // remove old sidecar" logic entirely — that pair could throw with rec.dir already
+  // pointed at the destination but parentId/name still naming the source, a chimera
+  // NodeRec that later readdirs/retries would silently operate on.
+  try {
+    maybeFault("sidecarMove");
+    let sidecarHandle: FileSystemFileHandle | undefined;
+    try {
+      sidecarHandle = await srcDirOld.getFileHandle(SIDECAR_NAME);
+    } catch (e) {
+      if ((e as { name?: string } | null)?.name !== "NotFoundError") errnoFromDom(e, oldName);
+    }
+    if (sidecarHandle) {
+      const movable = sidecarHandle as MovableFileHandle;
+      if (typeof movable.move === "function") {
+        await movable.move(newDir, SIDECAR_NAME);
+      } else {
+        // copy+delete fallback for engines without FileSystemFileHandle.move — same
+        // shape as moveFileEntry's fallback below.
+        const data = new Uint8Array(await (await sidecarHandle.getFile()).arrayBuffer());
+        const destHandle = await newDir.getFileHandle(SIDECAR_NAME, { create: true });
+        const h = await destHandle.createSyncAccessHandle();
+        try {
+          h.truncate(0);
+          if (data.byteLength > 0) h.write(data, { at: 0 });
+          h.flush();
+        } finally {
+          h.close();
+        }
+        await srcDirOld.removeEntry(SIDECAR_NAME);
+      }
+    }
+  } catch (e) {
+    await destDir.removeEntry(newName, { recursive: true }).catch(() => {});
+    errnoFromDom(e, oldName);
+  }
+
   const children = await ensureChildren(id, rec);
   for (const [childName, entry] of children) {
     maybeFault("moveStep");
@@ -355,36 +409,30 @@ async function moveTree(
       await moveFileEntry(child, entry.id, id, newDir, childName);
     }
   }
-  // transport the sidecar file itself
-  await ensureSidecar(rec);
-  const srcDirOld = rec.dir;
+
+  // The subtree HAS now fully moved (non-atomic by design, per
+  // BackendCaps.renameCost === "subtree": sidecar + every child are physically
+  // relocated). rec.dir must never be reassigned any earlier than this — a partial
+  // rebind (dir already pointing at dest while parentId/name still say source) is
+  // exactly the chimera state a fallible step between them used to create. Commit the
+  // FULL rebind in one place, all at once, now that physical truth backs it.
   rec.dir = newDir;
-  if (!isEmptySidecar(rec.sidecar!)) await writeSidecarFile(rec);
-  // By this point the subtree HAS already moved (non-atomic by design, per
-  // BackendCaps.renameCost === "subtree"): a failure below is surfaced to the caller
-  // rather than silently swallowed, so a phantom source directory/sidecar isn't left
-  // behind to be silently re-discovered with fresh ids on a later reopen.
-  // EXCEPTION: the old sidecar file may legitimately not exist (a directory with no
-  // attr overrides never had one) — tolerate only that NotFoundError.
-  try {
-    await srcDirOld.removeEntry(SIDECAR_NAME);
-  } catch (e) {
-    if ((e as { name?: string } | null)?.name !== "NotFoundError") errnoFromDom(e, oldName);
-  }
-  // remove the emptied source directory — must use oldName/oldParent (captured above),
-  // NOT rec.name/rec.parentId: those are only overwritten below, as the last statements
-  // of this function, so a caller re-invoking this helper on a rec whose previous move
-  // attempt failed (e.g. the rename restore path) still finds the entry's true current
-  // on-disk name and location here.
+  rec.parentId = destParentId;
+  rec.name = newName;
+
+  // Remove the emptied source directory — the only remaining fallible step, and it
+  // runs AFTER the rebind above: if it throws, rec already truthfully describes the
+  // new location (sidecar + children are physically there), so a caller retry, a
+  // plain lookup/readdir, or the rename op's own truth-preserving catch (below) all
+  // observe state that matches disk, even though this op ultimately reports failure.
   if (oldParent?.dir) {
     try {
+      maybeFault("moveCleanup");
       await oldParent.dir.removeEntry(oldName);
     } catch (e) {
       errnoFromDom(e, oldName);
     }
   }
-  rec.parentId = destParentId;
-  rec.name = newName;
 }
 
 const ops: Record<string, OpFn> = {
@@ -739,6 +787,12 @@ const ops: Record<string, OpFn> = {
     // strictly sequentially through the `chain` (see bottom of file), so no
     // interleaved readdir can ever observe a `.wash-shadow-*` name.
     let shadowName: string | undefined;
+    // Set only when the closePooled call just below (displaced-entry teardown) is
+    // itself what newly poisons pendingFlushError — as opposed to a poison that was
+    // already pending beforehand, from some earlier, unrelated failure, which must
+    // stay reported. Used by the discard phase to clear ONLY the poison this op
+    // introduced for bytes it is about to intentionally destroy anyway.
+    let displacedIntroducedPoison = false;
     if (displaced) {
       const dispRec = node(displaced.id);
       if (dispRec.kind === "dir") {
@@ -748,7 +802,9 @@ const ops: Record<string, OpFn> = {
         if (grand.size > 0) throw new VfsError("ENOTEMPTY", toName);
       } else {
         if (movingRec.kind === "dir") throw new VfsError("ENOTDIR", toName);
+        const poisonBefore = pendingFlushError;
         closePooled(displaced.id);
+        displacedIntroducedPoison = poisonBefore === null && pendingFlushError !== null;
       }
       shadowName = `.wash-shadow-${ulid()}`;
       if (dispRec.kind === "dir") {
@@ -826,6 +882,22 @@ const ops: Record<string, OpFn> = {
       // movingRec.parentId/name are now rebound to toParent/toName (the move helper's
       // final act above).
     } catch (e) {
+      // Truth-preserving failure: a move helper's own parentId/name rebind is its
+      // final act (moveFileEntry) — or is committed once every physical piece is
+      // relocated (moveTree), independently of any later fallible step such as
+      // moveTree's post-rebind old-dir cleanup. If that rebind already landed here,
+      // even though the op as a whole is about to fail, the dentry maps must be made
+      // to match it NOW, before any restore/rethrow below — maps always match the
+      // last committed rebind, even on a failed op. When the rebind never landed
+      // (the far more common case), fall through to the pre-existing
+      // displaced-entry restore path instead.
+      if (movingRec.parentId === toParent && movingRec.name === toName) {
+        fromChildren.delete(fromName);
+        toChildren.set(toName, moving);
+        fp.mtimeMs = Date.now();
+        tp.mtimeMs = Date.now();
+        throw e;
+      }
       // If the pre-move sidecar write above landed, tp.sidecar[toName] now holds an
       // annotation for a name the primary move never reached. On this failure path
       // that's either tolerated garbage (no displaced entry: `toName` never becomes a
@@ -890,6 +962,17 @@ const ops: Record<string, OpFn> = {
         await dispRec.dir.removeEntry(SIDECAR_NAME).catch(() => {});
       } else {
         discardPooled(displaced.id); // content is being destroyed — must not poison fsync
+        // The primary move succeeded, so the displaced entry's bytes really are being
+        // intentionally destroyed now — if the closePooled teardown above was what
+        // set pendingFlushError (rather than some earlier, unrelated failure already
+        // pending before it), that poison describes bytes nobody will ever read
+        // again and must not fail a later, unrelated fsync. Clear only what THIS op
+        // introduced; an already-pending poison from before stays reported. On the
+        // restore path (primary move failed, shadow moved back to `toName`) this
+        // line is never reached, so that poison correctly stays live — the file
+        // survives the failed rename, so a real flush failure against it still
+        // matters.
+        if (displacedIntroducedPoison) pendingFlushError = null;
       }
       // Defense-in-depth: the shadow name is our own throwaway, never exposed to a
       // caller, so it can never legitimately be "already gone" except via a prior

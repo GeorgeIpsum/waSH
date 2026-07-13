@@ -190,4 +190,50 @@ describe("OpfsBackend rename", () => {
     expect((await be.readdir(root)).map((d) => d.name)).toEqual(["b"]);
     await be.close();
   });
+
+  it("dir rename aborts cleanly when the sidecar transport fails (no chimera tree)", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    const d = ulid();
+    await be.create(root, "src", d, "dir");
+    const f = ulid();
+    await be.create(d, "exec.sh", f, "file", { mode: 0o755 }); // non-empty sidecar in src
+    await (be as unknown as { call: (op: string, a: unknown[]) => Promise<unknown> }).call("__injectFault", ["sidecarMove", 0]);
+    await expect(be.rename(root, "src", root, "moved")).rejects.toMatchObject({ errno: "ENOSPC" });
+    expect((await be.lookup(root, "src"))?.id).toBe(d);
+    expect((await be.readdir(d)).map((x) => x.name)).toEqual(["exec.sh"]);
+    expect((await be.lookup(d, "exec.sh"))?.attrs.mode).toBe(0o755);
+    expect(await be.lookup(root, "moved")).toBeNull();
+    await be.rename(root, "src", root, "moved");
+    expect((await be.lookup(d, "exec.sh"))?.attrs.mode).toBe(0o755);
+    await be.close();
+  });
+
+  it("post-commit cleanup failure surfaces the error but leaves a truthful namespace", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    const d = ulid();
+    await be.create(root, "src", d, "dir");
+    await be.create(d, "f", ulid(), "file");
+    await (be as unknown as { call: (op: string, a: unknown[]) => Promise<unknown> }).call("__injectFault", ["moveCleanup", 0]);
+    await expect(be.rename(root, "src", root, "moved")).rejects.toMatchObject({ errno: "ENOSPC" });
+    expect((await be.lookup(root, "moved"))?.id).toBe(d);
+    expect((await be.readdir(d)).map((x) => x.name)).toEqual(["f"]);
+    await be.flush();
+    await be.close();
+  });
+
+  it("overwriting a dirty pooled target does not poison fsync when the rename succeeds", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    const a = ulid();
+    const b = ulid();
+    await be.create(root, "a", a, "file");
+    await be.create(root, "b", b, "file");
+    await be.write(b, 0, new TextEncoder().encode("dirty-target"));
+    await (be as unknown as { call: (op: string, a: unknown[]) => Promise<unknown> }).call("__injectFault", ["evictFlush", 0]);
+    await be.rename(root, "a", root, "b");
+    await be.flush(); // must resolve: those bytes were intentionally destroyed
+    await be.close();
+  });
 });
