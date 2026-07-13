@@ -193,6 +193,14 @@ async function acquireHandle(
 ): Promise<FileSystemSyncAccessHandle> {
   const existing = pool.get(id);
   if (existing) return existing;
+  // Once pooled, attrsOf's getSize()-based fast path never re-reads File.lastModified
+  // (an open sync-access handle's own state is authoritative for size, but OPFS doesn't
+  // expose a live mtime through it) — so a freshly-discovered file's mtimeMs:0 placeholder
+  // (see ensureChildren) must be resolved to its real File.lastModified now, before the
+  // handle goes in the pool, or it would be stuck reporting 0 for the rest of the session.
+  if (rec.mtimeMs === 0 && !rec.mtimeExplicit) {
+    rec.mtimeMs = (await rec.file.getFile()).lastModified;
+  }
   let handle: FileSystemSyncAccessHandle;
   try {
     handle = await rec.file.createSyncAccessHandle();

@@ -102,6 +102,29 @@ describe("OpfsBackend namespace reads", () => {
     await be2.close();
   });
 
+  it("pooled getattr reports File.lastModified for an untouched, freshly-discovered file (I1)", async () => {
+    const rootName = testRoot();
+    const be = await OpfsBackend.open(rootName);
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f.txt", f, "file");
+    await be.write(f, 0, new TextEncoder().encode("content"));
+    await be.flush();
+    await be.close();
+
+    await new Promise((r) => setTimeout(r, 50));
+    const gap = Date.now(); // strictly after the write, strictly before rediscovery
+
+    const be2 = await OpfsBackend.open(rootName);
+    const root2 = await be2.root();
+    const info = await be2.lookup(root2, "f.txt"); // discovery only: no in-session mtime yet
+    await be2.read(info!.id, 0, 100); // pools a sync-access handle for the id
+    const attrs = await be2.getattr(info!.id); // pre-fix: reports the discovery-time placeholder (0)
+    expect(attrs.mtimeMs).toBeGreaterThan(0);
+    expect(attrs.mtimeMs).toBeLessThan(gap);
+    await be2.close();
+  });
+
   it("readdir on a file throws ENOTDIR; getattr of unknown id ENOENT", async () => {
     const rootName = testRoot();
     const origin = await navigator.storage.getDirectory();
