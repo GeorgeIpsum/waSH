@@ -38,10 +38,13 @@ describe("OpfsBackend shell", () => {
     await be.close();
   });
 
-  it("unimplemented ops reject with ENOSYS across the RPC boundary", async () => {
+  it("an unknown op name rejects with ENOSYS across the RPC boundary", async () => {
     const be = await OpfsBackend.open(testRoot());
-    // rename shipped in Task 7; dump remains stubbed until Task 8 — repoint the sentinel.
-    await expect(be.dump()).rejects.toMatchObject({ errno: "ENOSYS" });
+    // dump() shipped in Task 8 — no stubbed op is left to exercise the ENOSYS
+    // sentinel, so call the private RPC directly with a bogus op name instead.
+    await expect(
+      (be as unknown as { call: (op: string, a: unknown[]) => Promise<unknown> }).call("nonexistent-op", []),
+    ).rejects.toMatchObject({ errno: "ENOSYS" });
     await be.close();
   });
 

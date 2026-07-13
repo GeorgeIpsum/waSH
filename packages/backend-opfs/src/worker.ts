@@ -527,6 +527,24 @@ const ops: Record<string, OpFn> = {
     return { value: rec.target };
   },
 
+  async dump(): Promise<OpResult> {
+    const inodes: { id: NodeId; attrs: Attrs }[] = [];
+    const dirents: { parentId: NodeId; name: string; childId: NodeId; kind: NodeKind }[] = [];
+    async function walk(id: NodeId): Promise<void> {
+      const rec = node(id);
+      inodes.push({ id, attrs: await attrsOf(id, rec) });
+      if (rec.kind !== "dir") return;
+      requireDir(rec);
+      const children = await ensureChildren(id, rec);
+      for (const [name, entry] of children) {
+        dirents.push({ parentId: id, name, childId: entry.id, kind: entry.kind });
+        await walk(entry.id);
+      }
+    }
+    await walk(rootId);
+    return { value: { inodes, dirents } };
+  },
+
   // Non-atomic by design (BackendCaps.renameCost === "subtree"): a file move is a
   // single OPFS move/copy step, but a directory move recreates the dest subtree and
   // walks every descendant, rebinding each NodeRec's handles while keeping ids stable.
