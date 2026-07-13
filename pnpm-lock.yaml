@@ -62,6 +62,28 @@ importers:
         specifier: ^3.0.0
         version: 3.2.7(@types/node@22.20.1)(@vitest/browser@3.2.7)
 
+  packages/backend-opfs:
+    dependencies:
+      '@wash/vfs':
+        specifier: workspace:^
+        version: link:../vfs
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+      '@vitest/browser':
+        specifier: 3.2.7
+        version: 3.2.7(playwright@1.61.1)(vite@7.3.6(@types/node@22.20.1))(vitest@3.2.7)
+      playwright:
+        specifier: ^1.61.1
+        version: 1.61.1
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.7(@types/node@22.20.1)(@vitest/browser@3.2.7)
+
   packages/vfs:
     devDependencies:
       '@types/node':
