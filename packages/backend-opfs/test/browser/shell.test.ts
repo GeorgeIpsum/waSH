@@ -40,8 +40,8 @@ describe("OpfsBackend shell", () => {
 
   it("unimplemented ops reject with ENOSYS across the RPC boundary", async () => {
     const be = await OpfsBackend.open(testRoot());
-    const root = await be.root();
-    await expect(be.rename(root, "f", root, "g")).rejects.toMatchObject({ errno: "ENOSYS" });
+    // rename shipped in Task 7; dump remains stubbed until Task 8 — repoint the sentinel.
+    await expect(be.dump()).rejects.toMatchObject({ errno: "ENOSYS" });
     await be.close();
   });
 

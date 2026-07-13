@@ -177,6 +177,69 @@ function closePooled(id: NodeId): void {
   pool.delete(id, true);
 }
 
+type MovableFileHandle = FileSystemFileHandle & {
+  move?: (dest: FileSystemDirectoryHandle, name: string) => Promise<void>;
+};
+
+async function moveFileEntry(
+  rec: NodeRec & { file: FileSystemFileHandle },
+  id: NodeId,
+  destDir: FileSystemDirectoryHandle,
+  newName: string,
+): Promise<void> {
+  closePooled(id); // sync handles lock the file
+  const movable = rec.file as MovableFileHandle;
+  if (typeof movable.move === "function") {
+    await movable.move(destDir, newName);
+    rec.file = await destDir.getFileHandle(newName);
+  } else {
+    // copy+delete fallback for engines without FileSystemFileHandle.move
+    const data = new Uint8Array(await (await rec.file.getFile()).arrayBuffer());
+    const destHandle = await destDir.getFileHandle(newName, { create: true });
+    const h = await destHandle.createSyncAccessHandle();
+    try {
+      h.truncate(0);
+      if (data.byteLength > 0) h.write(data, { at: 0 });
+      h.flush();
+    } finally {
+      h.close();
+    }
+    const oldParent = rec.parentId !== null ? node(rec.parentId) : null;
+    if (oldParent?.dir) await oldParent.dir.removeEntry(rec.name).catch(() => {});
+    rec.file = destHandle;
+  }
+}
+
+async function moveTree(
+  rec: NodeRec & { dir: FileSystemDirectoryHandle },
+  id: NodeId,
+  destParent: FileSystemDirectoryHandle,
+  newName: string,
+): Promise<void> {
+  const destDir = await destParent.getDirectoryHandle(newName, { create: true });
+  const children = await ensureChildren(id, rec);
+  for (const [childName, entry] of children) {
+    const child = node(entry.id);
+    if (child.kind === "dir") {
+      requireDir(child);
+      await moveTree(child, entry.id, destDir, childName);
+    } else {
+      requireFile(child);
+      await moveFileEntry(child, entry.id, destDir, childName);
+    }
+    child.parentId = id; // unchanged parent NODE; only handles moved
+  }
+  // transport the sidecar file itself
+  await ensureSidecar(rec);
+  const srcDirOld = rec.dir;
+  rec.dir = destDir;
+  if (!isEmptySidecar(rec.sidecar!)) await writeSidecarFile(rec);
+  await srcDirOld.removeEntry(SIDECAR_NAME).catch(() => {});
+  // remove the emptied source directory
+  const oldParent = rec.parentId !== null ? node(rec.parentId) : null;
+  if (oldParent?.dir) await oldParent.dir.removeEntry(rec.name).catch(() => {});
+}
+
 const ops: Record<string, OpFn> = {
   async open(rootDirName: string, poolSizeOpt: number): Promise<OpResult> {
     poolSize = poolSizeOpt;
@@ -420,6 +483,73 @@ const ops: Record<string, OpFn> = {
     const rec = node(id);
     if (rec.kind !== "symlink" || rec.target === undefined) throw new VfsError("EINVAL");
     return { value: rec.target };
+  },
+
+  // Non-atomic by design (BackendCaps.renameCost === "subtree"): a file move is a
+  // single OPFS move/copy step, but a directory move recreates the dest subtree and
+  // walks every descendant, rebinding each NodeRec's handles while keeping ids stable.
+  // A failure partway through a directory move can leave the source and dest subtrees
+  // each holding part of the tree — accepted for v1 and documented, not rolled back.
+  async rename(fromParent: NodeId, fromName: string, toParent: NodeId, toName: string): Promise<OpResult> {
+    const fp = node(fromParent);
+    requireDir(fp);
+    const tp = node(toParent);
+    requireDir(tp);
+    if (fromName === SIDECAR_NAME || toName === SIDECAR_NAME) {
+      throw new VfsError("EPERM", fromName === SIDECAR_NAME ? fromName : toName);
+    }
+    const fromChildren = await ensureChildren(fromParent, fp);
+    const moving = fromChildren.get(fromName);
+    if (!moving) throw new VfsError("ENOENT", fromName);
+    const toChildren = await ensureChildren(toParent, tp);
+    const displaced = toChildren.get(toName);
+    const movingRec = node(moving.id);
+
+    if (displaced) {
+      const dispRec = node(displaced.id);
+      if (dispRec.kind === "dir") {
+        if (movingRec.kind !== "dir") throw new VfsError("EISDIR", toName);
+        requireDir(dispRec);
+        const grand = await ensureChildren(displaced.id, dispRec);
+        if (grand.size > 0) throw new VfsError("ENOTEMPTY", toName);
+        await dispRec.dir.removeEntry(SIDECAR_NAME).catch(() => {});
+        await tp.dir.removeEntry(toName);
+        nodes.delete(displaced.id);
+      } else {
+        if (movingRec.kind === "dir") throw new VfsError("ENOTDIR", toName);
+        closePooled(displaced.id);
+        await tp.dir.removeEntry(toName);
+        nodes.delete(displaced.id);
+      }
+      toChildren.delete(toName);
+    }
+
+    if (movingRec.kind === "dir") {
+      requireDir(movingRec);
+      await moveTree(movingRec, moving.id, tp.dir, toName);
+    } else {
+      requireFile(movingRec);
+      await moveFileEntry(movingRec, moving.id, tp.dir, toName);
+    }
+
+    // transport the entry's OWN sidecar record (mode/symlink) between parents
+    await ensureSidecar(fp);
+    const entryMeta = fp.sidecar![fromName];
+    if (entryMeta) {
+      fp.sidecar = setSidecarEntry(fp.sidecar!, fromName, { mode: undefined, symlink: undefined });
+      await writeSidecarFile(fp);
+      await ensureSidecar(tp);
+      tp.sidecar = setSidecarEntry(tp.sidecar!, toName, entryMeta);
+      await writeSidecarFile(tp);
+    }
+
+    fromChildren.delete(fromName);
+    toChildren.set(toName, moving);
+    movingRec.parentId = toParent;
+    movingRec.name = toName;
+    fp.mtimeMs = Date.now();
+    tp.mtimeMs = Date.now();
+    return { value: undefined };
   },
 };
 
