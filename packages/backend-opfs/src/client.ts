@@ -8,6 +8,8 @@ export const SIDECAR_NAME = ".wash-attrs";
 
 export interface OpfsBackendOptions {
   handlePoolSize?: number;
+  /** Test-only: registers the `__injectFault` op in the worker. Never set this in production. */
+  testHooks?: boolean;
 }
 
 export class OpfsBackend implements WashBackend {
@@ -37,7 +39,7 @@ export class OpfsBackend implements WashBackend {
   static async open(rootDirName: string, opts: OpfsBackendOptions = {}): Promise<OpfsBackend> {
     const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
     const be = new OpfsBackend(worker);
-    be.rootId = (await be.call("open", [rootDirName, opts.handlePoolSize ?? 64])) as NodeId;
+    be.rootId = (await be.call("open", [rootDirName, opts.handlePoolSize ?? 64, opts.testHooks ?? false])) as NodeId;
     return be;
   }
 

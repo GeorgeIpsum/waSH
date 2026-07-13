@@ -34,6 +34,19 @@ const nodes = new Map<NodeId, NodeRec>();
 let rootId: NodeId = "";
 let poolSize = 64;
 
+// Test-gated fault injection (never reachable unless `open` was called with
+// `testHooks: true`): `armed === null` is the fast path that makes every
+// `maybeFault` call a no-op in production, with zero allocation. Only when a
+// test opts in does `open` allocate the map and register `__injectFault`.
+let armed: Set<string> | null = null;
+
+function maybeFault(site: string): void {
+  if (armed === null) return;
+  if (!armed.has(site)) return;
+  armed.delete(site);
+  throw new DOMException("injected quota failure", "QuotaExceededError");
+}
+
 function makePool(capacity: number): Lru<NodeId, FileSystemSyncAccessHandle> {
   return new Lru(capacity, (_id, h) => {
     try {
@@ -86,6 +99,7 @@ async function ensureSidecar(rec: NodeRec & { dir: FileSystemDirectoryHandle }):
 }
 
 async function writeSidecarFile(rec: NodeRec & { dir: FileSystemDirectoryHandle }): Promise<void> {
+  maybeFault("sidecarWrite");
   const sidecar = rec.sidecar ?? {};
   if (isEmptySidecar(sidecar)) {
     await rec.dir.removeEntry(SIDECAR_NAME).catch(() => {});
@@ -200,6 +214,7 @@ async function moveFileEntry(
   destDir: FileSystemDirectoryHandle,
   newName: string,
 ): Promise<void> {
+  maybeFault("moveStep");
   const oldParent = rec.parentId !== null ? node(rec.parentId) : null;
   const oldName = rec.name;
   closePooled(id); // sync handles lock the file
@@ -244,6 +259,7 @@ async function moveTree(
   const newDir = await destDir.getDirectoryHandle(newName, { create: true });
   const children = await ensureChildren(id, rec);
   for (const [childName, entry] of children) {
+    maybeFault("moveStep");
     const child = node(entry.id);
     if (child.kind === "dir") {
       requireDir(child);
@@ -286,7 +302,7 @@ async function moveTree(
 }
 
 const ops: Record<string, OpFn> = {
-  async open(rootDirName: string, poolSizeOpt: number): Promise<OpResult> {
+  async open(rootDirName: string, poolSizeOpt: number, testHooks?: boolean): Promise<OpResult> {
     poolSize = poolSizeOpt;
     pool = makePool(poolSize);
     const origin = await navigator.storage.getDirectory();
@@ -297,6 +313,15 @@ const ops: Record<string, OpFn> = {
       kind: "dir", parentId: null, name: "", dir,
       mode: 0o755, mtimeMs: now, ctimeMs: now,
     });
+    if (testHooks) {
+      armed = new Set();
+      // Only ever present when a test opted in: one-shot per site — arming
+      // re-arms it (idempotent), firing disarms it.
+      ops.__injectFault = async (site: string): Promise<OpResult> => {
+        armed!.add(site);
+        return { value: undefined };
+      };
+    }
     return { value: rootId };
   },
 
