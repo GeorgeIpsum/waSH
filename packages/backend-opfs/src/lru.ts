@@ -37,8 +37,11 @@ export class Lru<K, V> {
   }
 
   clear(callEvict = false): void {
-    if (callEvict) for (const [k, v] of this.map) this.onEvict(k, v);
+    const entries = callEvict ? [...this.map] : null;
     this.map.clear();
+    if (entries) {
+      for (const [k, v] of entries) this.onEvict(k, v);
+    }
   }
 
   keys(): IterableIterator<K> {
