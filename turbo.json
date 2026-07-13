@@ -3,6 +3,8 @@
   "tasks": {
     "build": { "dependsOn": ["^build"], "outputs": ["dist/**"] },
     "test": { "dependsOn": ["^build"] },
-    "typecheck": { "dependsOn": ["^build"] }
+    "typecheck": { "dependsOn": ["^build"] },
+    "test:browser": { "dependsOn": ["^build"], "cache": false },
+    "bench": { "dependsOn": ["^build"], "cache": false }
   }
 }

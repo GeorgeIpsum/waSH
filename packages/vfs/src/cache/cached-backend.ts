@@ -1,4 +1,4 @@
-import type { Attrs, BackendCaps, Dirent, NodeId, NodeInfo, NodeKind, WashBackend } from "../types.js";
+import type { Attrs, BackendCaps, BackendDump, Dirent, NodeId, NodeInfo, NodeKind, WashBackend } from "../types.js";
 import { VfsError } from "../errors.js";
 
 const NEG = Symbol("negative");
@@ -258,7 +258,15 @@ export class CachedBackend implements WashBackend {
     const run = (async () => {
       while (this.queue.length > 0) {
         const op = this.queue[0]!;
-        await op(); // rejection leaves the op at the head for retry — see dropVictim/enqueue docs
+        try {
+          await op(); // rejection leaves the op at the head for retry — see dropVictim/enqueue docs
+        } catch (e) {
+          // Give the backend its durability-point callback even though the
+          // drain failed — backends like IndexedDB clear their sticky abort
+          // poison in flush(); without this the queue head can never retry.
+          await this.inner.flush().catch(() => {});
+          throw e;
+        }
         this.queue.shift();
       }
       await this.inner.flush();
@@ -283,6 +291,15 @@ export class CachedBackend implements WashBackend {
       const attrs = await this.getattr(hit.id);
       return { id: hit.id, attrs };
     }
+    // A complete readdir map for `parent` is authoritative for absences: a
+    // name missing from it is a definitive miss, cacheable without asking
+    // `inner` (mount-time warming's whole point — see `warm()` — and a small
+    // win for any directory that's already been fully readdir()'d).
+    const dirMap = this.readdirCache.get(parent);
+    if (dirMap && !dirMap.has(name)) {
+      this.lookupCache.set(k, NEG);
+      return null;
+    }
     await this.drain(); // cache-miss read: never read stale
     const info = await this.inner.lookup(parent, name);
     this.lookupCache.set(k, info ? { id: info.id, kind: info.attrs.kind } : NEG);
@@ -303,10 +320,35 @@ export class CachedBackend implements WashBackend {
   async readdir(id: NodeId): Promise<Dirent[]> {
     const hit = this.readdirCache.get(id);
     if (hit) return [...hit.values()].map((d) => ({ ...d }));
+    // A cached (non-dir) kind is authoritative: fail fast without asking
+    // `inner`, so a warmed file/symlink id's readdir() never touches inner.
+    const cachedKind = this.attrCache.get(id);
+    if (cachedKind && cachedKind.kind !== "dir") throw new VfsError("ENOTDIR");
     await this.drain(); // cache-miss read: never read stale
     const list = await this.inner.readdir(id);
     this.readdirCache.set(id, new Map(list.map((d) => [d.name, d])));
     return list.map((d) => ({ ...d }));
+  }
+
+  /**
+   * Bulk-prime all metadata caches from a backend dump (mount-time warming,
+   * spec §5). After warming, every lookup/getattr/readdir — including
+   * negative lookups in dumped directories — is served from memory.
+   */
+  warm(dump: BackendDump): void {
+    if (this.queue.length > 0 || this.dirtyData.size > 0 || this.flushing !== null) {
+      throw new VfsError("EINVAL", "warm() requires a clean cache");
+    }
+    for (const { id, attrs } of dump.inodes) {
+      this.attrCache.set(id, { ...attrs });
+      if (attrs.kind === "dir" && !this.readdirCache.has(id)) {
+        this.readdirCache.set(id, new Map());
+      }
+    }
+    for (const d of dump.dirents) {
+      this.lookupCache.set(this.key(d.parentId, d.name), { id: d.childId, kind: d.kind });
+      this.readdirCache.get(d.parentId)?.set(d.name, { name: d.name, childId: d.childId, kind: d.kind });
+    }
   }
 
   async create(parent: NodeId, name: string, id: NodeId, kind: NodeKind, attrs?: Partial<Attrs>): Promise<void> {
@@ -428,6 +470,7 @@ export class CachedBackend implements WashBackend {
     return this.withNodeLock(id, async () => {
       const attrs = await this.getattr(id);
       if (attrs.kind === "dir") throw new VfsError("EISDIR");
+      if (data.byteLength === 0) return;
       const cur = await this.materialize(id, attrs);
       const end = Math.max(cur.byteLength, offset + data.byteLength);
       const next = new Uint8Array(end);

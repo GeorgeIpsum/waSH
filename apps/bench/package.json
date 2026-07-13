@@ -1,0 +1,20 @@
+{
+  "name": "bench",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "bench": "vitest bench --run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@wash/vfs": "workspace:^",
+    "@wash/backend-indexeddb": "workspace:^"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0",
+    "@types/node": "^22.0.0",
+    "fake-indexeddb": "^6.0.0"
+  }
+}
