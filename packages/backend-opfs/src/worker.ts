@@ -10,6 +10,7 @@ import {
   isEmptySidecar,
   type Sidecar,
 } from "./sidecar.js";
+import { Lru } from "./lru.js";
 
 export const SIDECAR_NAME = ".wash-attrs";
 
@@ -33,6 +34,14 @@ interface NodeRec {
 const nodes = new Map<NodeId, NodeRec>();
 let rootId: NodeId = "";
 let poolSize = 64;
+let pool: Lru<NodeId, FileSystemSyncAccessHandle> = new Lru(poolSize, (_id, h) => {
+  try {
+    h.flush();
+    h.close();
+  } catch {
+    /* already closed */
+  }
+});
 
 function defaultMode(kind: NodeKind): number {
   return kind === "dir" ? 0o755 : kind === "symlink" ? 0o777 : 0o644;
@@ -135,13 +144,42 @@ async function ensureChildren(
 type OpResult = { value: unknown; transfer?: Transferable[] };
 type OpFn = (...args: never[]) => Promise<OpResult>;
 
-function closePooled(_id: NodeId): void {
-  // sync-handle pool arrives in Task 5
+function requireFile(rec: NodeRec): asserts rec is NodeRec & { file: FileSystemFileHandle } {
+  if (rec.kind === "dir") throw new VfsError("EISDIR");
+  if (!rec.file) throw new VfsError("ENOENT");
+}
+
+async function acquireHandle(
+  id: NodeId,
+  rec: NodeRec & { file: FileSystemFileHandle },
+): Promise<FileSystemSyncAccessHandle> {
+  const existing = pool.get(id);
+  if (existing) return existing;
+  let handle: FileSystemSyncAccessHandle;
+  try {
+    handle = await rec.file.createSyncAccessHandle();
+  } catch (e) {
+    errnoFromDom(e, rec.name);
+  }
+  pool.set(id, handle);
+  return handle;
+}
+
+function closePooled(id: NodeId): void {
+  pool.delete(id, true);
 }
 
 const ops: Record<string, OpFn> = {
   async open(rootDirName: string, poolSizeOpt: number): Promise<OpResult> {
     poolSize = poolSizeOpt;
+    pool = new Lru(poolSize, (_id, h) => {
+      try {
+        h.flush();
+        h.close();
+      } catch {
+        /* already closed */
+      }
+    });
     const origin = await navigator.storage.getDirectory();
     const dir = await origin.getDirectoryHandle(rootDirName, { create: true });
     rootId = ulid();
@@ -155,7 +193,7 @@ const ops: Record<string, OpFn> = {
 
   async getattr(id: NodeId): Promise<OpResult> {
     const rec = node(id);
-    const attrs = await attrsOf(rec);
+    const attrs = await attrsOf(id, rec);
     return { value: attrs };
   },
 
@@ -166,7 +204,7 @@ const ops: Record<string, OpFn> = {
     const children = await ensureChildren(parent, rec);
     const entry = children.get(name);
     if (!entry) return { value: null };
-    const info: NodeInfo = { id: entry.id, attrs: await attrsOf(node(entry.id)) };
+    const info: NodeInfo = { id: entry.id, attrs: await attrsOf(entry.id, node(entry.id)) };
     return { value: info };
   },
 
@@ -201,12 +239,63 @@ const ops: Record<string, OpFn> = {
     return { value: undefined };
   },
 
+  async read(id: NodeId, offset: number, length: number): Promise<OpResult> {
+    const rec = node(id);
+    requireFile(rec);
+    const handle = await acquireHandle(id, rec);
+    const size = handle.getSize();
+    if (offset >= size || length === 0) return { value: new ArrayBuffer(0) };
+    const end = Math.min(offset + length, size);
+    const buf = new Uint8Array(end - offset);
+    handle.read(buf, { at: offset });
+    return { value: buf.buffer, transfer: [buf.buffer] };
+  },
+
+  async write(id: NodeId, offset: number, data: ArrayBuffer): Promise<OpResult> {
+    const rec = node(id);
+    requireFile(rec);
+    const bytes = new Uint8Array(data);
+    if (bytes.byteLength === 0) return { value: undefined }; // POSIX no-op
+    const handle = await acquireHandle(id, rec);
+    try {
+      handle.write(bytes, { at: offset }); // OPFS zero-fills any gap past EOF
+    } catch (e) {
+      errnoFromDom(e, rec.name);
+    }
+    rec.mtimeMs = Date.now();
+    rec.mtimeExplicit = false;
+    return { value: undefined };
+  },
+
+  async truncate(id: NodeId, size: number): Promise<OpResult> {
+    const rec = node(id);
+    requireFile(rec);
+    const handle = await acquireHandle(id, rec);
+    try {
+      handle.truncate(size);
+    } catch (e) {
+      errnoFromDom(e, rec.name);
+    }
+    rec.mtimeMs = Date.now();
+    rec.mtimeExplicit = false;
+    return { value: undefined };
+  },
+
   async flush(): Promise<OpResult> {
-    return { value: undefined }; // pooled-handle flushing arrives in Task 5
+    for (const id of [...pool.keys()]) {
+      const h = pool.get(id);
+      try {
+        h?.flush();
+      } catch {
+        /* closed under us */
+      }
+    }
+    return { value: undefined };
   },
 
   async close(): Promise<OpResult> {
-    return { value: undefined }; // pool teardown arrives in Task 5
+    pool.clear(true);
+    return { value: undefined };
   },
 
   // Failure-ordering invariant: the in-memory dentry/node commit is the final step of
@@ -296,13 +385,21 @@ const ops: Record<string, OpFn> = {
   },
 };
 
-async function attrsOf(rec: NodeRec): Promise<Attrs> {
+async function attrsOf(id: NodeId, rec: NodeRec): Promise<Attrs> {
   let size = 0;
   let mtimeMs = rec.mtimeMs;
   if (rec.kind === "file" && rec.file) {
-    const f = await rec.file.getFile();
-    size = f.size;
-    mtimeMs = rec.mtimeExplicit || rec.mtimeMs > f.lastModified ? rec.mtimeMs : f.lastModified;
+    const pooled = pool.get(id);
+    if (pooled) {
+      // A pooled sync-access handle is authoritative over getFile(): unflushed
+      // writes/truncates are invisible to getFile() until flush(), but getSize()
+      // always reflects them.
+      size = pooled.getSize();
+    } else {
+      const f = await rec.file.getFile();
+      size = f.size;
+      mtimeMs = rec.mtimeExplicit || rec.mtimeMs > f.lastModified ? rec.mtimeMs : f.lastModified;
+    }
   } else if (rec.kind === "symlink") {
     size = rec.target?.length ?? 0;
   }
