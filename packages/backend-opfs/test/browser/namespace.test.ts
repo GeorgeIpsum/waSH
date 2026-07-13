@@ -125,6 +125,19 @@ describe("OpfsBackend namespace reads", () => {
     await be2.close();
   });
 
+  it("failed chmod rolls back in-memory mode (raw caller sees consistent state)", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await (be as unknown as { call: (op: string, a: unknown[]) => Promise<unknown> }).call("__injectFault", ["sidecarWrite", 0]);
+    await expect(be.setattr(f, { mode: 0o700 })).rejects.toMatchObject({ errno: "ENOSPC" });
+    expect((await be.getattr(f)).mode).toBe(0o644); // rolled back
+    await be.setattr(f, { mode: 0o700 }); // retry clean
+    expect((await be.getattr(f)).mode).toBe(0o700);
+    await be.close();
+  });
+
   it("readdir on a file throws ENOTDIR; getattr of unknown id ENOENT", async () => {
     const rootName = testRoot();
     const origin = await navigator.storage.getDirectory();

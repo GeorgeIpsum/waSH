@@ -57,18 +57,55 @@ function maybeFault(site: string): void {
   throw new DOMException("injected quota failure", "QuotaExceededError");
 }
 
+// Sticky durability poison: an evicted handle that failed to flush is gone for good
+// (close() below always runs regardless), so there is no handle left for a later
+// `fsync` to flush or report on. Recording the failure here and surfacing it on the
+// NEXT `flush` op (see below) ensures that loss is reported rather than silently
+// dropped. Only the first such failure is kept — see the `flush` op comment for why.
+let pendingFlushError: VfsError | null = null;
+
 function makePool(capacity: number): Lru<NodeId, FileSystemSyncAccessHandle> {
   return new Lru(capacity, (_id, h) => {
+    let flushFailed = false;
+    let flushError: unknown;
     try {
       try {
+        maybeFault("evictFlush");
         h.flush();
+      } catch (e) {
+        flushFailed = true;
+        flushError = e;
       } finally {
         h.close(); // must run even when flush throws: a leaked handle holds the file's exclusive lock
       }
     } catch {
-      // handle already closed, or close failed after a failed flush — nothing more we can do
+      // close() itself failed (e.g. already closed) — nothing more we can do beyond the
+      // flush-failure poisoning below, which already captured the real durability loss.
     }
+    if (flushFailed && !pendingFlushError) pendingFlushError = toVfs(flushError);
   });
+}
+
+// Used ONLY where the pooled handle's content is being destroyed outright (unlink's
+// file branch; rename's displaced-entry teardown) — as opposed to closePooled, used
+// where the entry is merely being moved and must survive. A flush failure here is
+// moot (the bytes are going away either way) and must NOT poison a later fsync: the
+// data being discarded was never going to be read back, so its flush failing carries
+// no durability implication for anything the caller still cares about.
+function discardPooled(id: NodeId): void {
+  const h = pool.peek(id);
+  pool.delete(id, false);
+  if (!h) return;
+  try {
+    try {
+      maybeFault("evictFlush");
+      h.flush();
+    } finally {
+      h.close();
+    }
+  } catch {
+    // swallowed — see comment above.
+  }
 }
 
 let pool: Lru<NodeId, FileSystemSyncAccessHandle> = makePool(poolSize);
@@ -83,14 +120,32 @@ function node(id: NodeId): NodeRec {
   return rec;
 }
 
-export function errnoFromDom(e: unknown, path?: string): never {
+// Shared DOMException → VfsError mapping table. Returns `undefined` (rather than
+// throwing) for names it doesn't recognize, so callers can decide what to do with an
+// unmapped error: errnoFromDom rethrows the raw error (its long-standing contract);
+// toVfs (below) falls back to a generic VfsError for callers that need one no matter
+// what, because they can only ever surface a VfsError to a later, unrelated caller.
+function domToVfs(e: unknown, path?: string): VfsError | undefined {
   const name = (e as { name?: string } | null)?.name;
-  if (name === "NotFoundError") throw new VfsError("ENOENT", path);
-  if (name === "InvalidModificationError") throw new VfsError("ENOTEMPTY", path);
-  if (name === "NoModificationAllowedError") throw new VfsError("EBUSY", path);
-  if (name === "TypeMismatchError") throw new VfsError("ENOTDIR", path);
-  if (name === "QuotaExceededError") throw new VfsError("ENOSPC", path);
-  throw e;
+  if (name === "NotFoundError") return new VfsError("ENOENT", path);
+  if (name === "InvalidModificationError") return new VfsError("ENOTEMPTY", path);
+  if (name === "NoModificationAllowedError") return new VfsError("EBUSY", path);
+  if (name === "TypeMismatchError") return new VfsError("ENOTDIR", path);
+  if (name === "QuotaExceededError") return new VfsError("ENOSPC", path);
+  return undefined;
+}
+
+export function errnoFromDom(e: unknown, path?: string): never {
+  throw domToVfs(e, path) ?? e;
+}
+
+// Like domToVfs, but always returns a VfsError — for callers (the eviction-path flush
+// below) that record a failure to report to a LATER, unrelated caller rather than
+// throwing it to the current one. An unmapped DOM error still needs *some* errno to
+// carry across that gap, so it falls back to EBUSY (closest fit: the resource — an
+// evicted, already-closed sync handle — is no longer usable right now).
+function toVfs(e: unknown, path?: string): VfsError {
+  return domToVfs(e, path) ?? new VfsError("EBUSY", path);
 }
 
 function requireDir(rec: NodeRec): asserts rec is NodeRec & { dir: FileSystemDirectoryHandle } {
@@ -382,25 +437,42 @@ const ops: Record<string, OpFn> = {
     return { value: out };
   },
 
+  // Failure-ordering invariant (same as create/unlink/rename above): the in-memory
+  // commit is the final step. rec.mode and the parent's sidecar are snapshotted before
+  // the write and rolled back together if writeSidecarFile fails, so a failed chmod
+  // never leaves rec.mode reporting a value the sidecar never durably recorded — a
+  // caller retry (or a plain getattr) must observe pre-op state, not a memory/disk split.
   async setattr(id: NodeId, attrs: Partial<Pick<Attrs, "mode" | "mtimeMs" | "ctimeMs">>): Promise<OpResult> {
     const rec = node(id);
+    if (attrs.mode !== undefined) {
+      const newMode = attrs.mode & 0o777;
+      if (rec.parentId !== null) {
+        const parent = node(rec.parentId);
+        requireDir(parent);
+        const prevMode = rec.mode;
+        const prevSidecar = parent.sidecar;
+        try {
+          await ensureSidecar(parent);
+          rec.mode = newMode;
+          parent.sidecar = setSidecarEntry(parent.sidecar!, rec.name, {
+            mode: rec.mode === defaultMode(rec.kind) ? undefined : rec.mode,
+          });
+          await writeSidecarFile(parent);
+        } catch (e) {
+          rec.mode = prevMode;
+          parent.sidecar = prevSidecar;
+          if (e instanceof VfsError) throw e;
+          errnoFromDom(e, rec.name);
+        }
+      } else {
+        rec.mode = newMode; // root has no parent to persist a sidecar entry into
+      }
+    }
     if (attrs.mtimeMs !== undefined) {
       rec.mtimeMs = attrs.mtimeMs;
       rec.mtimeExplicit = true;
     }
     if (attrs.ctimeMs !== undefined) rec.ctimeMs = attrs.ctimeMs;
-    if (attrs.mode !== undefined) {
-      rec.mode = attrs.mode & 0o777;
-      if (rec.parentId !== null) {
-        const parent = node(rec.parentId);
-        requireDir(parent);
-        await ensureSidecar(parent);
-        parent.sidecar = setSidecarEntry(parent.sidecar!, rec.name, {
-          mode: rec.mode === defaultMode(rec.kind) ? undefined : rec.mode,
-        });
-        await writeSidecarFile(parent);
-      }
-    }
     return { value: undefined };
   },
 
@@ -447,6 +519,17 @@ const ops: Record<string, OpFn> = {
   },
 
   async flush(): Promise<OpResult> {
+    // A poisoned eviction flush (see pendingFlushError above) takes priority: it
+    // describes data that is ALREADY unrecoverably lost, from a handle that no longer
+    // exists to retry against, so it must be reported before this flush even looks at
+    // the handles it currently holds. One-shot: cleared on report so a caller that
+    // retries after seeing the failure gets a clean flush next time (matching every
+    // other fault-injection recovery test in this suite).
+    if (pendingFlushError) {
+      const e = pendingFlushError;
+      pendingFlushError = null;
+      throw e;
+    }
     // Ops run strictly sequentially through `chain` (see bottom of file) and nothing
     // in this loop mutates the pool, so there is no benign "handle closed under us"
     // case here: a thrown flush is a REAL durability failure (e.g. quota) and must be
@@ -535,7 +618,7 @@ const ops: Record<string, OpFn> = {
       if (grand.size > 0) throw new VfsError("ENOTEMPTY", name);
       await child.dir.removeEntry(SIDECAR_NAME).catch(() => {}); // sidecar-only dir is empty
     } else {
-      closePooled(entry.id);
+      discardPooled(entry.id); // content is being destroyed — a flush failure here must not poison fsync
     }
     try {
       await rec.dir.removeEntry(name);
@@ -806,7 +889,7 @@ const ops: Record<string, OpFn> = {
         requireDir(dispRec);
         await dispRec.dir.removeEntry(SIDECAR_NAME).catch(() => {});
       } else {
-        closePooled(displaced.id);
+        discardPooled(displaced.id); // content is being destroyed — must not poison fsync
       }
       // Defense-in-depth: the shadow name is our own throwaway, never exposed to a
       // caller, so it can never legitimately be "already gone" except via a prior

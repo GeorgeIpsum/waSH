@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { OpfsBackend, SIDECAR_NAME } from "@wash/backend-opfs";
 import { ulid } from "@wash/vfs";
 
+const enc = new TextEncoder();
 const roots: string[] = [];
 function testRoot(): string {
   const name = `wash-test-${ulid()}`;
@@ -80,6 +81,18 @@ describe("OpfsBackend create/unlink", () => {
     const id2 = ulid();
     await be.create(root, "x", id2, "file"); // default mode: no sidecar write involved, must succeed
     expect((await be.lookup(root, "x"))?.id).toBe(id2);
+    await be.close();
+  });
+
+  it("unlinking a dirty file never poisons fsync even if its discard-flush fails", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "doomed", f, "file");
+    await be.write(f, 0, enc.encode("x"));
+    await (be as unknown as { call: (op: string, a: unknown[]) => Promise<unknown> }).call("__injectFault", ["evictFlush", 0]);
+    await be.unlink(root, "doomed"); // discard path: swallow, no poison
+    await be.flush(); // must resolve
     await be.close();
   });
 

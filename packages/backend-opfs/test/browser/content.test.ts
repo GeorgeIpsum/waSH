@@ -103,4 +103,18 @@ describe("OpfsBackend content", () => {
     }
     await be.close();
   });
+
+  it("a failed eviction flush poisons the next fsync exactly once", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true, handlePoolSize: 2 });
+    const root = await be.root();
+    const ids = [];
+    for (const n of ["a", "b"]) { const f = ulid(); await be.create(root, n, f, "file"); await be.write(f, 0, enc.encode(n)); ids.push(f); }
+    await (be as unknown as { call: (op: string, a: unknown[]) => Promise<unknown> }).call("__injectFault", ["evictFlush", 0]);
+    const c = ulid();
+    await be.create(root, "c", c, "file");
+    await be.write(c, 0, enc.encode("c")); // pool overflow → evicts a dirty handle → flush fails → poisoned, write still succeeds
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" });
+    await be.flush(); // cleared
+    await be.close();
+  });
 });
