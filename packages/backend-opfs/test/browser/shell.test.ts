@@ -41,7 +41,7 @@ describe("OpfsBackend shell", () => {
   it("unimplemented ops reject with ENOSYS across the RPC boundary", async () => {
     const be = await OpfsBackend.open(testRoot());
     const root = await be.root();
-    await expect(be.create(root, "f", ulid(), "file")).rejects.toMatchObject({ errno: "ENOSYS" });
+    await expect(be.rename(root, "f", root, "g")).rejects.toMatchObject({ errno: "ENOSYS" });
     await be.close();
   });
 

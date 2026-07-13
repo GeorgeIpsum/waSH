@@ -135,6 +135,10 @@ async function ensureChildren(
 type OpResult = { value: unknown; transfer?: Transferable[] };
 type OpFn = (...args: never[]) => Promise<OpResult>;
 
+function closePooled(_id: NodeId): void {
+  // sync-handle pool arrives in Task 5
+}
+
 const ops: Record<string, OpFn> = {
   async open(rootDirName: string, poolSizeOpt: number): Promise<OpResult> {
     poolSize = poolSizeOpt;
@@ -203,6 +207,65 @@ const ops: Record<string, OpFn> = {
 
   async close(): Promise<OpResult> {
     return { value: undefined }; // pool teardown arrives in Task 5
+  },
+
+  async create(parent: NodeId, name: string, id: NodeId, kind: NodeKind, attrs?: Partial<Attrs>): Promise<OpResult> {
+    const rec = node(parent);
+    requireDir(rec);
+    if (name === SIDECAR_NAME) throw new VfsError("EPERM", name);
+    const children = await ensureChildren(parent, rec);
+    if (children.has(name)) throw new VfsError("EEXIST", name);
+    let handles: { dir?: FileSystemDirectoryHandle; file?: FileSystemFileHandle };
+    try {
+      handles = kind === "dir"
+        ? { dir: await rec.dir.getDirectoryHandle(name, { create: true }) }
+        : { file: await rec.dir.getFileHandle(name, { create: true }) };
+    } catch (e) {
+      errnoFromDom(e, name);
+    }
+    const mode = attrs?.mode !== undefined ? attrs.mode & 0o777 : defaultMode(kind);
+    registerChild(parent, name, kind, handles, { id, mode });
+    if (attrs?.mtimeMs !== undefined) node(id).mtimeMs = attrs.mtimeMs;
+    if (attrs?.ctimeMs !== undefined) node(id).ctimeMs = attrs.ctimeMs;
+    if (mode !== defaultMode(kind)) {
+      await ensureSidecar(rec);
+      rec.sidecar = setSidecarEntry(rec.sidecar!, name, { mode });
+      await writeSidecarFile(rec);
+    }
+    rec.mtimeMs = Date.now();
+    return { value: undefined };
+  },
+
+  async unlink(parent: NodeId, name: string): Promise<OpResult> {
+    const rec = node(parent);
+    requireDir(rec);
+    if (name === SIDECAR_NAME) throw new VfsError("EPERM", name);
+    const children = await ensureChildren(parent, rec);
+    const entry = children.get(name);
+    if (!entry) throw new VfsError("ENOENT", name);
+    const child = node(entry.id);
+    if (child.kind === "dir") {
+      requireDir(child);
+      const grand = await ensureChildren(entry.id, child);
+      if (grand.size > 0) throw new VfsError("ENOTEMPTY", name);
+      await child.dir.removeEntry(SIDECAR_NAME).catch(() => {}); // sidecar-only dir is empty
+    } else {
+      closePooled(entry.id);
+    }
+    try {
+      await rec.dir.removeEntry(name);
+    } catch (e) {
+      errnoFromDom(e, name);
+    }
+    await ensureSidecar(rec);
+    if (rec.sidecar![name]) {
+      rec.sidecar = setSidecarEntry(rec.sidecar!, name, { mode: undefined, symlink: undefined });
+      await writeSidecarFile(rec);
+    }
+    children.delete(name);
+    nodes.delete(entry.id);
+    rec.mtimeMs = Date.now();
+    return { value: undefined };
   },
 };
 
