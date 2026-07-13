@@ -25,6 +25,12 @@ export class OpfsBackend implements WashBackend {
 
   private constructor(private readonly worker: Worker) {
     worker.onmessage = (ev: MessageEvent<RpcResponse>) => this.dispatch(ev.data);
+    worker.onerror = (ev: ErrorEvent) => {
+      this.failAllPending(new Error(`OPFS worker error: ${ev.message || "unknown"}`));
+    };
+    worker.onmessageerror = () => {
+      this.failAllPending(new Error("OPFS worker message deserialization failed"));
+    };
   }
 
   static async open(rootDirName: string, opts: OpfsBackendOptions = {}): Promise<OpfsBackend> {
@@ -32,6 +38,11 @@ export class OpfsBackend implements WashBackend {
     const be = new OpfsBackend(worker);
     be.rootId = (await be.call("open", [rootDirName, opts.handlePoolSize ?? 64])) as NodeId;
     return be;
+  }
+
+  private failAllPending(err: Error): void {
+    for (const { reject } of this.pending.values()) reject(err);
+    this.pending.clear();
   }
 
   private dispatch(res: RpcResponse): void {
@@ -53,6 +64,7 @@ export class OpfsBackend implements WashBackend {
   async close(): Promise<void> {
     await this.call("close", []);
     this.worker.terminate();
+    this.failAllPending(new Error("OpfsBackend closed"));
   }
 
   async root(): Promise<NodeId> {

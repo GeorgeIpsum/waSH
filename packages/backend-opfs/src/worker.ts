@@ -97,6 +97,15 @@ function ensure(op: string): OpFn {
   };
 }
 
+// Design note (not a TODO): ops run strictly sequentially through this chain, by
+// design, and unbounded — no per-op timeout is imposed. A hung OPFS operation (e.g.
+// a stuck file lock) blocks every queued op behind it. This is intentional: large
+// I/O (big file reads/writes, deep directory walks) has no safe universal time bound,
+// so an artificial timeout would either fire on legitimate slow operations or be set
+// so high it's useless. Client-side failure hygiene (client.ts: onerror/onmessageerror
+// handlers, close()'s failAllPending) is what protects callers if the worker itself
+// dies or becomes unresponsive — it does not un-stick this queue, it only ensures
+// callers aren't left hanging forever.
 let chain: Promise<void> = Promise.resolve();
 
 self.onmessage = (ev: MessageEvent<RpcRequest>) => {

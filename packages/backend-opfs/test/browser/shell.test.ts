@@ -43,4 +43,14 @@ describe("OpfsBackend shell", () => {
     await expect(be.readdir(await be.root())).rejects.toMatchObject({ errno: "ENOSYS" });
     await be.close();
   });
+
+  it("worker failure rejects in-flight calls instead of hanging them", async () => {
+    const be = await OpfsBackend.open(testRoot());
+    const root = await be.root();
+    const internals = be as unknown as { worker: Worker };
+    internals.worker.terminate(); // kill the worker out from under the client
+    const inflight = be.getattr(root); // posts to a dead worker: would hang forever pre-fix
+    internals.worker.dispatchEvent(new ErrorEvent("error", { message: "boom" }));
+    await expect(inflight).rejects.toThrow(/worker error/);
+  }, 2000);
 });
