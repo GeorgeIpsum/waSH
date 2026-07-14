@@ -1,9 +1,9 @@
 # waSH — OPFS Rename Transaction & Sidecar Durability Design
 
 **Date:** 2026-07-14
-**Status:** Approved pending user review
-**Scope:** `@wash/backend-opfs` worker — restructure the `rename` op onto an in-memory transaction primitive, and make sidecar file writes crash/quota-durable.
-**Supersedes:** the hand-built shadow/restore/truth-preserving-commit patchwork in `packages/backend-opfs/src/worker.ts`.
+**Status:** ⛔ SUPERSEDED — NOT to be implemented. Superseded 2026-07-14 by the manifest-model redesign (`docs/superpowers/specs/2026-07-14-opfs-manifest-backend-design.md`).
+**Why superseded:** A clean-slate adversarial review of THIS spec (transcript `.lil-bro/20260714-184328-opfs-rename-spec-review.md`) reached a fundamental result (finding F10): multi-entry atomicity cannot be composed from OPFS single-entry primitives (`move`/`removeEntry`/`write`) via LIFO rollback — the `OpTxn` step-present/step-absent invariant assumes single-op disk inverses, but a rename touches multiple entries (byte-move + metadata-record-move; displaced-remove + source-move). A prior-art survey (general crash-consistency systems + OPFS-specific projects) confirmed the field's answer: keep ALL metadata in one atomically-swapped manifest object and store data in id-addressed blobs that never move on rename — so rename becomes a metadata-only edit, atomic and O(1) by construction (the same model `@wash/backend-indexeddb` already uses). This whole transaction/sidecar/shadow design is therefore unnecessary; the redesign eliminates it.
+**Original scope (kept for the record):** `@wash/backend-opfs` worker — restructure the `rename` op onto an in-memory transaction primitive, and make sidecar file writes crash/quota-durable.
 
 This design was validated through a five-turn adversarial review (transcript:
 `.lil-bro/20260714-171812-opfs-rename-txn-design.md`, 10 findings, all agreed,
