@@ -52,6 +52,15 @@ let dirty = false;
 let releaseLock: (() => void) | null = null;
 let poolSize = 64;
 
+// ---- size-guard advisory (spec §7/§11: v1 writes a whole manifest generation per flush
+// batch, so per-flush commit cost is O(manifest size), not O(1) per mutated entry). No
+// empirical browser bench exists yet (apps/bench is Node/fake-indexeddb only, and OPFS
+// needs a browser worker — see apps/bench/README.md), so this threshold is a reasoned
+// default: ~2 MiB of serialized JSON is roughly a 15-20k-entry manifest. Advisory only —
+// never throws; fired once per worker lifetime so it doesn't spam on every flush.
+let warnedManifestSize = false;
+const MANIFEST_SIZE_WARN_BYTES = 2 * 1024 * 1024;
+
 function slotName(s: "a" | "b"): string { return s === "a" ? "manifest.a" : "manifest.b"; }
 function otherSlot(): "a" | "b" { return currentSlot === "a" ? "b" : "a"; }
 
@@ -94,6 +103,13 @@ async function readSlot(s: "a" | "b"): Promise<Uint8Array | null> {
 async function writeGeneration(): Promise<void> {
   const nextGen = generation + 1;
   const bytes = serializeManifest(mani, nextGen);
+  if (bytes.byteLength > MANIFEST_SIZE_WARN_BYTES && !warnedManifestSize) {
+    warnedManifestSize = true;
+    console.warn(
+      `[wash-opfs] manifest is ${bytes.byteLength} bytes; per-flush rewrite cost is ` +
+      `O(manifest size). Consider fewer files or a future log+checkpoint manifest.`,
+    );
+  }
   const target = otherSlot();
   const fh = await rootDir.getFileHandle(slotName(target), { create: true });
   const h = await fh.createSyncAccessHandle();
