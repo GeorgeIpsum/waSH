@@ -144,6 +144,23 @@ function rollbackToCommitted(): void {
   dirty = false;
 }
 
+/**
+ * GC's live set (spec §3.3): the UNION of the working manifest and BOTH retained
+ * on-disk generations. Blob reclamation is entirely GC's job — unlink/rename only drop
+ * the inode from the manifest (Tasks 3/4) — so a blob still reachable from a fallback
+ * generation must never be collected just because the working manifest dropped it.
+ */
+async function unionLiveIds(): Promise<Set<NodeId>> {
+  const live = liveIds(mani); // working manifest
+  for (const s of ["a", "b"] as const) {
+    const bytes = await readSlot(s);
+    if (!bytes) continue;
+    const parsed = parseManifest(bytes);
+    if (parsed) for (const id of Object.keys(parsed.manifest.inodes)) live.add(id);
+  }
+  return live;
+}
+
 async function acquireLock(name: string): Promise<boolean> {
   return new Promise((resolve) => {
     void navigator.locks.request(`wash-opfs:${name}`, { ifAvailable: true }, (lock) => {
@@ -187,12 +204,21 @@ const ops: Record<string, OpFn> = {
       currentSlot = sel.currentSlot;
       committedBytes = (currentSlot === "a" ? await readSlot("a") : await readSlot("b"))!;
     }
-    await blobs.gc(liveIds(mani)); // open-time GC over the committed (loaded) manifest
+    // At open, working == loaded generation, but both slots still contribute to the
+    // union live set (the other slot may hold a fallback generation) — see unionLiveIds().
+    await blobs.gc(await unionLiveIds());
     return { value: mani.rootId };
   },
 
   async root(): Promise<OpResult> {
     return { value: mani.rootId };
+  },
+
+  /** Normal op, callable any time (not testHooks-gated): reclaims blobs unreachable from
+   *  the working manifest OR either retained on-disk generation. */
+  async gc(): Promise<OpResult> {
+    await blobs.gc(await unionLiveIds());
+    return { value: undefined };
   },
 
   async getattr(id: NodeId): Promise<OpResult> {
