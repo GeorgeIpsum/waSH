@@ -1,37 +1,81 @@
 # @wash/backend-opfs
 
 An [Origin Private File System (OPFS)](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system)
-`WashBackend` for [`@wash/vfs`](../vfs). Implements spec §6 of the waSH design
-doc: real, hierarchical, quota-backed storage with synchronous file I/O via
-`FileSystemSyncAccessHandle`.
+`WashBackend` for [`@wash/vfs`](../vfs) — **the intended default backend for
+the `wash` package** (Plan 6): the terminal mounts OPFS by default and falls
+back to [`@wash/backend-indexeddb`](../backend-indexeddb) only where OPFS or
+sync access handles are unavailable (see "Browser requirements" below).
 
-This is **the intended default backend for the `wash` package** (Plan 6): the
-terminal mounts OPFS by default and falls back to
-[`@wash/backend-indexeddb`](../backend-indexeddb) only where OPFS or sync
-access handles are unavailable (see "Browser support" below).
+Storage model, on-disk layout, and the full crash-consistency argument are
+specified in
+[`docs/superpowers/specs/2026-07-14-opfs-manifest-backend-design.md`](../../docs/superpowers/specs/2026-07-14-opfs-manifest-backend-design.md).
+This README is a summary of that design plus how to run the package's tests.
 
-## Worker architecture
+## Architecture: id-addressed blobs + a two-generation manifest
 
-`FileSystemSyncAccessHandle` — the only fast, synchronous read/write API OPFS
-offers — is spec'd as **worker-only**; it throws on the main thread. So all
-filesystem state lives in a dedicated storage worker (`worker.ts`) owned by
-the backend:
+Earlier iterations of this backend mirrored the OPFS directory tree
+path-for-path, with a hidden per-directory sidecar file carrying mode bits
+and symlink targets. That shape made every multi-entry mutation (an
+overwrite-rename, a directory rename) an attempt to compose atomicity out of
+OPFS's single-entry primitives (`move`/`removeEntry`/`write`) — which cannot
+be done safely (see the spec's §1 for the adversarial-review finding that
+killed that design). This rewrite replaces it with the same shape the
+`@wash/backend-indexeddb` backend already uses, adapted to OPFS's
+synchronous-worker primitives instead of IndexedDB transactions:
 
-- `client.ts` is the main-thread facade. It spins up the worker, and every
-  `WashBackend` method is an RPC call (`rpc.ts`) sent over `postMessage` and
-  resolved when the worker replies.
-- The worker holds the in-memory node table (`id → handle`), a bounded LRU
-  pool of open `FileSystemSyncAccessHandle`s (default 64 — each holds an
-  exclusive lock on its file, so unbounded-open is not an option), and every
-  sidecar it has read.
-- Ops run **strictly sequentially** through a single promise chain in the
-  worker — no op starts until the previous one's result has been posted back.
-  This is what makes multi-step mutations (directory rename's shadow-rename
-  dance, sidecar transport) safe without a separate lock: nothing can observe
-  an intermediate state.
-- `OpfsBackend.close()` tells the worker to flush and drop all pooled
-  handles, then terminates the worker. A worker crash or malformed message
-  rejects every in-flight call instead of hanging the caller forever.
+- **Content lives in id-addressed blobs, never moved.** Each inode's bytes
+  are chunked across `blobs/<inodeId>.<chunkIdx>` files (default chunk size
+  64 KiB, matching `@wash/vfs`'s `CHUNK_SIZE`). A blob is never renamed —
+  content is addressed purely by `(inodeId, chunkIdx)` — so no namespace
+  operation (`rename`, `create`, `unlink`, `chmod`, `mkdir`, `link`,
+  `symlink`) ever touches a blob. This is the same trick SQLite's
+  `opfs-sahpool` VFS uses for OPFS content.
+- **The whole namespace + metadata is one manifest, kept in two generations.**
+  `manifest.a` and `manifest.b` each hold a self-describing generation: a
+  header line (`generation` + a checksum) followed by the JSON body
+  (`rootId`, every inode's attrs, every directory's dirents). A commit writes
+  the next generation **in place** into whichever slot is currently the
+  *older* one, via `truncate(0)` → `write(header+body)` → `flush()` on a sync
+  access handle. The reader loads both slots and picks the one with the
+  highest generation whose checksum validates — so a crash mid-write leaves a
+  torn new slot that simply fails its checksum, and the reader falls back to
+  the other slot's last-good generation. There is no separate head pointer to
+  corrupt, and both generations are kept live so a torn write is *never* fatal
+  as long as the other slot survives. This is LMDB's dual-meta-page /
+  ZFS-uberblock-ring discipline, not an atomic-rename primitive OPFS doesn't
+  provide.
+- **Every namespace op is a pure in-memory manifest edit.** `create`,
+  `mkdir`, `unlink`, `rmdir`, `chmod`, `utimes`, `symlink`, `link`, and
+  `rename` all just mutate the in-memory working manifest (add/remove an
+  inode record, add/remove/reparent a dirent). None of that touches disk
+  until the next `flush()` — see the caps table below for what this buys.
+- **The worker is fully synchronous — no `createWritable`.** All storage I/O
+  (blob chunks and manifest slots alike) goes through
+  `FileSystemSyncAccessHandle`, which is fast but worker-only (it throws on
+  the main thread), so the entire storage engine lives in a dedicated worker
+  (`worker.ts`) that the main-thread `OpfsBackend` (`client.ts`) talks to over
+  RPC (`rpc.ts`). Ops run strictly sequentially through one promise chain in
+  the worker, so a multi-step commit is never observed half-done by another
+  op. Nothing in this backend uses the async `createWritable()` API or its
+  weaker "best effort, no partial writes" durability wording.
+- **Single-writer, enforced by a Web Lock.** `OpfsBackend.open()` acquires
+  `navigator.locks.request("wash-opfs:<rootDirName>", { ifAvailable: true })`
+  and holds it for the backend's lifetime, releasing it in `close()`. A
+  second `open()` on the same root rejects with `EBUSY` immediately, rather
+  than letting two writers each commit from a stale generation and silently
+  clobber each other's work (and GC the loser's still-referenced blobs).
+
+### GC
+
+A blob is only ever deleted once it is unreachable from every manifest that
+could still be read — that's the union of both on-disk generations' inode
+ids **and** the in-memory working manifest's ids (which may include inodes
+created but not yet flushed). Using only the newest generation would be
+unsafe: if that generation ever corrupts and the backend falls back to the
+older one, the older generation could reference a blob GC already deleted
+because the newer one had dropped it. GC runs at `open()` (against whatever
+was just loaded) and opportunistically in-session; it is never a correctness
+dependency for existing data, only a reclaiming of provably-dead bytes.
 
 ## Usage
 
@@ -46,7 +90,7 @@ cached.warm(await be.dump()); // bulk-load metadata before the first op
 const vfs = new Vfs();
 await vfs.mount("/", cached);
 await vfs.writeFile("/hello.txt", "hi");
-await vfs.fsync(); // durability point: flushes dirty sync-access handles
+await vfs.fsync(); // durability point: flushes dirty blobs, then commits a manifest generation
 await be.close();
 ```
 
@@ -54,68 +98,54 @@ As with the IndexedDB backend, always wrap `OpfsBackend` in `CachedBackend`
 for real workloads — the raw backend satisfies `WashBackend` and passes
 conformance on its own, but every op is a worker round trip.
 
-## Caps (honest limitations)
+## Caps
+
+```ts
+{ symlinks: "supported", hardlinks: true, atomicDirRename: true, renameCost: "O1", reservedNames: [] }
+```
+
+Identical to `@wash/backend-indexeddb`'s caps — a direct consequence of the
+manifest model:
 
 | Cap | Value | Why |
 |---|---|---|
-| `symlinks` | `"supported"` | Emulated — see sidecar, below. |
-| `hardlinks` | `false` | OPFS has no link count; not modeled. |
-| `atomicDirRename` | `false` | See `renameCost`. |
-| `renameCost` | `"subtree"` | OPFS's native `move()` is file-only. Renaming a directory recreates the destination subtree and walks every descendant, rebinding each existing `NodeId` to its new handle (ids stay stable) — **not atomic**: a failure partway through can leave the source and destination each holding part of the tree. Compare `@wash/backend-indexeddb`, where directory rename is O(1). |
-| `reservedNames` | `[".wash-attrs"]` | See sidecar, below. |
+| `symlinks` | `"supported"` | A symlink is an inode record with a `target` string field; no path emulation needed. |
+| `hardlinks` | `true` | Dirents and inodes are separate manifest maps, so a second dirent pointing at one inode id (and bumping its `nlink`) is a normal edit — no link-count tracking to bolt on. |
+| `atomicDirRename` | `true` | Directory rename re-parents exactly one dirent; the subtree's inodes and dirents are keyed by id, not by path, so nothing under the renamed directory changes. |
+| `renameCost` | `"O1"` | Same reasoning as above — the operation's cost does not scale with the size of the renamed subtree. This describes the *operation's* scaling, not the durable-commit cost (see below). |
+| `reservedNames` | `[]` | The manifest and `blobs/` live in an OPFS structure the VFS namespace never addresses by path (unlike the old sidecar model's `.wash-attrs`), so there is no user-facing name to reserve. |
 
-**The sidecar.** OPFS has no inode table, no mode bits, and no native
-symlinks. Each directory may hold a hidden `.wash-attrs` JSON file (name →
-`{ mode, symlink }`, deviations-from-default only) that supplies file mode
-and emulated symlink targets. It lives *inside* the directory it describes,
-so it transports for free on a directory rename (the integration test's
-`chmod` + subtree-rename case in `test/browser/integration.test.ts` pins
-this down). `.wash-attrs` is declared in `caps.reservedNames`: the backend
-hides it from `readdir`/`lookup` and rejects user `create`/`unlink`/`rename`
-targeting that name with `EPERM` (precedent: `.git`).
+## The honest scaling note
 
-**`.wash-shadow-*` is crash residue, not a reserved name.** A directory
-rename that displaces an existing entry moves the displaced entry aside to a
-throwaway `.wash-shadow-<ulid>` name first (see `worker.ts`'s shadow-rename
-comment), only discarding it once the primary move has confirmed success.
-Ops run strictly sequentially through one in-worker chain, so no reader ever
-observes this name mid-op — but if the *worker itself* dies mid-rename (tab
-closed, OOM-killed, browser crash), a `.wash-shadow-*` entry can be left
-behind on disk. Unlike `.wash-attrs`, this prefix is **not** in
-`caps.reservedNames`: it is deliberately left as ordinary, visible,
-`readdir`-able garbage rather than hidden magic, so a user (or `wash rm`) can
-find and remove it like any other file. `open()` does not scan for or
-auto-clean these on mount; recovering from a mid-rename crash is a manual
-step for now.
+`renameCost: "O1"` describes the *operation* — renaming a directory does no
+per-descendant work. It does **not** describe the cost of making that
+rename (or any other mutation) durable. **Every committed flush batch writes
+a whole manifest generation** — `flush()` serializes the entire in-memory
+namespace and metadata and writes it into a slot — so **durable commit is
+O(manifest size), not O(the batch's mutations)**, amortized across every op
+`CachedBackend` folded into that batch. Building a large tree (many files) in
+one write-back batch pays this once per batch, which is cheap; forcing a
+`flush()`/`fsync()` per mutation on a filesystem with tens of thousands of
+entries would pay a full manifest rewrite every time, which is not.
 
-**File mtime tracks `File.lastModified`, free.** A file's mtime is
-`File.lastModified` unless something in the *current* worker session says
-otherwise: an in-session `write`/`truncate` or an explicit
-`setattr(mtimeMs)`/utimes stamps the node's in-memory mtime, which then wins
-over `File.lastModified` until the node is dropped from memory. Critically,
-merely *discovering* a file (on first lookup/readdir, or on reopen after a
-close) does **not** stamp an mtime — a freshly-discovered file's mtime falls
-straight through to `File.lastModified`, so mtimes for untouched files are
-accurate across a close/reopen. The sidecar does not persist mtime, so an
-explicit `setattr(mtimeMs)`/utimes call is session-scoped: after a
-close/reopen it is gone and mtime again tracks `File.lastModified`. Directory
-and symlink mtimes are always session-scoped (stamped at creation/discovery
-time; there is no `File.lastModified` equivalent for them to fall back to).
+This is a real, unavoidable cost of the "one atomically-swapped object"
+design (§1 of the spec), not a bug. The plan tracks two follow-ups neither of
+which has landed in this package yet:
 
-**Symlink targets are POSIX-honest, not validated.** `readlink` returns
-whatever path string was passed to `symlink()`, even across a rename of an
-ancestor directory that would make the target unreachable — matching real
-POSIX symlink semantics (a symlink stores a path, not a resolved reference).
-The integration test's `/project/main → /project/src/index.ts` case (target
-left stale after `/project/src` is renamed to `/project/lib`) pins this down.
+- A benched **size-guard threshold** (`apps/bench`'s manifest-scaling curve,
+  spec §7/§10) above which the backend should emit a one-time warning so the
+  cliff is observable instead of silent. Not yet implemented.
+- A **log+checkpoint manifest** (append small deltas between periodic full
+  rewrites) as the scaling lever if the threshold above is ever hit in
+  practice. Explicitly out of scope for this rewrite (spec §11).
 
-## Browser support
+## Browser requirements
 
 The binding constraint is `FileSystemSyncAccessHandle` (specifically
-`createSyncAccessHandle`), since the backend is unusable without it. Verified
-directly against MDN's browser-compat-data source
-(`api/FileSystemSyncAccessHandle.json`, `mdn/browser-compat-data` on GitHub)
-on 2026-07-13:
+`createSyncAccessHandle`) — the backend is unusable without it, since it's
+OPFS's only fast synchronous I/O path and this design has no
+`createWritable` fallback. Per MDN's browser-compat-data
+(`api/FileSystemSyncAccessHandle.json`, `mdn/browser-compat-data` on GitHub):
 
 | Engine | Minimum version |
 |---|---|
@@ -123,23 +153,18 @@ on 2026-07-13:
 | Firefox | 111+ |
 | Safari | 15.2+ |
 
-OPFS root access itself (`navigator.storage.getDirectory`,
-`FileSystemDirectoryHandle`) has been available since Chrome 86, but that's
-moot here — sync access handles are the actual floor. Not independently
-verified in this pass: mobile-browser parity (Chrome Android/Firefox
-Android/Safari iOS mirror their desktop versions per the same BCD data, but
-that wasn't re-checked against a device), and any Safari-specific
-correctness quirks beyond the documented cap table (tracked as a Plan 3
-deferred item, not covered by this package's test suite, which runs against
-Chromium only).
-
-Below this floor (or on a browser without OPFS at all), `wash` falls back to
+The compat data lists Chrome Android at 109+ and reports Firefox
+Android/Safari iOS as mirroring their desktop versions above — not verified
+against a physical device in this pass. OPFS root access itself
+(`navigator.storage.getDirectory`) has shipped since Chrome 86, but that's
+moot here since sync access handles are the actual floor. Below this floor,
+or on a browser without OPFS at all, `wash` falls back to
 `@wash/backend-indexeddb` per the Plan 6 default-backend selection.
 
 ## Testing
 
 ```
-pnpm --filter @wash/backend-opfs test          # Node: pure modules only (lru, sidecar codec)
+pnpm --filter @wash/backend-opfs test          # Node: pure modules only (manifest codec, lru)
 pnpm --filter @wash/backend-opfs test:browser  # real OPFS in Chromium via @vitest/browser + Playwright
 ```
 
@@ -149,12 +174,27 @@ pnpm --filter @wash/backend-opfs test:browser  # real OPFS in Chromium via @vite
 pnpm exec playwright install chromium
 ```
 
-The Node suite (`test/node/**`) covers only backend-internal pure modules
-(`Lru`, the sidecar codec) that don't touch OPFS — there is no OPFS
+The Node suite (`test/node/**`) covers only the backend-internal pure
+modules that don't touch OPFS — `manifest.ts`'s serialize/parse/checksum and
+highest-valid-generation selection logic, and the LRU pool. There is no OPFS
 implementation available under Node, so everything that touches the
-filesystem (namespace, content, rename, symlinks, warm/dump, the end-to-end
-`Vfs` integration test) lives under `test/browser/**` and runs against a
-real Chromium OPFS implementation. Shared `@wash/vfs` conformance runs
-against both the raw backend and `CachedBackend(OpfsBackend, { flushDelayMs: 1 })`,
-with symlink and reserved-name cases exercised (first backend to hit the
-reserved-names cap) and hardlink cases skipped (`caps.hardlinks === false`).
+filesystem (namespace ops, content, rename, symlinks, hardlinks,
+warm/dump, durability/GC fault injection, and the end-to-end `Vfs`
+integration test) lives under `test/browser/**` and runs against a real
+Chromium OPFS implementation.
+
+Shared `@wash/vfs` conformance runs against both the raw backend and
+`CachedBackend(OpfsBackend, { flushDelayMs: 1 })`. Because this backend's
+caps now match `@wash/backend-indexeddb`'s, the **hardlink** and
+**same-inode-rename** conformance cases run (rather than skip), and the
+**reserved-names** case skips (`reservedNames: []` — there is nothing left to
+reserve now that the sidecar is gone).
+
+`test/browser/integration.test.ts` is the end-to-end proof: build a tree,
+write and append content, `chmod`, hardlink (`vfs.link`), symlink, rename a
+non-empty directory (O(1), atomic), `fsync`, close, then reopen a second
+`OpfsBackend` against the same root and warm a fresh `CachedBackend` from
+`await be.dump()` — confirming content, mode, hardlink `nlink`, and the
+symlink's target (served by the backend directly; `readlink` is never
+warmed into the cache) all survive the round trip. A second test confirms
+`EXDEV` when renaming across a memory-backed mount and an OPFS-backed mount.
