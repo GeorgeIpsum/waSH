@@ -211,6 +211,66 @@ const ops: Record<string, OpFn> = {
     releaseLock = null;
     return { value: undefined };
   },
+
+  async lookup(parent: NodeId, name: string): Promise<OpResult> {
+    requireDir(parent);
+    const e = children(parent)[name];
+    if (!e) return { value: null };
+    return { value: { id: e.id, attrs: attrsOf(inode(e.id)) } };
+  },
+
+  async readdir(id: NodeId): Promise<OpResult> {
+    requireDir(id);
+    const out = Object.entries(children(id)).map(([name, e]) => ({ name, childId: e.id, kind: e.kind }));
+    return { value: out };
+  },
+
+  async create(parent: NodeId, name: string, id: NodeId, kind: NodeKind, attrs?: Partial<Attrs>): Promise<OpResult> {
+    const p = requireDir(parent);
+    const dir = children(parent);
+    if (dir[name]) throw new VfsError("EEXIST", name);
+    const now = Date.now();
+    mani.inodes[id] = {
+      kind, size: 0, mode: attrs?.mode !== undefined ? attrs.mode & 0o777 : defaultMode(kind),
+      mtimeMs: attrs?.mtimeMs ?? now, ctimeMs: attrs?.ctimeMs ?? now, nlink: 1,
+    };
+    if (kind === "dir") mani.dirents[id] = {};
+    dir[name] = { id, kind };
+    p.mtimeMs = now;
+    dirty = true;
+    return { value: undefined };
+  },
+
+  async unlink(parent: NodeId, name: string): Promise<OpResult> {
+    const p = requireDir(parent);
+    const dir = children(parent);
+    const e = dir[name];
+    if (!e) throw new VfsError("ENOENT", name);
+    const child = inode(e.id);
+    if (child.kind === "dir") {
+      if (Object.keys(children(e.id)).length > 0) throw new VfsError("ENOTEMPTY", name);
+      delete mani.dirents[e.id];
+      delete mani.inodes[e.id];
+    } else {
+      child.nlink -= 1;
+      if (child.nlink <= 0) {
+        delete mani.inodes[e.id]; // blob chunks reclaimed by GC (Task 6); NEVER deleted in-op
+      }
+    }
+    delete dir[name];
+    p.mtimeMs = Date.now();
+    dirty = true;
+    return { value: undefined };
+  },
+
+  async setattr(id: NodeId, attrs: Partial<Pick<Attrs, "mode" | "mtimeMs" | "ctimeMs">>): Promise<OpResult> {
+    const rec = inode(id);
+    if (attrs.mode !== undefined) rec.mode = attrs.mode & 0o777;
+    if (attrs.mtimeMs !== undefined) rec.mtimeMs = attrs.mtimeMs;
+    if (attrs.ctimeMs !== undefined) rec.ctimeMs = attrs.ctimeMs;
+    dirty = true;
+    return { value: undefined };
+  },
 };
 
 function ensure(op: string): OpFn {
