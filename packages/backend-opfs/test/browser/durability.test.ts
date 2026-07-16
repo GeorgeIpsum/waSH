@@ -41,6 +41,8 @@ describe("OpfsBackend durability + GC", () => {
     const c = fault(be);
     await c("__injectFault", ["blobFlush", 0, 1]); // blob flush during commit fails
     await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" });
+    // whole-batch rollback: the uncommitted file is dropped from the working manifest
+    expect(await be.lookup(root, "f")).toBeNull();
     await be.flush(); // fault consumed (times:1) → clean commit succeeds
     await be.close();
   });
@@ -55,6 +57,8 @@ describe("OpfsBackend durability + GC", () => {
     await be.flush();            // gen 1 → slot a; references x
     await be.unlink(root, "x");  // working manifest drops x (deferred delete: blob NOT removed)
     await be.flush();            // gen 2 → slot b; does NOT reference x. But gen 1 (slot a) is retained.
+    // x is gone from the working namespace, yet its blob must survive (referenced by retained gen 1)
+    expect(await be.lookup(root, "x")).toBeNull();
     await fault(be)("gc", []);   // GC must keep x's blob: gen 1 (fallback) still references it
     // x's blob is still on disk (reachable from the retained gen 1)
     const origin = await navigator.storage.getDirectory();
