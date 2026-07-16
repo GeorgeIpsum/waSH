@@ -4,8 +4,6 @@ import type {
 import { VfsError } from "@wash/vfs";
 import type { RpcRequest, RpcResponse } from "./rpc.js";
 
-export const SIDECAR_NAME = ".wash-attrs";
-
 export interface OpfsBackendOptions {
   handlePoolSize?: number;
   /** Test-only: registers the `__injectFault` op in the worker. Never set this in production. */
@@ -15,10 +13,10 @@ export interface OpfsBackendOptions {
 export class OpfsBackend implements WashBackend {
   readonly caps: BackendCaps = {
     symlinks: "supported",
-    hardlinks: false,
-    atomicDirRename: false,
-    renameCost: "subtree",
-    reservedNames: [SIDECAR_NAME],
+    hardlinks: true,
+    atomicDirRename: true,
+    renameCost: "O1",
+    reservedNames: [],
   };
 
   private nextId = 1;
