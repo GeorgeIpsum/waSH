@@ -387,6 +387,17 @@ const ops: Record<string, OpFn> = {
     dirty = true;
     return { value: undefined };
   },
+
+  async dump(): Promise<OpResult> {
+    const inodes = Object.entries(mani.inodes).map(([id, rec]) => ({ id, attrs: attrsOf(rec) }));
+    const dirents: { parentId: NodeId; name: string; childId: NodeId; kind: NodeKind }[] = [];
+    for (const [parentId, entries] of Object.entries(mani.dirents)) {
+      for (const [name, e] of Object.entries(entries)) {
+        dirents.push({ parentId, name, childId: e.id, kind: e.kind });
+      }
+    }
+    return { value: { inodes, dirents } };
+  },
 };
 
 function ensure(op: string): OpFn {
