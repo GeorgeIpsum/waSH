@@ -92,8 +92,13 @@ export class BlobStore {
     const lastKeep = size === 0 ? -1 : Math.floor((size - 1) / this.chunkSize);
     const prevLast = prevSize === 0 ? -1 : Math.floor((prevSize - 1) / this.chunkSize);
     for (let idx = lastKeep + 1; idx <= prevLast; idx++) {
-      this.pool.delete(this.key(id, idx), true);
-      await this.blobDir.removeEntry(this.key(id, idx)).catch(() => {});
+      const key = this.key(id, idx);
+      // Discarded tail chunk: close without flushing (its bytes are being deleted anyway —
+      // flushing first could raise a false-positive ENOSPC for data we're about to discard).
+      const h = this.pool.peek(key);
+      if (h) { try { h.close(); } catch { /* already closed */ } }
+      this.pool.delete(key, false);
+      await this.blobDir.removeEntry(key).catch(() => {});
     }
     if (lastKeep >= 0) {
       const keep = size - lastKeep * this.chunkSize;

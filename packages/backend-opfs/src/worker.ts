@@ -271,6 +271,34 @@ const ops: Record<string, OpFn> = {
     dirty = true;
     return { value: undefined };
   },
+
+  async read(id: NodeId, offset: number, length: number): Promise<OpResult> {
+    const rec = requireFile(id);
+    return { value: await blobs.read(id, offset, length, rec.size) };
+  },
+
+  async write(id: NodeId, offset: number, data: Uint8Array | ArrayBuffer): Promise<OpResult> {
+    const rec = requireFile(id);
+    // The client transfers `data` as an ArrayBuffer (see client.ts write()), not a Uint8Array.
+    // BlobStore.write calls .subarray(...) on it, which ArrayBuffer lacks — wrap first.
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data as ArrayBuffer);
+    if (bytes.byteLength === 0) return { value: undefined }; // POSIX no-op
+    await blobs.write(id, offset, bytes); // fallible; on throw the manifest is untouched below
+    const end = offset + bytes.byteLength;
+    if (end > rec.size) rec.size = end;
+    rec.mtimeMs = Date.now();
+    dirty = true;
+    return { value: undefined };
+  },
+
+  async truncate(id: NodeId, size: number): Promise<OpResult> {
+    const rec = requireFile(id);
+    await blobs.truncate(id, size, rec.size);
+    rec.size = size;
+    rec.mtimeMs = Date.now();
+    dirty = true;
+    return { value: undefined };
+  },
 };
 
 function ensure(op: string): OpFn {
