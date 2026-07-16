@@ -261,7 +261,7 @@ git commit -m "feat(backend-opfs): manifest pure core (serialize/parse/checksum/
 - Produces (worker-internal, used by Tasks 3–6):
   - Module state: `let mani: Manifest`, `let generation: number`, `let currentSlot: "a"|"b"`, `let dirty: boolean`, `let committedBytes: Uint8Array`, `let rootDir: FileSystemDirectoryHandle`, `let blobs: BlobStore` (holds the handle pool internally), `let releaseLock: (() => void) | null`. (Eviction-flush errors are tracked inside `BlobStore` and surfaced by `flushAll()`, not a worker-level array.)
   - Helpers: `inode(id): InodeRecord` (ENOENT), `requireDir(id)`, `requireFile(id)` (returns the inode, throws EISDIR/ENOENT), `children(id): Record<string,{id,kind}>` (the dirents map for a dir, creating `{}` if absent), `defaultMode(kind)`, `touchDir()` marks `dirty=true`, `commit(): Promise<void>` (the ordered fail-closed flush), `errnoFromDom`/`maybeFault` (kept), `chunkKey(id,idx)`.
-  - Blob store (`blobs.ts`): `class BlobStore` with `read(id, offset, length, size): Promise<Uint8Array>`, `write(id, offset, data): Promise<void>`, `truncate(id, size, prevSize): Promise<void>`, `deleteInode(id, size): Promise<void>`, `flushAll(): VfsError | null`, `closeAll(): void`, `gc(liveIds: Set<string>): Promise<void>`.
+  - Blob store (`blobs.ts`): `class BlobStore` with `read(id, offset, length, size): Promise<Uint8Array>`, `write(id, offset, data): Promise<void>`, `truncate(id, size, prevSize): Promise<void>`, `flushAll(): VfsError | null`, `closeAll(): void`, `gc(liveIds: Set<string>): Promise<void>`. (No per-inode delete: unlink/rename never remove blobs in-op; whole-inode reclamation is GC's job — see Task 6. `truncate` trims its own tail chunks because a live file's excess chunks are never GC-eligible.)
 
 - [ ] **Step 1: Write the failing shell tests (rewrite `shell.test.ts`)**
 
@@ -438,14 +438,6 @@ export class BlobStore {
       const keep = size - lastKeep * this.chunkSize;
       const h = await this.handle(id, lastKeep, false);
       if (h && h.getSize() > keep) h.truncate(keep);
-    }
-  }
-
-  async deleteInode(id: string, size: number): Promise<void> {
-    const last = size === 0 ? -1 : Math.floor((size - 1) / this.chunkSize);
-    for (let idx = 0; idx <= last; idx++) {
-      this.pool.delete(this.key(id, idx), true);
-      await this.blobDir.removeEntry(this.key(id, idx)).catch(() => {});
     }
   }
 
@@ -874,9 +866,7 @@ Expected: FAIL — ops missing (ENOSYS from `lookup`/`create`/etc.).
     } else {
       child.nlink -= 1;
       if (child.nlink <= 0) {
-        const size = child.size;
-        delete mani.inodes[e.id];
-        await blobs.deleteInode(e.id, size); // post-commit-ish blob cleanup; GC also covers it
+        delete mani.inodes[e.id]; // blob chunks reclaimed by GC (Task 6); NEVER deleted in-op
       }
     }
     delete dir[name];
@@ -1117,9 +1107,7 @@ Expected: FAIL — `symlink`/`readlink`/`link`/`rename` ENOSYS.
         if (mv.kind === "dir") throw new VfsError("ENOTDIR", toName);
         ex.nlink -= 1;
         if (ex.nlink <= 0) {
-          const size = ex.size;
-          delete mani.inodes[displaced.id];
-          await blobs.deleteInode(displaced.id, size);
+          delete mani.inodes[displaced.id]; // blobs reclaimed by GC (Task 6); NEVER deleted in-op
         }
       }
     }
@@ -1368,14 +1356,14 @@ describe("OpfsBackend durability + GC", () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify RED / discover the unlink-eager-delete gap**
+- [ ] **Step 2: Run to verify RED**
 
 Run: `pnpm turbo build --filter @wash/backend-opfs && pnpm --filter @wash/backend-opfs test:browser durability`
-Expected: the first two tests FAIL until wired; the third exposes that `unlink`/`rename` delete blobs EAGERLY (in-op), which destroys data that a fallback generation still references. This is the design's union-GC requirement (spec §3.3): **blob deletion must be deferred to GC, not done in-op.**
+Expected: the torn-slot and blob-flush tests FAIL until the commit path is exercised; the union-GC test FAILS because the `gc` op does not exist yet (`ENOSYS`) and open-time GC is still single-generation. (The design already defers blob deletion — Tasks 3/4 never delete in-op — so this task ADDS GC rather than fixing an eager-delete bug.)
 
-- [ ] **Step 3: Implement the deferred-blob-delete + union-GC fix**
+- [ ] **Step 3: Add union GC + the `gc` op + union-aware open-time GC**
 
-In worker.ts, **remove the eager `await blobs.deleteInode(...)` calls from `unlink` and `rename`** (Tasks 3 and 4). An unlinked inode simply leaves the manifest; its blobs are reclaimed by GC once no retained generation references the id. Add:
+Blob reclamation is entirely GC's job (unlink/rename only drop the inode from the manifest, per Tasks 3/4). GC's live set is the UNION of the working manifest and BOTH retained on-disk generations, so a blob still reachable from a fallback generation is never collected (spec §3.3). Add to worker.ts:
 
 ```ts
 async function unionLiveIds(): Promise<Set<NodeId>> {
@@ -1389,21 +1377,21 @@ async function unionLiveIds(): Promise<Set<NodeId>> {
   return live;
 }
 ```
-Change the `open`-time GC and add a test/maintenance op:
+Add the `gc` op (a normal op — callable any time, e.g. for maintenance and the union-GC test):
 ```ts
   async gc(): Promise<OpResult> {
     await blobs.gc(await unionLiveIds());
     return { value: undefined };
   },
 ```
-And in `open`, replace `await blobs.gc(liveIds(mani));` with `await blobs.gc(await unionLiveIds());` (at open, working == loaded generation; both slots contribute; correct union).
+And in `open` (Task 2), replace `await blobs.gc(liveIds(mani));` with `await blobs.gc(await unionLiveIds());` (at open, working == loaded generation, and both slots contribute — the correct union).
 
-Now the third durability test passes: after the torn gen-2 write, gen 1 (referencing `x`) is retained, `x`'s blob was NOT eagerly deleted (unlink no longer deletes), and reopen restores gen 1 with `x` intact. The first two tests pass once the commit path is exercised. If the third test's comment path (eager delete) was the only failure, this removal is the whole fix.
+Now the union-GC test passes: after committing the unlink into gen 2, gen 1 (slot a) still references `x`, `unionLiveIds()` includes `x`, and `blobs.gc` keeps its chunk. The torn-slot and blob-flush tests pass once the commit path (Task 2's `commit`) is correctly wired.
 
 - [ ] **Step 4: Run to verify GREEN**
 
 Run: `pnpm turbo build --filter @wash/backend-opfs && pnpm --filter @wash/backend-opfs test:browser durability content namespace links rename shell`
-Expected: PASS across all rewritten browser suites (deferred-delete must not regress unlink/rename semantics — content still reads correctly because GC only reaps ids absent from the union).
+Expected: PASS across all rewritten browser suites (GC must not regress content — it only reaps ids absent from the union live set).
 
 - [ ] **Step 5: Add the both-slots-corrupt → EIO test and confirm no-GC**
 
