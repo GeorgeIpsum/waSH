@@ -73,9 +73,11 @@ ids **and** the in-memory working manifest's ids (which may include inodes
 created but not yet flushed). Using only the newest generation would be
 unsafe: if that generation ever corrupts and the backend falls back to the
 older one, the older generation could reference a blob GC already deleted
-because the newer one had dropped it. GC runs at `open()` (against whatever
-was just loaded) and opportunistically in-session; it is never a correctness
-dependency for existing data, only a reclaiming of provably-dead bytes.
+because the newer one had dropped it. Garbage collection runs at `open()`
+(scanning `blobs/` against the union of the working manifest and both retained
+on-disk generations); an internal `gc` op is available for maintenance, but GC
+is not triggered automatically mid-session, so within a long-lived session
+orphaned chunks accumulate until the next `open()`.
 
 ## Usage
 
@@ -109,7 +111,7 @@ manifest model:
 
 | Cap | Value | Why |
 |---|---|---|
-| `symlinks` | `"supported"` | A symlink is an inode record with a `target` string field; no path emulation needed. |
+| `symlinks` | `"supported"` | A symlink is an inode record with a `target` string field; the backend stores the target verbatim without validation or resolution (dangling and absolute targets are preserved as-is; resolution is the VFS's job). |
 | `hardlinks` | `true` | Dirents and inodes are separate manifest maps, so a second dirent pointing at one inode id (and bumping its `nlink`) is a normal edit — no link-count tracking to bolt on. |
 | `atomicDirRename` | `true` | Directory rename re-parents exactly one dirent; the subtree's inodes and dirents are keyed by id, not by path, so nothing under the renamed directory changes. |
 | `renameCost` | `"O1"` | Same reasoning as above — the operation's cost does not scale with the size of the renamed subtree. This describes the *operation's* scaling, not the durable-commit cost (see below). |
