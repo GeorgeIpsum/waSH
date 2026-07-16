@@ -9,7 +9,7 @@ afterEach(async () => {
   for (const n of roots.splice(0)) await o.removeEntry(n, { recursive: true }).catch(() => {});
 });
 
-async function fileFixture(chunkless = false) {
+async function fileFixture() {
   const be = await OpfsBackend.open(testRoot(), { handlePoolSize: 4 });
   const root = await be.root();
   const f = ulid();
@@ -70,6 +70,43 @@ describe("OpfsBackend content", () => {
       ids.push(f);
     }
     for (let i = 0; i < 5; i++) expect(dec.decode(await be.read(ids[i]!, 0, 100))).toBe(`content-${i}`);
+    await be.close();
+  });
+
+  it("spans multiple chunks: write, boundary read, cross-boundary truncate, sparse extend", async () => {
+    const be = await OpfsBackend.open(testRoot(), { handlePoolSize: 8 });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "big", f, "file");
+    const N = 70000; // > 65536 → spans chunk 0 [0..65535] and chunk 1 [65536..69999]
+    const payload = new Uint8Array(N);
+    for (let i = 0; i < N; i++) payload[i] = i % 251;
+    await be.write(f, 0, payload);
+    expect((await be.getattr(f)).size).toBe(N);
+
+    // full read round-trips every byte across the chunk boundary
+    const full = await be.read(f, 0, N);
+    expect(full.byteLength).toBe(N);
+    expect([...full]).toEqual([...payload]);
+
+    // a read straddling the 65536 boundary reassembles correctly
+    const straddle = await be.read(f, 65530, 12); // bytes 65530..65541
+    expect([...straddle]).toEqual([...payload.subarray(65530, 65542)]);
+
+    // truncate back across the boundary: drops chunk 1 entirely, truncates chunk 0
+    await be.truncate(f, 5000);
+    expect((await be.getattr(f)).size).toBe(5000);
+    const shrunk = await be.read(f, 0, 100000);
+    expect(shrunk.byteLength).toBe(5000);
+    expect([...shrunk]).toEqual([...payload.subarray(0, 5000)]);
+
+    // sparse-extend back past the boundary: the gap (and re-entered chunk 1) reads as zeros
+    await be.truncate(f, 66000);
+    const extended = await be.read(f, 0, 66000);
+    expect(extended.byteLength).toBe(66000);
+    expect([...extended.subarray(0, 5000)]).toEqual([...payload.subarray(0, 5000)]);
+    expect([...extended.subarray(5000, 66000)]).toEqual(new Array(61000).fill(0));
+
     await be.close();
   });
 });
