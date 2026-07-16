@@ -37,7 +37,18 @@ export class OpfsBackend implements WashBackend {
   static async open(rootDirName: string, opts: OpfsBackendOptions = {}): Promise<OpfsBackend> {
     const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
     const be = new OpfsBackend(worker);
-    be.rootId = (await be.call("open", [rootDirName, opts.handlePoolSize ?? 64, opts.testHooks ?? false])) as NodeId;
+    try {
+      be.rootId = (await be.call("open", [rootDirName, opts.handlePoolSize ?? 64, opts.testHooks ?? false])) as NodeId;
+    } catch (e) {
+      // open() can reject: EBUSY (single-writer lock held elsewhere), EIO (both
+      // manifest slots corrupt), etc. Terminate the worker so it does not leak —
+      // and, on any rejection AFTER the worker acquired the per-root Web Lock,
+      // so that lock is released (a leaked worker would hold it, wedging future
+      // opens with a spurious EBUSY until GC).
+      be.closed = true;
+      worker.terminate();
+      throw e;
+    }
     return be;
   }
 
@@ -69,10 +80,10 @@ export class OpfsBackend implements WashBackend {
     try {
       await this.call("close", []);
     } finally {
-      // The worker is torn down and pending calls are failed EVEN when the close RPC
-      // itself rejects (e.g. it surfaced a final poisoned flush failure) — close is
-      // often the last durability checkpoint a caller sees, so that rejection must
-      // propagate to the caller rather than being masked by cleanup.
+      // Tear down the worker and fail any pending calls. The worker's close op is
+      // best-effort: it swallows a final commit() failure and does NOT reject for
+      // durability reasons, so flush()/fsync() — not close() — is the durability
+      // checkpoint a caller should rely on.
       this.closed = true;
       this.worker.terminate();
       this.failAllPending(new VfsError("EBADF", "backend closed"));
