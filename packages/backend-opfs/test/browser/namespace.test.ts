@@ -27,7 +27,7 @@ describe("OpfsBackend namespace", () => {
     await be.close();
   });
 
-  it("readdir lists children sorted-insensitively; persists across reopen", async () => {
+  it("readdir lists all children regardless of insertion order; persists across reopen", async () => {
     const name = testRoot();
     const be = await OpfsBackend.open(name);
     const root = await be.root();
@@ -58,6 +58,49 @@ describe("OpfsBackend namespace", () => {
     const a = await be.getattr(g);
     expect(a.mode).toBe(0o700);
     expect(a.mtimeMs).toBe(999);
+    await be.close();
+  });
+
+  it("masks mode to 0o777 and applies default modes when attrs omitted", async () => {
+    const be = await OpfsBackend.open(testRoot());
+    const root = await be.root();
+    // high bits above 0o777 are stripped
+    const hb = ulid();
+    await be.create(root, "hb", hb, "file", { mode: 0o100700 });
+    expect((await be.getattr(hb)).mode).toBe(0o700);
+    // defaults when no attrs provided: dir 0o755, file 0o644, symlink handled elsewhere
+    const dd = ulid();
+    await be.create(root, "dd", dd, "dir");
+    expect((await be.getattr(dd)).mode).toBe(0o755);
+    const df = ulid();
+    await be.create(root, "df", df, "file");
+    expect((await be.getattr(df)).mode).toBe(0o644);
+    await be.close();
+  });
+
+  it("setattr updates only the provided fields and masks mode", async () => {
+    const be = await OpfsBackend.open(testRoot());
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    const start = await be.getattr(f);
+    // mode-only: mtime/ctime unchanged, high bits masked
+    await be.setattr(f, { mode: 0o102750 });
+    let a = await be.getattr(f);
+    expect(a.mode).toBe(0o750);
+    expect(a.mtimeMs).toBe(start.mtimeMs);
+    expect(a.ctimeMs).toBe(start.ctimeMs);
+    // mtime-only: mode unchanged
+    await be.setattr(f, { mtimeMs: 555 });
+    a = await be.getattr(f);
+    expect(a.mtimeMs).toBe(555);
+    expect(a.mode).toBe(0o750);
+    // ctime-only: mtime + mode unchanged
+    await be.setattr(f, { ctimeMs: 777 });
+    a = await be.getattr(f);
+    expect(a.ctimeMs).toBe(777);
+    expect(a.mtimeMs).toBe(555);
+    expect(a.mode).toBe(0o750);
     await be.close();
   });
 });
