@@ -133,6 +133,10 @@ export class OpfsBackend implements WashBackend {
     return (await this.call("readlink", [id])) as string;
   }
 
+  async link(parent: NodeId, name: string, id: NodeId): Promise<void> {
+    await this.call("link", [parent, name, id]);
+  }
+
   async dump(): Promise<BackendDump> {
     return (await this.call("dump", [])) as BackendDump;
   }

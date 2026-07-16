@@ -299,6 +299,68 @@ const ops: Record<string, OpFn> = {
     dirty = true;
     return { value: undefined };
   },
+
+  async symlink(parent: NodeId, name: string, id: NodeId, target: string): Promise<OpResult> {
+    const p = requireDir(parent);
+    if (children(parent)[name]) throw new VfsError("EEXIST", name);
+    const now = Date.now();
+    mani.inodes[id] = { kind: "symlink", size: target.length, mode: 0o777, mtimeMs: now, ctimeMs: now, nlink: 1, target };
+    children(parent)[name] = { id, kind: "symlink" };
+    p.mtimeMs = now;
+    dirty = true;
+    return { value: undefined };
+  },
+
+  async readlink(id: NodeId): Promise<OpResult> {
+    const rec = inode(id);
+    if (rec.kind !== "symlink" || rec.target === undefined) throw new VfsError("EINVAL");
+    return { value: rec.target };
+  },
+
+  async link(parent: NodeId, name: string, id: NodeId): Promise<OpResult> {
+    const p = requireDir(parent);
+    if (children(parent)[name]) throw new VfsError("EEXIST", name); // EEXIST before EPERM
+    const rec = inode(id);
+    if (rec.kind === "dir") throw new VfsError("EPERM", name);
+    rec.nlink += 1;
+    children(parent)[name] = { id, kind: rec.kind };
+    p.mtimeMs = Date.now();
+    dirty = true;
+    return { value: undefined };
+  },
+
+  async rename(fromParent: NodeId, fromName: string, toParent: NodeId, toName: string): Promise<OpResult> {
+    const fp = requireDir(fromParent);
+    const tp = requireDir(toParent);
+    const fromDir = children(fromParent);
+    const moving = fromDir[fromName];
+    if (!moving) throw new VfsError("ENOENT", fromName);
+    const toDir = children(toParent);
+    const displaced = toDir[toName];
+    if (displaced) {
+      if (displaced.id === moving.id) return { value: undefined }; // POSIX same-inode no-op
+      const ex = inode(displaced.id);
+      const mv = inode(moving.id);
+      if (ex.kind === "dir") {
+        if (mv.kind !== "dir") throw new VfsError("EISDIR", toName);
+        if (Object.keys(children(displaced.id)).length > 0) throw new VfsError("ENOTEMPTY", toName);
+        delete mani.dirents[displaced.id];
+        delete mani.inodes[displaced.id];
+      } else {
+        if (mv.kind === "dir") throw new VfsError("ENOTDIR", toName);
+        ex.nlink -= 1;
+        if (ex.nlink <= 0) {
+          delete mani.inodes[displaced.id]; // blobs reclaimed by GC (Task 6); NEVER deleted in-op
+        }
+      }
+    }
+    delete fromDir[fromName];
+    toDir[toName] = moving;
+    fp.mtimeMs = Date.now();
+    tp.mtimeMs = fp.mtimeMs;
+    dirty = true;
+    return { value: undefined };
+  },
 };
 
 function ensure(op: string): OpFn {
