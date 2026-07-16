@@ -57,6 +57,16 @@ describe("manifest core", () => {
     expect(selectGeneration(garbage, garbage)).toEqual({ state: "corrupt" });
   });
 
+  it("treats a zero-length slot as absent (fresh mount survives a torn first write)", () => {
+    const empty = new Uint8Array(0);
+    // both slots zero-length → empty, NOT corrupt: a torn first write must not brick a fresh mount
+    expect(selectGeneration(empty, empty)).toEqual({ state: "empty" });
+    expect(selectGeneration(empty, null)).toEqual({ state: "empty" });
+    // a zero-length slot alongside a valid one falls back to the valid generation
+    const valid = serializeManifest(sample(), 5);
+    expect(selectGeneration(empty, valid)).toMatchObject({ generation: 5, currentSlot: "b" });
+  });
+
   it("emptyManifest has a root dir and no dirents; liveIds covers all inode ids", () => {
     const m = emptyManifest("ROOT");
     expect(m.inodes.ROOT.kind).toBe("dir");

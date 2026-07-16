@@ -67,11 +67,13 @@ export type SelectResult =
   | { state: "corrupt" };
 
 export function selectGeneration(slotA: Uint8Array | null, slotB: Uint8Array | null): SelectResult {
-  const a = slotA ? parseManifest(slotA) : null;
-  const b = slotB ? parseManifest(slotB) : null;
+  const aPresent = slotA != null && slotA.byteLength > 0;
+  const bPresent = slotB != null && slotB.byteLength > 0;
+  const a = aPresent ? parseManifest(slotA!) : null;
+  const b = bPresent ? parseManifest(slotB!) : null;
   if (!a && !b) {
-    if (!slotA && !slotB) return { state: "empty" };
-    return { state: "corrupt" }; // ≥1 present but none valid
+    if (!aPresent && !bPresent) return { state: "empty" };
+    return { state: "corrupt" };
   }
   if (a && (!b || a.generation >= b.generation)) {
     return { manifest: a.manifest, generation: a.generation, currentSlot: "a" };
