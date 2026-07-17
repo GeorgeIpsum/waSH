@@ -137,27 +137,38 @@ async function commit(): Promise<void> {
   try {
     maybeFault("blobFlush"); // test hook: simulate a blob-flush failure at the commit boundary
   } catch (e) {
-    rollbackToCommitted();
+    await rollbackToCommitted();
     throw toVfs(e); // QuotaExceededError → ENOSPC
   }
   const blobErr = blobs.flushAll();
   if (blobErr) {
-    rollbackToCommitted();
+    await rollbackToCommitted();
     throw blobErr;
   }
-  if (!dirty) return;
+  if (!dirty) {
+    blobs.commitContent(); // no content op ran (undo is empty), but never skip the discard
+    return;
+  }
   try {
     await writeGeneration();
+    blobs.commitContent(); // manifest + content are both durable now — discard the undo-log
   } catch (e) {
-    rollbackToCommitted();
+    await rollbackToCommitted();
     throw toVfs(e);
   }
 }
 
-function rollbackToCommitted(): void {
+/**
+ * Roll the working manifest back to the last successfully committed generation AND restore
+ * any in-place content mutation (overwrite/truncate-shrink) made during the failed batch —
+ * blobs must match the rolled-back manifest, or already-committed content is corrupted.
+ * Must complete before commit()'s rejection propagates (all three call sites await it).
+ */
+async function rollbackToCommitted(): Promise<void> {
   const parsed = parseManifest(committedBytes);
   mani = parsed ? parsed.manifest : emptyManifest(mani.rootId);
   dirty = false;
+  await blobs.rollbackContent();
 }
 
 /**

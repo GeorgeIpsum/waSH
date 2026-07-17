@@ -6,6 +6,13 @@ export class BlobStore {
   private pool: Lru<string, FileSystemSyncAccessHandle>;
   /** An eviction that fails to flush loses data silently; record it so the next flushAll surfaces it. */
   private evictError: VfsError | null = null;
+  /**
+   * Per-batch content undo-log (key = "<id>.<idx>"). Captures a chunk's committed bytes
+   * BEFORE its first in-batch mutation, so a failed-flush rollback can restore blobs to
+   * match the rolled-back manifest. `null` means the chunk did not exist at last commit
+   * (delete it on rollback). Cleared on both rollback and commit.
+   */
+  private undo = new Map<string, Uint8Array | null>();
   constructor(
     private readonly blobDir: FileSystemDirectoryHandle,
     poolSize: number,
@@ -50,6 +57,27 @@ export class BlobStore {
     return h;
   }
 
+  /**
+   * Capture a chunk's pre-batch (committed) bytes once, before its first mutation this
+   * batch — idempotent per batch. Routes through `handle()` (the same acquisition path
+   * `read`/`write` use) so it reuses a pooled handle if present, and opens+pools the
+   * on-disk file if it exists but isn't pooled — reading its FULL committed contents.
+   * Stores `null` only when the chunk genuinely doesn't exist (nothing to restore).
+   */
+  private async snapshot(id: string, idx: number): Promise<void> {
+    const key = this.key(id, idx);
+    if (this.undo.has(key)) return; // already captured this batch → keep the committed snapshot
+    const h = await this.handle(id, idx, false);
+    if (!h) {
+      this.undo.set(key, null);
+      return;
+    }
+    const size = h.getSize();
+    const buf = new Uint8Array(size);
+    if (size > 0) h.read(buf, { at: 0 });
+    this.undo.set(key, buf);
+  }
+
   async read(id: string, offset: number, length: number, size: number): Promise<Uint8Array> {
     if (offset >= size || length === 0) return new Uint8Array(0);
     const end = Math.min(offset + length, size);
@@ -75,6 +103,7 @@ export class BlobStore {
     const first = Math.floor(offset / this.chunkSize);
     const last = Math.floor((end - 1) / this.chunkSize);
     for (let idx = first; idx <= last; idx++) {
+      await this.snapshot(id, idx); // capture committed bytes BEFORE this chunk's first mutation this batch
       const chunkStart = idx * this.chunkSize;
       const from = Math.max(offset, chunkStart);
       const to = Math.min(end, chunkStart + this.chunkSize);
@@ -93,6 +122,7 @@ export class BlobStore {
     const prevLast = prevSize === 0 ? -1 : Math.floor((prevSize - 1) / this.chunkSize);
     for (let idx = lastKeep + 1; idx <= prevLast; idx++) {
       const key = this.key(id, idx);
+      await this.snapshot(id, idx); // capture committed bytes BEFORE discarding this chunk
       // Discarded tail chunk: close without flushing (its bytes are being deleted anyway —
       // flushing first could raise a false-positive ENOSPC for data we're about to discard).
       const h = this.pool.peek(key);
@@ -103,7 +133,10 @@ export class BlobStore {
     if (lastKeep >= 0) {
       const keep = size - lastKeep * this.chunkSize;
       const h = await this.handle(id, lastKeep, false);
-      if (h && h.getSize() > keep) h.truncate(keep);
+      if (h && h.getSize() > keep) {
+        await this.snapshot(id, lastKeep); // capture committed bytes BEFORE shrinking the boundary chunk
+        h.truncate(keep);
+      }
     }
   }
 
@@ -125,6 +158,45 @@ export class BlobStore {
 
   closeAll(): void {
     this.pool.clear(true);
+  }
+
+  /**
+   * Roll every chunk mutated this batch back to its committed bytes (or delete it, if it
+   * didn't exist at last commit). Best-effort per chunk — a pathological double-fault
+   * (e.g. disk full during the restore write itself) is swallowed so one bad chunk doesn't
+   * block the rest of the rollback. Never holds two live sync access handles on the same
+   * file: reuse the pooled handle when present, and only close a handle opened ad hoc here.
+   */
+  async rollbackContent(): Promise<void> {
+    for (const [key, bytes] of this.undo) {
+      try {
+        if (bytes === null) {
+          // chunk did not exist at last commit → remove it
+          const h = this.pool.peek(key);
+          if (h) { try { h.close(); } catch { /* already closed */ } }
+          this.pool.delete(key, false);
+          await this.blobDir.removeEntry(key).catch(() => {});
+        } else {
+          // restore committed content in place and make it durable
+          const pooled = this.pool.peek(key);
+          let h = pooled;
+          if (!h) {
+            const fh = await this.blobDir.getFileHandle(key, { create: true });
+            h = await fh.createSyncAccessHandle();
+          }
+          h.truncate(bytes.byteLength);
+          if (bytes.byteLength > 0) h.write(bytes, { at: 0 });
+          h.flush();
+          if (!pooled) h.close(); // only close a handle we opened ad hoc
+        }
+      } catch { /* pathological double-fault; best-effort */ }
+    }
+    this.undo.clear();
+  }
+
+  /** Discard undo snapshots after a durable commit — the mutated content is now committed. */
+  commitContent(): void {
+    this.undo.clear();
   }
 
   async gc(liveIds: Set<string>): Promise<void> {

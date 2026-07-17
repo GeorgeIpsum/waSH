@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { OpfsBackend } from "@wash/backend-opfs";
 import { ulid } from "@wash/vfs";
 const enc = new TextEncoder();
+const dec = new TextDecoder();
 const roots: string[] = [];
 function testRoot(): string { const n = `wash-test-${ulid()}`; roots.push(n); return n; }
 afterEach(async () => {
@@ -97,5 +98,50 @@ describe("OpfsBackend durability + GC", () => {
     const names: string[] = [];
     for await (const n of (blobDir as unknown as { keys(): AsyncIterableIterator<string> }).keys()) names.push(n);
     expect(names.some((n) => n.startsWith(f))).toBe(true);
+  });
+
+  it("failed flush rolls back an in-place OVERWRITE — committed content is not corrupted", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name, { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("AAAA"));
+    await be.flush();                      // commit F="AAAA"
+    await be.write(f, 0, enc.encode("BB")); // in-place overwrite → blob physically "BBAA"
+    await fault(be)("__injectFault", ["blobFlush", 0, 1]);
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" }); // rollback restores content
+    expect(dec.decode(await be.read(f, 0, 4))).toBe("AAAA"); // NOT "BBAA"
+    await be.close();
+    const be2 = await OpfsBackend.open(name);
+    const f2 = await be2.lookup(await be2.root(), "f");
+    expect(dec.decode(await be2.read(f2!.id, 0, 4))).toBe("AAAA"); // survives reopen
+    await be2.close();
+  });
+
+  it("failed flush rolls back a TRUNCATE-shrink — the discarded tail is restored", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name, { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    const N = 70000;
+    const payload = new Uint8Array(N);
+    for (let i = 0; i < N; i++) payload[i] = (i % 250) + 1; // non-zero, so "zeros" corruption is detectable
+    await be.write(f, 0, payload);
+    await be.flush();                       // commit F size 70000
+    await be.truncate(f, 5000);             // eager physical shrink (delete tail + shrink boundary)
+    await fault(be)("__injectFault", ["blobFlush", 0, 1]);
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" }); // rollback restores blobs
+    expect((await be.getattr(f)).size).toBe(N); // manifest rolled back to 70000
+    const back = await be.read(f, 0, N);
+    expect(back.byteLength).toBe(N);
+    expect([...back]).toEqual([...payload]); // original bytes restored, NOT zeros
+    await be.close();
+    const be2 = await OpfsBackend.open(name);
+    const f2 = await be2.lookup(await be2.root(), "f");
+    const back2 = await be2.read(f2!.id, 0, N);
+    expect([...back2]).toEqual([...payload]); // survives reopen
+    await be2.close();
   });
 });
