@@ -144,4 +144,27 @@ describe("OpfsBackend durability + GC", () => {
     expect([...back2]).toEqual([...payload]); // survives reopen
     await be2.close();
   });
+
+  it("rollback restores committed content even when the mutated chunk was NOT pooled (cross-session)", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name);
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("AAAA"));
+    await be.flush();
+    await be.close(); // pool emptied; chunk is on disk only
+
+    // Reopen with a FRESH worker (empty pool): the first mutation of this
+    // committed chunk must snapshot its bytes from DISK, not record it absent.
+    const be2 = await OpfsBackend.open(name, { testHooks: true });
+    const f2 = (await be2.lookup(await be2.root(), "f"))!.id;
+    await be2.write(f2, 0, enc.encode("BB")); // unpooled snapshot path
+    await fault(be2)("__injectFault", ["blobFlush", 0, 1]);
+    await expect(be2.flush()).rejects.toMatchObject({ errno: "ENOSPC" });
+    // If snapshot had wrongly recorded the chunk absent, rollback would have
+    // DELETED it → this read would be empty/zeros. It must be the committed "AAAA".
+    expect(dec.decode(await be2.read(f2, 0, 4))).toBe("AAAA");
+    await be2.close();
+  });
 });

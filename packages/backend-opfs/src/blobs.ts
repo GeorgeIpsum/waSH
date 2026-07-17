@@ -178,16 +178,16 @@ export class BlobStore {
           await this.blobDir.removeEntry(key).catch(() => {});
         } else {
           // restore committed content in place and make it durable
-          const pooled = this.pool.peek(key);
-          let h = pooled;
-          if (!h) {
-            const fh = await this.blobDir.getFileHandle(key, { create: true });
-            h = await fh.createSyncAccessHandle();
+          const fh = await this.blobDir.getFileHandle(key, { create: true });
+          const pooled = this.pool.peek(key) !== undefined;
+          const h = this.pool.peek(key) ?? (await fh.createSyncAccessHandle());
+          try {
+            h.truncate(bytes.byteLength);
+            if (bytes.byteLength > 0) h.write(bytes, { at: 0 });
+            h.flush();
+          } finally {
+            if (!pooled) h.close(); // never leak a handle we opened ad hoc
           }
-          h.truncate(bytes.byteLength);
-          if (bytes.byteLength > 0) h.write(bytes, { at: 0 });
-          h.flush();
-          if (!pooled) h.close(); // only close a handle we opened ad hoc
         }
       } catch { /* pathological double-fault; best-effort */ }
     }
