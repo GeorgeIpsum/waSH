@@ -94,8 +94,9 @@ async function readSlot(s: "a" | "b"): Promise<Uint8Array | null> {
   try {
     const fh = await rootDir.getFileHandle(slotName(s));
     return new Uint8Array(await (await fh.getFile()).arrayBuffer());
-  } catch {
-    return null;
+  } catch (e) {
+    if ((e as { name?: string } | null)?.name === "NotFoundError") return null; // genuinely absent slot
+    throw new VfsError("EIO", slotName(s)); // unreadable/malformed slot storage → fail closed, no GC
   }
 }
 

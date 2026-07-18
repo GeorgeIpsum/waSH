@@ -100,6 +100,31 @@ describe("OpfsBackend durability + GC", () => {
     expect(names.some((n) => n.startsWith(f))).toBe(true);
   });
 
+  it("unreadable manifest slots (not NotFound) → open rejects EIO and does NOT GC blobs", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name);
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("keep"));
+    await be.flush();
+    await be.close();
+    const origin = await navigator.storage.getDirectory();
+    const dir = await origin.getDirectoryHandle(name);
+    // Replace each manifest slot FILE with a DIRECTORY of the same name → getFileHandle
+    // throws TypeMismatchError (a non-NotFound read error), which must NOT be seen as "absent".
+    for (const slot of ["manifest.a", "manifest.b"]) {
+      await dir.removeEntry(slot).catch(() => {});
+      await dir.getDirectoryHandle(slot, { create: true });
+    }
+    await expect(OpfsBackend.open(name)).rejects.toMatchObject({ errno: "EIO" });
+    // blobs must survive (no empty-init GC)
+    const blobDir = await dir.getDirectoryHandle("blobs");
+    const names: string[] = [];
+    for await (const n of (blobDir as unknown as { keys(): AsyncIterableIterator<string> }).keys()) names.push(n);
+    expect(names.some((n) => n.startsWith(f))).toBe(true);
+  });
+
   it("failed flush rolls back an in-place OVERWRITE — committed content is not corrupted", async () => {
     const name = testRoot();
     const be = await OpfsBackend.open(name, { testHooks: true });
