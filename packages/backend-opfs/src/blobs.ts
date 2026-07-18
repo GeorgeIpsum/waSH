@@ -103,19 +103,26 @@ export class BlobStore {
     }
     // first mutation this batch: record rollback info, create the staged version from the committed one
     if (!this.staged.has(key)) this.staged.set(key, cur ?? null);
-    const staged = (await this.handleVersioned(id, idx, stagedGen, true))!;
+    // Read the committed source bytes INTO MEMORY FIRST (only one live handle at a time), so
+    // acquiring the staged handle below can't evict a still-needed source handle under a
+    // handlePoolSize: 1 pool (the source open would otherwise evict+close the not-yet-acquired
+    // staged handle, or vice versa).
+    let srcBytes: Uint8Array | null = null;
     if (cur !== undefined) {
-      // copy committed bytes forward so unmutated parts of the chunk survive
       const src = await this.handleVersioned(id, idx, cur, false);
       if (src) {
         const size = src.getSize();
         if (size > 0) {
-          const buf = new Uint8Array(size);
-          src.read(buf, { at: 0 });
-          staged.truncate(size);
-          staged.write(buf, { at: 0 });
+          srcBytes = new Uint8Array(size);
+          src.read(srcBytes, { at: 0 });
         }
       }
+    }
+    const staged = (await this.handleVersioned(id, idx, stagedGen, true))!;
+    if (srcBytes) {
+      // copy committed bytes forward so unmutated parts of the chunk survive
+      staged.truncate(srcBytes.byteLength);
+      staged.write(srcBytes, { at: 0 });
     }
     this.chunkVersion.set(key, stagedGen);
     return staged;

@@ -118,7 +118,14 @@ async function writeGeneration(): Promise<void> {
     maybeFault("slotWrite");
     h.truncate(0);
     h.write(bytes, { at: 0 });
+    maybeFault("slotFlush");   // test hook: fault AFTER the bytes have landed but at the durability barrier
     h.flush();
+  } catch (e) {
+    // The slot may hold a fully-written-but-not-durably-flushed generation. Invalidate it
+    // (0-length → treated as an absent slot by selectGeneration) so reopen cannot select a
+    // non-durable generation whose staged chunks the rollback deletes. Best-effort.
+    try { h.truncate(0); h.flush(); } catch { /* pathological double-fault */ }
+    throw e;
   } finally {
     h.close();
   }

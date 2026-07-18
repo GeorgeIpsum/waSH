@@ -263,4 +263,41 @@ describe("OpfsBackend durability + GC", () => {
     expect((await be.getattr(f)).size).toBe(4);
     await be.close();
   });
+
+  it("a slot-flush failure that may have landed does not strand a batch's new content (P1)", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name, { testHooks: true });
+    const root = await be.root();
+    await be.create(root, "keep", ulid(), "file");
+    await be.flush(); // commit gen 1 (no "g")
+    // Batch: create + write a NEW file, then the slot flush faults after the bytes landed.
+    const g = ulid();
+    await be.create(root, "g", g, "file");
+    await be.write(g, 0, enc.encode("GGGG"));
+    await fault(be)("__injectFault", ["slotFlush", 0, 1]);
+    await expect(be.flush()).rejects.toBeTruthy();
+    await be.close();
+    // Reopen: the half-written gen-2 slot must be invalidated → gen 1 selected → "g" absent
+    // (not present-but-reading-zeros). Its staged chunk being deleted is then safe.
+    const be2 = await OpfsBackend.open(name);
+    const root2 = await be2.root();
+    expect(await be2.lookup(root2, "g")).toBeNull();
+    expect(await be2.lookup(root2, "keep")).not.toBeNull();
+    await be2.close();
+  });
+
+  it("COW overwrite/truncate work with a single-entry handle pool (P2)", async () => {
+    const be = await OpfsBackend.open(testRoot(), { handlePoolSize: 1 });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("AAAA"));
+    await be.flush();
+    await be.write(f, 0, enc.encode("BB")); // overwrite committed data → cow under pool size 1
+    expect(dec.decode(await be.read(f, 0, 4))).toBe("BBAA");
+    await be.truncate(f, 2); // truncate-shrink committed data → cow boundary under pool size 1
+    expect(dec.decode(await be.read(f, 0, 4))).toBe("BB");
+    await be.flush();
+    await be.close();
+  });
 });
