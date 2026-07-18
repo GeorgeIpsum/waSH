@@ -41,6 +41,9 @@ export class BlobStore {
     private readonly blobDir: FileSystemDirectoryHandle,
     poolSize: number,
     readonly chunkSize: number = CHUNK_SIZE,
+    /** Test-gated fault hook (same instance as the worker's `maybeFault`); a no-op when no
+     *  fault is registered, so this is zero-cost in production. */
+    private readonly maybeFault: (site: string) => void = () => {},
   ) {
     this.pool = new Lru(poolSize, (_k, h) => this.onEvict(h));
   }
@@ -152,6 +155,7 @@ export class BlobStore {
       const to = Math.min(end, chunkStart + this.chunkSize);
       const h = await this.cow(id, idx, stagedGen); // COW: write always targets the staged, mutable version
       try {
+        this.maybeFault("blobWrite"); // test-only: fail AFTER the chunk is staged, BEFORE the byte write
         h.write(data.subarray(from - offset, to - offset), { at: from - chunkStart });
       } catch (e) {
         if ((e as { name?: string }).name === "QuotaExceededError") throw new VfsError("ENOSPC", id);
@@ -276,6 +280,11 @@ export class BlobStore {
   async gc(liveFiles: Set<string>): Promise<void> {
     for await (const name of (this.blobDir as unknown as { keys(): AsyncIterableIterator<string> }).keys()) {
       if (!liveFiles.has(name)) {
+        // Version-aware GC can target a superseded committed version that is still pooled —
+        // close its open sync access handle first (same pattern as rollbackBatch), otherwise
+        // an open handle blocks removeEntry and leaks the handle.
+        const h = this.pool.peek(name);
+        if (h) { try { h.close(); } catch { /* already closed */ } }
         this.pool.delete(name, false);
         await this.blobDir.removeEntry(name).catch(() => {});
       }

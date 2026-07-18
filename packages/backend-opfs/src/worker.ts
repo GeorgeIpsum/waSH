@@ -1,6 +1,6 @@
 /// <reference lib="webworker" />
 import type { Attrs, NodeId, NodeKind } from "@wash/vfs";
-import { VfsError, ulid } from "@wash/vfs";
+import { CHUNK_SIZE, VfsError, ulid } from "@wash/vfs";
 import type { RpcRequest, RpcResponse } from "./rpc.js";
 import {
   type Manifest, type InodeRecord,
@@ -236,7 +236,7 @@ const ops: Record<string, OpFn> = {
     const origin = await navigator.storage.getDirectory();
     rootDir = await origin.getDirectoryHandle(rootDirName, { create: true });
     const blobDir = await rootDir.getDirectoryHandle("blobs", { create: true });
-    blobs = new BlobStore(blobDir, poolSize);
+    blobs = new BlobStore(blobDir, poolSize, CHUNK_SIZE, maybeFault);
     const sel = selectGeneration(await readSlot("a"), await readSlot("b"));
     if ("state" in sel) {
       if (sel.state === "corrupt") throw new VfsError("EIO", rootDirName); // never empty-init + GC over corruption
@@ -361,7 +361,12 @@ const ops: Record<string, OpFn> = {
     if (bytes.byteLength === 0) return { value: undefined }; // POSIX no-op
     // generation is constant within a batch (advances only on a successful commit), so
     // generation + 1 is a stable staged-gen for every content op in this batch.
-    await blobs.write(id, offset, bytes, generation + 1); // fallible; on throw the manifest is untouched below
+    try {
+      await blobs.write(id, offset, bytes, generation + 1);
+    } catch (e) {
+      await rollbackToCommitted(); // abort the whole batch: discard staged chunks + revert manifest to last-committed
+      throw e;
+    }
     const end = offset + bytes.byteLength;
     if (end > rec.size) rec.size = end;
     rec.mtimeMs = Date.now();
@@ -371,7 +376,12 @@ const ops: Record<string, OpFn> = {
 
   async truncate(id: NodeId, size: number): Promise<OpResult> {
     const rec = requireFile(id);
-    await blobs.truncate(id, size, rec.size, generation + 1);
+    try {
+      await blobs.truncate(id, size, rec.size, generation + 1);
+    } catch (e) {
+      await rollbackToCommitted(); // abort the whole batch: discard staged chunks + revert manifest to last-committed
+      throw e;
+    }
     rec.size = size;
     rec.mtimeMs = Date.now();
     dirty = true;

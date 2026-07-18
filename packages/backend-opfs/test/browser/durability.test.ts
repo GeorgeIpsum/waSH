@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { OpfsBackend } from "@wash/backend-opfs";
-import { ulid } from "@wash/vfs";
+import { CHUNK_SIZE, ulid } from "@wash/vfs";
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const roots: string[] = [];
@@ -209,6 +209,40 @@ describe("OpfsBackend durability + GC", () => {
     const f2 = (await be2.lookup(await be2.root(), "f"))!.id;
     expect(dec.decode(await be2.read(f2, 0, 4))).toBe("AAAA"); // prior generation intact
     await be2.close();
+  });
+
+  it("a content op that fails after staging aborts the batch — committed content survives, nothing partial promoted", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    // Baseline spans TWO chunks (CHUNK_SIZE = 65536) so a single write() call touches chunk 0
+    // then chunk 1 in order — this is what makes the test discriminating: a single-chunk
+    // fault-before-the-byte-write leaves nothing behind to promote either way (the staged file
+    // only ever holds the unmodified COW-forwarded bytes), so it can't tell a real batch-abort
+    // apart from a naive implementation. With two chunks, chunk 0's write actually lands on
+    // disk before chunk 1's write faults — a naive (non-aborting) implementation would leave
+    // chunk 0's new bytes visible while chunk 1 stays at its old content: a torn, half-promoted
+    // write. Fix 1 must roll BOTH chunks back, not just the one that failed.
+    const N = CHUNK_SIZE + 4;
+    const baseline = new Uint8Array(N).fill(0x41); // 'A' * N
+    await be.write(f, 0, baseline);
+    await be.flush(); // commit gen 1: all 'A's across 2 chunks
+    // skip=1: the first maybeFault("blobWrite") call (chunk 0) is a no-op, so chunk 0's cow +
+    // real byte write succeeds; the SECOND call (chunk 1) throws AFTER cow stages it, BEFORE
+    // its byte write.
+    await fault(be)("__injectFault", ["blobWrite", 1, 1]);
+    const attempted = new Uint8Array(N).fill(0x42); // 'B' * N
+    await expect(be.write(f, 0, attempted)).rejects.toBeTruthy(); // op aborts the batch
+    // Nothing partial promoted: chunk 0's already-written 'B's must NOT be visible either — the
+    // WHOLE batch is rolled back, not just the chunk that failed.
+    const back = await be.read(f, 0, N);
+    expect(back.every((b) => b === 0x41)).toBe(true); // still all 'A's, not a 'B'/'A' mix
+    // a later clean write+flush works (no wedged/poisoned state)
+    await be.write(f, 0, enc.encode("CCCC"));
+    await be.flush();
+    expect(dec.decode(await be.read(f, 0, 4))).toBe("CCCC");
+    await be.close();
   });
 
   it("a partially failed multi-chunk write does not persist (P1-B)", async () => {
