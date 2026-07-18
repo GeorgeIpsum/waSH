@@ -66,10 +66,24 @@ tree, no per-directory sidecars:
 ├── manifest.a            — one of two retained manifest generations (A/B; F3)
 ├── manifest.b            — the other generation; reader picks the highest valid generation
 └── blobs/
-    ├── <inodeId>.0       — chunk 0 of inode <inodeId>  (ULID-named, never moved/renamed)
-    ├── <inodeId>.1       — chunk 1
+    ├── <inodeId>.0.<gen> — chunk 0 of inode <inodeId>, as of manifest generation <gen>
+    ├── <inodeId>.1.<gen> — chunk 1, as of generation <gen>
     └── …                  (chunkSize benched, default 64 KiB; a sparse/zero chunk is simply absent)
 ```
+
+**Chunks are copy-on-write and VERSIONED, not mutated in place (P1-A/P1-B fix).** A chunk
+file is named `blobs/<inodeId>.<chunkIdx>.<gen>`, where `<gen>` is the manifest generation
+the version was staged for — there is no bare `<id>.<chunk>` file. A chunk version is
+**immutable once its generation is committed**: the current batch's mutations always COW into
+`<id>.<chunk>.<stagedGen>` (`stagedGen` = the committed `generation + 1`, constant for the
+whole batch), copying the committed bytes forward once so unmutated parts of the chunk
+survive; the committed versions (≤ the current `generation`) are never touched. The manifest
+schema carries NO per-chunk version field — a reader derives each chunk's version at open as
+"the highest `<gen>` ≤ the selected manifest generation," so there is no manifest bloat. This
+is what makes content crash-atomic in the same sense metadata already was (§3.1/§5): a crash
+between a blob flush and the manifest generation write leaves an **orphan** staged-gen chunk
+file on disk, never a corrupted committed one — the prior (still-selected) generation always
+resolves its own intact chunk versions, and the orphan is later reclaimed by GC (§3.3).
 
 **Two manifest generations (F3), not one.** A single manifest is a single point
 of whole-filesystem loss: a corrupt/truncated manifest would strand every blob
@@ -130,11 +144,17 @@ validation and the reader falls back to the other slot.
 in this strict order — **blobs first, manifest last, and never a manifest that
 references non-durable bytes**:
 
-1. **Flush every dirty blob sync-access-handle.** (F2)
-2. **If ANY blob flush fails:** do NOT commit the manifest; retain the dirty
-   blob handles; **roll the in-memory working manifest back to the last-committed
-   generation** (§3.1a); reject with the mapped errno. Re-drive of the batch is
-   the declared CachedBackend dependency (§11 / F1).
+1. **Flush every dirty blob sync-access-handle.** (F2) Every content mutation this
+   batch touched a COW'd **staged-generation** chunk version (`<id>.<chunk>.<stagedGen>`,
+   §2) — the committed versions (≤ the current `generation`) were never written to, so
+   this step can never corrupt already-durable content, only fail to durably persist
+   the new staged bytes.
+2. **If ANY blob flush fails:** do NOT commit the manifest; **roll the in-memory working
+   manifest back to the last-committed generation AND discard this batch's staged chunk
+   versions** (§3.1a); reject with the mapped errno. Because the committed chunk versions
+   were never touched, discarding the staged versions requires no byte restoration — just
+   deleting the staged-gen files and reverting the chunk-version map. Re-drive of the batch
+   is the declared CachedBackend dependency (§11 / F1).
 3. **Serialize the working manifest** with an incremented `generation` and a
    fresh `checksum`.
 4. **Write it in place into the NON-current slot** (`manifest.a`/`manifest.b`,
@@ -164,6 +184,20 @@ ahead; rollback discards the whole batch's edits so no generation ever commits a
 size without its bytes). The resulting cache/backend divergence for ops the
 cache already dequeued is the declared dependency, §11.
 
+**Content rollback is the COW mirror of this, and needs no byte restoration.**
+Every content mutation this batch (write/truncate) COW'd into a staged-generation
+chunk version (§2); rollback simply deletes those staged-gen files and reverts the
+in-memory chunk-version map to whichever version (possibly none) each chunk
+resolved to before this batch — the committed versions underneath were never
+touched, so there is nothing to restore byte-for-byte (contrast the earlier,
+now-removed in-memory content undo-log, which had to snapshot and replay whole
+committed chunks). This closes P1-A (a crash between blob flush and the manifest
+generation write can no longer corrupt the prior generation's content — it can
+only leave an inert orphan staged version, reclaimed by GC §3.3) and P1-B (a
+partially-failed multi-chunk write's already-COW'd chunks are staged-only and
+discarded by this same rollback, never silently persisted by a later `!dirty`
+commit).
+
 ### 3.2 Parse gate, versioning, and the highest-valid-generation reader (F3)
 
 The reader loads BOTH slots and selects the manifest with the **highest
@@ -184,34 +218,56 @@ The `v` field allows future format migration; v1 is the only format written.
 Readers also accept a v0 bare-object manifest (none exist yet; forward-compat
 only) but writers always emit v1 with generation+checksum.
 
-### 3.3 Blob garbage collection — live set is the UNION of retained generations + working (F4, F7)
+### 3.3 Blob garbage collection — live set is the UNION of retained generations + working, VERSION-aware (F4, F7)
 
-Blobs are referenced only by inode id; a blob unreachable from any manifest that
-could still be read is inert. Because the backend retains TWO fallback-eligible
-generations (§3.2), GC must treat BOTH as roots — plus the in-memory working
-manifest, which includes created-but-unflushed inodes:
+Blobs are chunk **versions** (§2), referenced by `(inodeId, chunkIdx)` resolving to a
+specific `<gen>`; a chunk version unreachable from any manifest view that could still
+be read is inert. Because the backend retains TWO fallback-eligible generations (§3.2),
+GC must treat BOTH as roots — plus the in-memory working manifest, which includes
+created-but-unflushed inodes and this session's staged (but not yet committed) chunk
+mutations:
 
-> **GC invariant:** a blob is collectible **iff** its inode id is present in
-> NEITHER retained on-disk generation (A and B) NOR the current in-memory
-> working manifest. Equivalently, the live set = union of the referenced ids of
-> every valid retained generation ∪ the working-manifest ids.
+> **GC invariant:** a physical file `<id>.<chunk>.<v>` is collectible **iff**, for
+> EVERY retained view (the working manifest, on-disk generation A, on-disk generation
+> B), it is either not the version that view resolves for `(id, chunk)`, or `chunk` is
+> outside that inode's size in that view. Equivalently: the live set is the union, over
+> every retained view, of each view's resolved chunk-version FILE for every file
+> inode's chunks within that view's size — computed per view by parsing its manifest,
+> then for each file inode and each `chunk` in `0 .. ceil(size/chunkSize)-1`, resolving
+> the highest `<id>.<chunk>.<v>` with `v <= thatView'sGeneration` (the working view uses
+> the in-memory `generation`). Reclaim every `blobs/*` file not in the union.
+
+This supersedes the earlier id-only union rule: GC now also reclaims **superseded chunk
+versions** once no retained generation resolves to them, not just whole abandoned
+inodes — e.g. an overwritten chunk's old committed version becomes collectible as soon
+as no retained view's size-gated resolution still points at it.
 
 Why the union (F7): if GC used only the newest generation and later fell back to
 the older one (because the newest slot corrupted), the older generation could
-reference a blob GC already deleted — restoring metadata that points at destroyed
-data. With the union rule, a blob referenced by inode `x` in an older retained
-generation survives until that generation's slot is **overwritten by a newer
-valid commit** (at which point no fallback can reach `x` and its blob becomes
-collectible). This is the LMDB free-list / ZFS block-free "don't free data
-reachable from a retained older root" discipline.
+reference a chunk version GC already deleted — restoring metadata that points at
+destroyed data. With the union rule, a chunk version referenced by inode `x` in an
+older retained generation survives until that generation's slot is **overwritten by a
+newer valid commit** (at which point no fallback can reach it and it becomes
+collectible). This is the LMDB free-list / ZFS block-free "don't free data reachable
+from a retained older root" discipline.
 
 Why the working set (F4): an inode created in-memory but not yet flushed has its
-blobs on disk but is absent from both committed generations; without the working
-set in the union, in-session GC would reap a live-but-unflushed blob. GC runs at
-open (working = the just-loaded generation, no unflushed state) and
-opportunistically in-session (working = the mutated manifest); the simplest safe
-realization is that in-session GC only runs when there is no dirty pending state,
-or restricts deletion to ids absent from the union above.
+chunk versions on disk but is absent from both committed generations; a chunk mutated
+this session is COW'd into a staged-generation version absent from every committed
+generation until commit. Without the working set in the union, in-session GC would
+reap a live-but-unflushed or live-but-uncommitted chunk version. GC runs at open
+(working = the just-loaded generation, no unflushed/staged state — chunk versions are
+resolved fresh from disk via a version-map scan, §2) and opportunistically in-session
+(working = the mutated manifest + this session's staged chunk versions); the simplest
+safe realization is that in-session GC only runs when there is no dirty pending state,
+or restricts deletion to files absent from the union above.
+
+**Orphan staged versions from a crashed/torn commit** (P1-A): a chunk version staged
+toward a generation whose manifest write never completed (or was itself torn) has
+`v` greater than either retained generation's own generation number, so it is excluded
+from every view's size-gated resolution and is collectible on the next GC pass —
+exactly the mechanism that reclaims a crash's orphan bytes without ever having
+referenced or corrupted committed data.
 
 GC is never a correctness dependency for existing data — it only reclaims
 provably-unreachable bytes.
@@ -227,13 +283,13 @@ durable by the next `flush()`'s ordered fail-closed generation commit (§3.1).
 |---|---|---|
 | `root`/`lookup`/`readdir`/`getattr`/`readlink` | read in-memory maps | — |
 | `create` / `mkdir` / `symlink` | add inode + dirent (EEXIST on taken name; ENOTDIR on file parent; symlink sets `target`) | — |
-| `unlink` / `rmdir` | remove dirent; `nlink--`; GC inode at 0 (ENOTEMPTY for non-empty dir) | delete `<id>.*` chunks — post-commit, best-effort |
+| `unlink` / `rmdir` | remove dirent; `nlink--`; GC inode at 0 (ENOTEMPTY for non-empty dir) | none in-op — `<id>.<chunk>.<v>` versions reclaimed by version-aware GC (§3.3) |
 | `rename` | delete `(fromParent,fromName)`, set `(toParent,toName)→id`; POSIX overwrite (displaced GC / EISDIR / ENOTDIR / ENOTEMPTY); same-inode no-op | — |
 | `link` | add dirent, `nlink++` (EEXIST before EPERM; EPERM on dir) | — |
 | `chmod` / `utimes` | inode field update | — |
-| `read` | inode bounds → chunk range read | `getAll`-equiv range over `<id>.<chunk>` via pool |
-| `write` | update inode `size`/`mtime` | chunk-aligned RMW via pool (zero-length = no-op) |
-| `truncate` | update inode `size`/`mtime` | delete dropped chunks; trim boundary chunk |
+| `read` | inode bounds → chunk range read | resolve each chunk's version via the working `chunkVersion` map, range-read `<id>.<chunk>.<v>` via pool |
+| `write` | update inode `size`/`mtime` | COW each touched chunk into `<id>.<chunk>.<stagedGen>` (copying committed bytes forward once), then chunk-aligned RMW via pool (zero-length = no-op) |
+| `truncate` | update inode `size`/`mtime` | drop tail chunks from the working view (physical files kept for GC, §3.3); COW + physically shrink the boundary chunk into `<stagedGen>` |
 | `flush` | **ordered fail-closed commit (§3.1):** flush dirty blob handles FIRST → if any fail, roll back working manifest + reject → else write the new generation into the non-current slot | (blob handle flushes happen before the manifest write) |
 | `dump` | return the manifest's `{inodes, dirents}` directly | — |
 | `close` | final `flush`; close pooled handles; **release the per-root Web Lock** (§5/F6) | — |
@@ -288,12 +344,26 @@ as zeros. The conformance suite is the oracle.
   generation from committing and discards the batch's in-memory edits, so no
   generation ever names bytes that aren't durable, and none ever commits a size
   from a `truncate` whose paired `write` failed.
-- **Crash/failure matrix (all end in a complete generation):**
+- **Content is crash-atomic via copy-on-write versioned chunks (closes P1-A/P1-B).**
+  Content is never mutated in place across generations: every mutation COW's into a
+  staged-generation chunk version (§2), and the committed generation's own chunk
+  versions are immutable once committed. This restores, for CONTENT, the same "always
+  a complete prior generation" guarantee the manifest generation scheme already gave
+  metadata — a crash between the blob flush and the manifest generation write cannot
+  corrupt committed content, because the write never touched a committed chunk file;
+  it only leaves an orphan staged-gen file that the next GC pass reclaims (§3.3). There
+  is no in-memory content undo-log (superseded — see §3.1a); COW makes byte-level
+  rollback/restoration unnecessary.
+- **Crash/failure matrix (all end in a complete generation, content included):**
   crash before any blob flush → last committed generation intact, in-flight batch
-  lost (accepted write-back risk); crash after blob flushes, before/during the
-  new-slot write → new slot torn → fails checksum → reader falls back to the
-  prior generation in the other slot; crash after the new slot is flushed valid →
-  it is the new committed generation. No path yields a partial or phantom state.
+  lost (accepted write-back risk), any COW'd staged chunk versions are inert orphans;
+  crash after blob flushes, before/during the new-slot write → new slot torn → fails
+  checksum → reader falls back to the prior generation in the other slot, which
+  resolves only its own already-committed chunk versions (never the just-flushed
+  staged ones — those remain > the fallback generation and are orphaned, reclaimed by
+  GC); crash after the new slot is flushed valid → it is the new committed generation,
+  and the staged chunk versions it references are now themselves committed. No path
+  yields a partial or phantom state, for metadata or content.
 - **Blob write/flush failures** map through `errnoFromDom` (e.g.
   `QuotaExceededError → ENOSPC`). The pooled-handle flush-failure poison
   mechanism (sticky `pendingFlushErrors`, reported once by `flush`/`close`)
@@ -334,9 +404,15 @@ New / replaced worker internals:
   `truncate`+`write`+`flush` — §3.1); the whole-batch in-memory
   snapshot/restore (§3.1a). The pure parts (serialize/parse/checksum/reader
   selection over supplied slot bytes) are Node-unit-testable; slot I/O is browser.
-- `src/blobs.ts` (new) — chunk store over `blobs/<id>.<chunk>`: `readRange`,
-  `writeRange`, `truncate`, `deleteInode`, `liveIds`/GC helpers (§3.3), backed by
-  the sync-handle pool. Fully synchronous I/O.
+- `src/blobs.ts` (new) — copy-on-write versioned chunk store over
+  `blobs/<id>.<chunk>.<gen>`: `read`/`write`/`truncate` resolve/mutate via a
+  `chunkVersion` map (highest version ≤ selected generation), COW-ing into a
+  caller-supplied `stagedGen` on first mutation per batch (`cow()`); `rollbackBatch`/
+  `commitBatch` discard or keep this batch's staged versions (replaces the earlier
+  in-memory content undo-log); `buildVersionMap(selectedGen)` resolves the map from
+  disk at open; version-aware GC helpers (§3.3) resolve an arbitrary generation's
+  view for the union live-set computation. Backed by the sync-handle pool, keyed by
+  full versioned filename. Fully synchronous I/O.
 - `src/worker.ts` (rewritten) — acquires the per-root Web Lock at open (§5/F6);
   holds the in-memory working manifest + last-committed snapshot + blob store;
   maps every op per §4; `flush` = ordered fail-closed commit (§3.1).

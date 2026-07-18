@@ -4,7 +4,7 @@ import { VfsError, ulid } from "@wash/vfs";
 import type { RpcRequest, RpcResponse } from "./rpc.js";
 import {
   type Manifest, type InodeRecord,
-  serializeManifest, parseManifest, selectGeneration, emptyManifest, liveIds,
+  serializeManifest, parseManifest, selectGeneration, emptyManifest,
 } from "./manifest.js";
 import { BlobStore } from "./blobs.js";
 
@@ -147,12 +147,12 @@ async function commit(): Promise<void> {
     throw blobErr;
   }
   if (!dirty) {
-    blobs.commitContent(); // no content op ran (undo is empty), but never skip the discard
+    blobs.commitBatch(); // no content op ran (staged is empty), but never skip the discard
     return;
   }
   try {
     await writeGeneration();
-    blobs.commitContent(); // manifest + content are both durable now — discard the undo-log
+    blobs.commitBatch(); // manifest + content are both durable now — discard staged bookkeeping
   } catch (e) {
     await rollbackToCommitted();
     throw toVfs(e);
@@ -160,33 +160,52 @@ async function commit(): Promise<void> {
 }
 
 /**
- * Roll the working manifest back to the last successfully committed generation AND restore
- * any in-place content mutation (overwrite/truncate-shrink) made during the failed batch —
- * blobs must match the rolled-back manifest, or already-committed content is corrupted.
+ * Roll the working manifest back to the last successfully committed generation and discard
+ * this batch's staged (COW'd) chunk versions. Because content mutations always COW into
+ * `<id>.<chunk>.<stagedGen>` and never touch a committed version in place, there is no content
+ * to restore — rollback just deletes the staged-gen files and reverts the chunk-version map.
  * Must complete before commit()'s rejection propagates (all three call sites await it).
  */
 async function rollbackToCommitted(): Promise<void> {
   const parsed = parseManifest(committedBytes);
   mani = parsed ? parsed.manifest : emptyManifest(mani.rootId);
   dirty = false;
-  await blobs.rollbackContent();
+  await blobs.rollbackBatch();
 }
 
 /**
- * GC's live set (spec §3.3): the UNION of the working manifest and BOTH retained
- * on-disk generations. Blob reclamation is entirely GC's job — unlink/rename only drop
- * the inode from the manifest (Tasks 3/4) — so a blob still reachable from a fallback
- * generation must never be collected just because the working manifest dropped it.
+ * GC's live set (spec §3.3, version-aware): the UNION, over the working manifest and BOTH
+ * retained on-disk generations, of each view's resolved chunk VERSION FILE for every file
+ * inode's chunks within that view's size. A physical `<id>.<chunk>.<v>` file is live iff some
+ * retained view resolves to it for a chunk within that inode's size in that view — this drops
+ * superseded chunk versions once no retained generation resolves them, not just whole ids.
  */
-async function unionLiveIds(): Promise<Set<NodeId>> {
-  const live = liveIds(mani); // working manifest
+async function unionLiveChunkFiles(): Promise<Set<string>> {
+  const live = new Set<string>();
+  addLiveChunkFiles(live, blobs.chunkVersionSnapshot(), mani); // working view
   for (const s of ["a", "b"] as const) {
     const bytes = await readSlot(s);
     if (!bytes) continue;
     const parsed = parseManifest(bytes);
-    if (parsed) for (const id of Object.keys(parsed.manifest.inodes)) live.add(id);
+    if (!parsed) continue;
+    const versions = await blobs.resolveGenerationVersions(parsed.generation);
+    addLiveChunkFiles(live, versions, parsed.manifest);
   }
   return live;
+}
+
+/** Add, for every file inode in `m` whose chunk resolves a version in `versions`, that chunk's
+ *  FULL versioned filename to `live`. Chunks beyond an inode's size are size-gated out. */
+function addLiveChunkFiles(live: Set<string>, versions: ReadonlyMap<string, number>, m: Manifest): void {
+  for (const [id, rec] of Object.entries(m.inodes)) {
+    if (rec.kind !== "file") continue;
+    const chunkCount = Math.ceil(rec.size / blobs.chunkSize);
+    for (let idx = 0; idx < chunkCount; idx++) {
+      const key = `${id}.${idx}`;
+      const v = versions.get(key);
+      if (v !== undefined) live.add(`${key}.${v}`);
+    }
+  }
 }
 
 async function acquireLock(name: string): Promise<boolean> {
@@ -231,10 +250,13 @@ const ops: Record<string, OpFn> = {
       generation = sel.generation;
       currentSlot = sel.currentSlot;
       committedBytes = (currentSlot === "a" ? await readSlot("a") : await readSlot("b"))!;
+      // Resolve the working chunk-version map from disk for the SELECTED generation (not on
+      // the EIO/empty-mount paths — EIO threw above, and a fresh empty mount has no chunks yet).
+      await blobs.buildVersionMap(generation);
     }
     // At open, working == loaded generation, but both slots still contribute to the
-    // union live set (the other slot may hold a fallback generation) — see unionLiveIds().
-    await blobs.gc(await unionLiveIds());
+    // union live set (the other slot may hold a fallback generation) — see unionLiveChunkFiles().
+    await blobs.gc(await unionLiveChunkFiles());
     return { value: mani.rootId };
   },
 
@@ -242,10 +264,10 @@ const ops: Record<string, OpFn> = {
     return { value: mani.rootId };
   },
 
-  /** Normal op, callable any time (not testHooks-gated): reclaims blobs unreachable from
-   *  the working manifest OR either retained on-disk generation. */
+  /** Normal op, callable any time (not testHooks-gated): reclaims chunk-version files unreachable
+   *  from the working manifest OR either retained on-disk generation. */
   async gc(): Promise<OpResult> {
-    await blobs.gc(await unionLiveIds());
+    await blobs.gc(await unionLiveChunkFiles());
     return { value: undefined };
   },
 
@@ -337,7 +359,9 @@ const ops: Record<string, OpFn> = {
     // BlobStore.write calls .subarray(...) on it, which ArrayBuffer lacks — wrap first.
     const bytes = data instanceof Uint8Array ? data : new Uint8Array(data as ArrayBuffer);
     if (bytes.byteLength === 0) return { value: undefined }; // POSIX no-op
-    await blobs.write(id, offset, bytes); // fallible; on throw the manifest is untouched below
+    // generation is constant within a batch (advances only on a successful commit), so
+    // generation + 1 is a stable staged-gen for every content op in this batch.
+    await blobs.write(id, offset, bytes, generation + 1); // fallible; on throw the manifest is untouched below
     const end = offset + bytes.byteLength;
     if (end > rec.size) rec.size = end;
     rec.mtimeMs = Date.now();
@@ -347,7 +371,7 @@ const ops: Record<string, OpFn> = {
 
   async truncate(id: NodeId, size: number): Promise<OpResult> {
     const rec = requireFile(id);
-    await blobs.truncate(id, size, rec.size);
+    await blobs.truncate(id, size, rec.size, generation + 1);
     rec.size = size;
     rec.mtimeMs = Date.now();
     dirty = true;

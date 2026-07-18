@@ -1,18 +1,42 @@
 import { CHUNK_SIZE, VfsError } from "@wash/vfs";
 import { Lru } from "./lru.js";
 
-/** Chunked content store over blobs/<inodeId>.<chunkIdx>, sync-access-handle backed. */
+/** Matches a versioned chunk filename "<inodeId>.<chunkIdx>.<gen>". Inode ids are ULIDs
+ *  (no dots), so the greedy `(.+)` correctly backtracks to the last two dot-delimited,
+ *  purely-numeric segments. */
+const VERSIONED_NAME_RE = /^(.+)\.(\d+)\.(\d+)$/;
+
+/**
+ * Chunked content store over blobs/<inodeId>.<chunkIdx>.<gen> — copy-on-write versioned
+ * chunks, sync-access-handle backed.
+ *
+ * A chunk version `<id>.<chunk>.<g>` is immutable once generation `g` is committed.
+ * Mutations always COW into `<id>.<chunk>.<stagedGen>` (stagedGen = committed generation + 1,
+ * supplied by the caller) — the committed versions are never touched in place, so the prior
+ * generation's content is always intact on disk even if a commit crashes or is rolled back.
+ * There is no in-memory undo-log: rollback just discards the staged-gen files.
+ */
 export class BlobStore {
   private pool: Lru<string, FileSystemSyncAccessHandle>;
   /** An eviction that fails to flush loses data silently; record it so the next flushAll surfaces it. */
   private evictError: VfsError | null = null;
+
+  /** key "<id>.<idx>" -> the chunk version (generation) the working view reads/writes. */
+  private chunkVersion = new Map<string, number>();
   /**
-   * Per-batch content undo-log (key = "<id>.<idx>"). Captures a chunk's committed bytes
-   * BEFORE its first in-batch mutation, so a failed-flush rollback can restore blobs to
-   * match the rolled-back manifest. `null` means the chunk did not exist at last commit
-   * (delete it on rollback). Cleared on both rollback and commit.
+   * Per-batch rollback bookkeeping (key = "<id>.<idx>") -> the chunk's PRE-BATCH version, or
+   * `null` if it did not exist pre-batch. Populated on a chunk's first mutation this batch
+   * (in `cow()` and in `truncate()`'s tail-drop loop). Cleared on both rollback and commit.
    */
-  private undo = new Map<string, Uint8Array | null>();
+  private staged = new Map<string, number | null>();
+  /**
+   * The generation this batch's mutations are staged into. Constant within a batch (the
+   * worker only advances `generation` on a successful commit), so a single scalar — set by
+   * every `write`/`truncate` call — is enough for `rollbackBatch` to find and delete each
+   * staged-gen file, even for chunks a same-batch truncate later dropped from `chunkVersion`.
+   */
+  private stagedGen: number | null = null;
+
   constructor(
     private readonly blobDir: FileSystemDirectoryHandle,
     poolSize: number,
@@ -36,46 +60,62 @@ export class BlobStore {
     return `${id}.${idx}`;
   }
 
-  private async handle(id: string, idx: number, create: boolean): Promise<FileSystemSyncAccessHandle | null> {
-    const k = this.key(id, idx);
-    const cached = this.pool.get(k);
+  private versionedName(id: string, idx: number, gen: number): string {
+    return `${id}.${idx}.${gen}`;
+  }
+
+  /** Acquire (optionally creating) the pooled sync access handle for a FULL versioned chunk file. */
+  private async handleVersioned(id: string, idx: number, gen: number, create: boolean): Promise<FileSystemSyncAccessHandle | null> {
+    const name = this.versionedName(id, idx, gen);
+    const cached = this.pool.get(name);
     if (cached) return cached;
     let fh: FileSystemFileHandle;
     try {
-      fh = await this.blobDir.getFileHandle(k, { create });
+      fh = await this.blobDir.getFileHandle(name, { create });
     } catch (e) {
       if ((e as { name?: string }).name === "NotFoundError") return null;
-      throw new VfsError("ENOSPC", k);
+      throw new VfsError("ENOSPC", name);
     }
     let h: FileSystemSyncAccessHandle;
     try {
       h = await fh.createSyncAccessHandle();
     } catch {
-      throw new VfsError("EBUSY", k);
+      throw new VfsError("EBUSY", name);
     }
-    this.pool.set(k, h);
+    this.pool.set(name, h);
     return h;
   }
 
   /**
-   * Capture a chunk's pre-batch (committed) bytes once, before its first mutation this
-   * batch — idempotent per batch. Routes through `handle()` (the same acquisition path
-   * `read`/`write` use) so it reuses a pooled handle if present, and opens+pools the
-   * on-disk file if it exists but isn't pooled — reading its FULL committed contents.
-   * Stores `null` only when the chunk genuinely doesn't exist (nothing to restore).
+   * Ensure <id>.<idx> has a writable staged-gen version this batch, copying the committed
+   * bytes forward ONCE on first mutation so unmutated parts of the chunk survive. NEVER
+   * mutates a committed version in place. Returns the staged (mutable) handle.
    */
-  private async snapshot(id: string, idx: number): Promise<void> {
+  private async cow(id: string, idx: number, stagedGen: number): Promise<FileSystemSyncAccessHandle> {
     const key = this.key(id, idx);
-    if (this.undo.has(key)) return; // already captured this batch → keep the committed snapshot
-    const h = await this.handle(id, idx, false);
-    if (!h) {
-      this.undo.set(key, null);
-      return;
+    const cur = this.chunkVersion.get(key);
+    if (cur === stagedGen) {
+      // already staged this batch → mutate the staged version directly
+      return (await this.handleVersioned(id, idx, stagedGen, true))!;
     }
-    const size = h.getSize();
-    const buf = new Uint8Array(size);
-    if (size > 0) h.read(buf, { at: 0 });
-    this.undo.set(key, buf);
+    // first mutation this batch: record rollback info, create the staged version from the committed one
+    if (!this.staged.has(key)) this.staged.set(key, cur ?? null);
+    const staged = (await this.handleVersioned(id, idx, stagedGen, true))!;
+    if (cur !== undefined) {
+      // copy committed bytes forward so unmutated parts of the chunk survive
+      const src = await this.handleVersioned(id, idx, cur, false);
+      if (src) {
+        const size = src.getSize();
+        if (size > 0) {
+          const buf = new Uint8Array(size);
+          src.read(buf, { at: 0 });
+          staged.truncate(size);
+          staged.write(buf, { at: 0 });
+        }
+      }
+    }
+    this.chunkVersion.set(key, stagedGen);
+    return staged;
   }
 
   async read(id: string, offset: number, length: number, size: number): Promise<Uint8Array> {
@@ -85,8 +125,10 @@ export class BlobStore {
     const first = Math.floor(offset / this.chunkSize);
     const last = Math.floor((end - 1) / this.chunkSize);
     for (let idx = first; idx <= last; idx++) {
-      const h = await this.handle(id, idx, false);
-      if (!h) continue; // sparse
+      const v = this.chunkVersion.get(this.key(id, idx));
+      if (v === undefined) continue; // sparse: no version resolves for this chunk
+      const h = await this.handleVersioned(id, idx, v, false);
+      if (!h) continue; // sparse (defensive: map claimed a version but file is gone)
       const chunkStart = idx * this.chunkSize;
       const from = Math.max(offset, chunkStart);
       const to = Math.min(end, chunkStart + this.chunkSize);
@@ -97,17 +139,18 @@ export class BlobStore {
     return out;
   }
 
-  async write(id: string, offset: number, data: Uint8Array): Promise<void> {
+  /** `stagedGen` = the generation this batch will commit (committed generation + 1). */
+  async write(id: string, offset: number, data: Uint8Array, stagedGen: number): Promise<void> {
     if (data.byteLength === 0) return;
+    this.stagedGen = stagedGen;
     const end = offset + data.byteLength;
     const first = Math.floor(offset / this.chunkSize);
     const last = Math.floor((end - 1) / this.chunkSize);
     for (let idx = first; idx <= last; idx++) {
-      await this.snapshot(id, idx); // capture committed bytes BEFORE this chunk's first mutation this batch
       const chunkStart = idx * this.chunkSize;
       const from = Math.max(offset, chunkStart);
       const to = Math.min(end, chunkStart + this.chunkSize);
-      const h = (await this.handle(id, idx, true))!;
+      const h = await this.cow(id, idx, stagedGen); // COW: write always targets the staged, mutable version
       try {
         h.write(data.subarray(from - offset, to - offset), { at: from - chunkStart });
       } catch (e) {
@@ -117,25 +160,31 @@ export class BlobStore {
     }
   }
 
-  async truncate(id: string, size: number, prevSize: number): Promise<void> {
+  async truncate(id: string, size: number, prevSize: number, stagedGen: number): Promise<void> {
+    this.stagedGen = stagedGen;
     const lastKeep = size === 0 ? -1 : Math.floor((size - 1) / this.chunkSize);
     const prevLast = prevSize === 0 ? -1 : Math.floor((prevSize - 1) / this.chunkSize);
     for (let idx = lastKeep + 1; idx <= prevLast; idx++) {
       const key = this.key(id, idx);
-      await this.snapshot(id, idx); // capture committed bytes BEFORE discarding this chunk
-      // Discarded tail chunk: close without flushing (its bytes are being deleted anyway —
-      // flushing first could raise a false-positive ENOSPC for data we're about to discard).
-      const h = this.pool.peek(key);
-      if (h) { try { h.close(); } catch { /* already closed */ } }
-      this.pool.delete(key, false);
-      await this.blobDir.removeEntry(key).catch(() => {});
+      const cur = this.chunkVersion.get(key);
+      if (cur === undefined) continue; // already sparse in the working view
+      if (!this.staged.has(key)) this.staged.set(key, cur);
+      // Working view drops the chunk (size gates it out) — do NOT delete the physical file:
+      // a retained prior generation may still resolve to it; GC reclaims once unreferenced.
+      this.chunkVersion.delete(key);
     }
     if (lastKeep >= 0) {
-      const keep = size - lastKeep * this.chunkSize;
-      const h = await this.handle(id, lastKeep, false);
-      if (h && h.getSize() > keep) {
-        await this.snapshot(id, lastKeep); // capture committed bytes BEFORE shrinking the boundary chunk
-        h.truncate(keep);
+      const key = this.key(id, lastKeep);
+      const cur = this.chunkVersion.get(key);
+      if (cur !== undefined) {
+        const keep = size - lastKeep * this.chunkSize;
+        const existing = await this.handleVersioned(id, lastKeep, cur, false);
+        if (existing && existing.getSize() > keep) {
+          // COW-first so the committed boundary version is untouched, then physically shorten
+          // the STAGED version so a later extend reads zeros in the gap.
+          const h = await this.cow(id, lastKeep, stagedGen);
+          h.truncate(keep);
+        }
       }
     }
   }
@@ -161,49 +210,72 @@ export class BlobStore {
   }
 
   /**
-   * Roll every chunk mutated this batch back to its committed bytes (or delete it, if it
-   * didn't exist at last commit). Best-effort per chunk — a pathological double-fault
-   * (e.g. disk full during the restore write itself) is swallowed so one bad chunk doesn't
-   * block the rest of the rollback. Never holds two live sync access handles on the same
-   * file: reuse the pooled handle when present, and only close a handle opened ad hoc here.
+   * Discard every chunk version staged this batch and revert `chunkVersion` to its pre-batch
+   * state. Committed versions were NEVER touched (COW wrote only to `<id>.<chunk>.<stagedGen>`),
+   * so there are no bytes to restore — just delete the staged-gen files (best-effort; a missing
+   * file, e.g. a chunk only ever dropped by truncate and never COW'd, is a harmless no-op) and
+   * revert the map.
    */
-  async rollbackContent(): Promise<void> {
-    for (const [key, bytes] of this.undo) {
+  async rollbackBatch(): Promise<void> {
+    const sg = this.stagedGen;
+    for (const [key, prevVersion] of this.staged) {
       try {
-        if (bytes === null) {
-          // chunk did not exist at last commit → remove it
-          const h = this.pool.peek(key);
+        if (sg !== null) {
+          const name = `${key}.${sg}`;
+          const h = this.pool.peek(name);
           if (h) { try { h.close(); } catch { /* already closed */ } }
-          this.pool.delete(key, false);
-          await this.blobDir.removeEntry(key).catch(() => {});
-        } else {
-          // restore committed content in place and make it durable
-          const fh = await this.blobDir.getFileHandle(key, { create: true });
-          const pooled = this.pool.peek(key) !== undefined;
-          const h = this.pool.peek(key) ?? (await fh.createSyncAccessHandle());
-          try {
-            h.truncate(bytes.byteLength);
-            if (bytes.byteLength > 0) h.write(bytes, { at: 0 });
-            h.flush();
-          } finally {
-            if (!pooled) h.close(); // never leak a handle we opened ad hoc
-          }
+          this.pool.delete(name, false);
+          await this.blobDir.removeEntry(name).catch(() => {});
         }
+        if (prevVersion === null) this.chunkVersion.delete(key);
+        else this.chunkVersion.set(key, prevVersion);
       } catch { /* pathological double-fault; best-effort */ }
     }
-    this.undo.clear();
+    this.staged.clear();
+    this.stagedGen = null;
   }
 
-  /** Discard undo snapshots after a durable commit — the mutated content is now committed. */
-  commitContent(): void {
-    this.undo.clear();
+  /** Discard staged-batch bookkeeping after a durable commit — the staged-gen files are now the committed versions. */
+  commitBatch(): void {
+    this.staged.clear();
+    this.stagedGen = null;
   }
 
-  async gc(liveIds: Set<string>): Promise<void> {
+  /**
+   * Scan `blobs/` and resolve, per chunk key "<id>.<idx>", the highest version `<= selectedGen`.
+   * Used both to build the live working-view map at open (`buildVersionMap`) and to resolve an
+   * arbitrary retained on-disk generation's view for union GC (`unionLiveChunkFiles` in worker.ts).
+   * Names with every version `> selectedGen` are ignored (orphans from a torn/crashed commit) —
+   * they simply resolve to no version for that view and are later reclaimed by GC.
+   */
+  async resolveGenerationVersions(selectedGen: number): Promise<Map<string, number>> {
+    const versions = new Map<string, number>();
     for await (const name of (this.blobDir as unknown as { keys(): AsyncIterableIterator<string> }).keys()) {
-      const dot = name.lastIndexOf(".");
-      const id = dot > 0 ? name.slice(0, dot) : name;
-      if (!liveIds.has(id)) {
+      const m = VERSIONED_NAME_RE.exec(name);
+      if (!m) continue;
+      const gen = Number(m[3]);
+      if (gen > selectedGen) continue;
+      const key = `${m[1]}.${m[2]}`;
+      const cur = versions.get(key);
+      if (cur === undefined || gen > cur) versions.set(key, gen);
+    }
+    return versions;
+  }
+
+  /** At open: resolve the working `chunkVersion` map from disk for the selected generation. */
+  async buildVersionMap(selectedGen: number): Promise<void> {
+    this.chunkVersion = await this.resolveGenerationVersions(selectedGen);
+  }
+
+  /** A read-only snapshot of the current in-session working-view chunk versions (for union GC). */
+  chunkVersionSnapshot(): ReadonlyMap<string, number> {
+    return new Map(this.chunkVersion);
+  }
+
+  /** Reclaim every physical chunk file whose FULL versioned name is not in `liveFiles`. */
+  async gc(liveFiles: Set<string>): Promise<void> {
+    for await (const name of (this.blobDir as unknown as { keys(): AsyncIterableIterator<string> }).keys()) {
+      if (!liveFiles.has(name)) {
         this.pool.delete(name, false);
         await this.blobDir.removeEntry(name).catch(() => {});
       }
