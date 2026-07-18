@@ -119,11 +119,13 @@ export class BlobStore {
       }
     }
     const staged = (await this.handleVersioned(id, idx, stagedGen, true))!;
-    if (srcBytes) {
-      // copy committed bytes forward so unmutated parts of the chunk survive
-      staged.truncate(srcBytes.byteLength);
-      staged.write(srcBytes, { at: 0 });
-    }
+    // Reset the staged version to exactly the committed source (or empty when there is none),
+    // ALWAYS — not just when srcBytes is non-null. `handleVersioned(create:true)` can reopen a
+    // file that lingered from a swallowed rollback `removeEntry`; without this truncate a reused
+    // version (especially a sparse/empty-source chunk) could leak stale bytes into a later
+    // partial write. truncate(0) on a fresh handle is a no-op.
+    staged.truncate(srcBytes ? srcBytes.byteLength : 0);
+    if (srcBytes) staged.write(srcBytes, { at: 0 }); // copy committed bytes forward so unmutated parts survive
     this.chunkVersion.set(key, stagedGen);
     return staged;
   }
