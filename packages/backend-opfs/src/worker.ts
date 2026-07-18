@@ -117,7 +117,11 @@ async function writeGeneration(): Promise<void> {
   try {
     maybeFault("slotWrite");
     h.truncate(0);
-    h.write(bytes, { at: 0 });
+    const n = h.write(bytes, { at: 0 });
+    // A short manifest write must fail the commit (caught below → slot invalidated → reopen
+    // falls back to the prior generation) rather than proceed to flush a truncated slot — it
+    // would also fail the checksum on reopen, but failing fast here is cleaner.
+    if (n < bytes.byteLength) throw new VfsError("EIO", slotName(target));
     maybeFault("slotFlush");   // test hook: fault AFTER the bytes have landed but at the durability barrier
     h.flush();
   } catch (e) {
@@ -258,8 +262,10 @@ const ops: Record<string, OpFn> = {
       currentSlot = sel.currentSlot;
       committedBytes = (currentSlot === "a" ? await readSlot("a") : await readSlot("b"))!;
       // Resolve the working chunk-version map from disk for the SELECTED generation (not on
-      // the EIO/empty-mount paths — EIO threw above, and a fresh empty mount has no chunks yet).
-      await blobs.buildVersionMap(generation);
+      // the EIO/empty-mount paths — EIO threw above, and a fresh empty mount has no chunks yet),
+      // size-gated to `mani` so a physically-retained-but-beyond-size tail chunk (e.g. from a
+      // shrink+flush, kept around for GC/fallback) cannot resurface in the working view.
+      await blobs.buildVersionMap(generation, mani);
     }
     // At open, working == loaded generation, but both slots still contribute to the
     // union live set (the other slot may hold a fallback generation) — see unionLiveChunkFiles().

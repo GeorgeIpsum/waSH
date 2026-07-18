@@ -300,4 +300,29 @@ describe("OpfsBackend durability + GC", () => {
     await be.flush();
     await be.close();
   });
+
+  it("shrink+reopen+extend reads zeros in the reclaimed gap — no truncated tail resurfacing (P1)", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name);
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    const N = 130000; // spans chunks 0 and 1 (CHUNK_SIZE 65536)
+    const payload = new Uint8Array(N);
+    for (let i = 0; i < N; i++) payload[i] = (i % 250) + 1; // non-zero so resurfacing is detectable
+    await be.write(f, 0, payload);
+    await be.flush();
+    await be.truncate(f, 5000); // drop chunk 1 + shrink chunk 0
+    await be.flush();
+    await be.close(); // committed at size 5000; old <f>.1.<gen> survives on disk for GC
+    // Reopen: the working map must NOT include the beyond-size chunk 1.
+    const be2 = await OpfsBackend.open(name);
+    const f2 = (await be2.lookup(await be2.root(), "f"))!.id;
+    await be2.truncate(f2, N); // extend back over the reclaimed region
+    const back = await be2.read(f2, 0, N);
+    expect(back.byteLength).toBe(N);
+    expect([...back.subarray(0, 5000)]).toEqual([...payload.subarray(0, 5000)]); // kept prefix
+    expect([...back.subarray(5000, N)]).toEqual(new Array(N - 5000).fill(0)); // reclaimed region reads ZEROS, not old bytes
+    await be2.close();
+  });
 });

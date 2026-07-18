@@ -1,5 +1,6 @@
 import { CHUNK_SIZE, VfsError } from "@wash/vfs";
 import { Lru } from "./lru.js";
+import type { Manifest } from "./manifest.js";
 
 /** Matches a versioned chunk filename "<inodeId>.<chunkIdx>.<gen>". Inode ids are ULIDs
  *  (no dots), so the greedy `(.+)` correctly backtracks to the last two dot-delimited,
@@ -125,7 +126,12 @@ export class BlobStore {
     // version (especially a sparse/empty-source chunk) could leak stale bytes into a later
     // partial write. truncate(0) on a fresh handle is a no-op.
     staged.truncate(srcBytes ? srcBytes.byteLength : 0);
-    if (srcBytes) staged.write(srcBytes, { at: 0 }); // copy committed bytes forward so unmutated parts survive
+    if (srcBytes) {
+      const n = staged.write(srcBytes, { at: 0 }); // copy committed bytes forward so unmutated parts survive
+      // A short copy-forward is an internal integrity failure (not caller-facing pressure like a
+      // partial content write) — the staged version would silently diverge from the committed one.
+      if (n < srcBytes.byteLength) throw new VfsError("EIO", key);
+    }
     this.chunkVersion.set(key, stagedGen);
     return staged;
   }
@@ -163,10 +169,15 @@ export class BlobStore {
       const from = Math.max(offset, chunkStart);
       const to = Math.min(end, chunkStart + this.chunkSize);
       const h = await this.cow(id, idx, stagedGen); // COW: write always targets the staged, mutable version
+      const slice = data.subarray(from - offset, to - offset);
       try {
         this.maybeFault("blobWrite"); // test-only: fail AFTER the chunk is staged, BEFORE the byte write
-        h.write(data.subarray(from - offset, to - offset), { at: from - chunkStart });
+        const n = h.write(slice, { at: from - chunkStart });
+        // A short (non-throwing) write under pressure must not be treated as success — it would
+        // let the worker commit a manifest size the blob doesn't actually back.
+        if (n < slice.byteLength) throw new VfsError("ENOSPC", id);
       } catch (e) {
+        if (e instanceof VfsError) throw e;
         if ((e as { name?: string }).name === "QuotaExceededError") throw new VfsError("ENOSPC", id);
         throw new VfsError("EBUSY", id);
       }
@@ -275,9 +286,29 @@ export class BlobStore {
     return versions;
   }
 
-  /** At open: resolve the working `chunkVersion` map from disk for the selected generation. */
-  async buildVersionMap(selectedGen: number): Promise<void> {
-    this.chunkVersion = await this.resolveGenerationVersions(selectedGen);
+  /**
+   * At open: resolve the working `chunkVersion` map from disk for the selected generation,
+   * SIZE-GATED to each file inode's current size in `manifest`. A chunk beyond an inode's size
+   * must NOT resurface in the working view even if a versioned file for it still exists on disk
+   * (e.g. a shrink+flush keeps the old physical tail chunk around for GC/fallback) — otherwise a
+   * later extend or sparse write would COW those stale bytes into what should read as a
+   * zero-filled gap, resurrecting truncated-away data. This only narrows the WORKING map; GC's
+   * union-live-set computation (`unionLiveChunkFiles`/`resolveGenerationVersions`) is unaffected
+   * and still keeps a fallback generation's in-its-size chunks live independently.
+   */
+  async buildVersionMap(selectedGen: number, manifest: Manifest): Promise<void> {
+    const available = await this.resolveGenerationVersions(selectedGen);
+    const map = new Map<string, number>();
+    for (const [id, rec] of Object.entries(manifest.inodes)) {
+      if (rec.kind !== "file") continue;
+      const chunkCount = rec.size === 0 ? 0 : Math.ceil(rec.size / this.chunkSize);
+      for (let chunk = 0; chunk < chunkCount; chunk++) {
+        const key = `${id}.${chunk}`;
+        const v = available.get(key);
+        if (v !== undefined) map.set(key, v);
+      }
+    }
+    this.chunkVersion = map;
   }
 
   /** A read-only snapshot of the current in-session working-view chunk versions (for union GC). */
