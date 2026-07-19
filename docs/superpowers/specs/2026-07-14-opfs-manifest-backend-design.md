@@ -120,6 +120,9 @@ interface InodeRecord {
   ctimeMs: number;
   nlink: number;
   target?: string;              // symlinks only
+  holes?: Array<[number, number]>; // files only; range-encoded, sorted, non-overlapping,
+                                    // half-open [startChunk, endChunkExclusive) all-zero
+                                    // chunk ranges; OMITTED when empty (P1 deep, below)
 }
 
 interface Manifest {
@@ -131,6 +134,30 @@ interface Manifest {
   dirents: Record<NodeId /*parentId*/, Record<string /*name*/, { id: NodeId; kind: NodeKind }>>;
 }
 ```
+
+**`InodeRecord.holes` — per-file HOLES, authoritative for zeros (P1 deep fix).**
+§2 already establishes that a chunk WITH content resolves correctly as "the highest
+on-disk version ≤ the selected generation" (nothing writes a chunk after its last
+write). What that scan cannot tell, on its own, is whether an in-range chunk with NO
+live version is *genuinely sparse* or is a *truncated-away chunk whose stale pre-truncate
+version still lingers on disk* (kept around for GC/fallback, §3.3) — after a
+shrink→reopen→extend→reopen sequence, the naive "guess from disk+size" reader resolves
+such a chunk to its stale version and resurfaces old bytes instead of zeros. `holes`
+closes this: it is the exact, range-encoded set of chunk indices `C ∈ [0,
+ceil(size/chunkSize))` whose content is entirely zero (never-written OR
+truncated-away). The reader's rule is now unconditional: chunk `C` in-range and
+`C ∈ holes` → **return zeros, never resolve or read any on-disk version, no matter
+what a disk scan would suggest**; chunk `C` in-range and `C ∉ holes` → resolve+read its
+version as before (§2's rule still holds for non-hole chunks). Holes are maintained
+exactly by the worker on every content op: `write` removes the touched chunk range from
+`holes` (it now has content) and, if the write starts past the old EOF, adds the
+newly-sparse gap `[oldChunkCount, firstTouchedChunk)` as new holes; `truncate`-shrink
+clamps `holes` to drop/trim ranges `>=` the new chunk count (the shrunk boundary chunk
+itself stays non-hole — its intra-chunk tail already reads as zeros via short-read);
+`truncate`-extend adds the newly-in-range chunks `[oldChunkCount, newChunkCount)` as
+holes. `holes` is OMITTED (not an empty array) when a file has no holes, so a normal
+contiguous file adds zero manifest bytes. It is part of the JSON body and covered by the
+existing checksum discipline like every other inode field.
 
 The serialized form places `checksum` such that a truncated write cannot yield a
 byte sequence that both parses AND validates (e.g. checksum is computed over the
@@ -230,12 +257,21 @@ mutations:
 > **GC invariant:** a physical file `<id>.<chunk>.<v>` is collectible **iff**, for
 > EVERY retained view (the working manifest, on-disk generation A, on-disk generation
 > B), it is either not the version that view resolves for `(id, chunk)`, or `chunk` is
-> outside that inode's size in that view. Equivalently: the live set is the union, over
+> outside that inode's size in that view, **or `chunk` is a HOLE in that view's own
+> `InodeRecord.holes`** (P1 deep). Equivalently: the live set is the union, over
 > every retained view, of each view's resolved chunk-version FILE for every file
-> inode's chunks within that view's size — computed per view by parsing its manifest,
-> then for each file inode and each `chunk` in `0 .. ceil(size/chunkSize)-1`, resolving
+> inode's chunks within that view's size AND NOT a hole in that view — computed per view
+> by parsing its manifest, then for each file inode and each `chunk` in `0 ..
+> ceil(size/chunkSize)-1` that is not in that view's own `holes`, resolving
 > the highest `<id>.<chunk>.<v>` with `v <= thatView'sGeneration` (the working view uses
 > the in-memory `generation`). Reclaim every `blobs/*` file not in the union.
+
+A hole chunk references no live chunk file by definition (its content is authoritatively
+zero — §3 above), so it contributes nothing to the union regardless of what version a raw
+disk scan would otherwise resolve for it. This is what reclaims a truncated-then-re-holed
+chunk's stale version: once every retained view marks that chunk as a hole (or out of
+size), no view's resolved-version set references the stale file any longer and it becomes
+collectible — exactly the case the multi-reopen regression test exercises.
 
 This supersedes the earlier id-only union rule: GC now also reclaims **superseded chunk
 versions** once no retained generation resolves to them, not just whole abandoned

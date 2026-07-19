@@ -1,6 +1,6 @@
 import { CHUNK_SIZE, VfsError } from "@wash/vfs";
 import { Lru } from "./lru.js";
-import type { Manifest } from "./manifest.js";
+import { holesHas, type Manifest } from "./manifest.js";
 
 /** Matches a versioned chunk filename "<inodeId>.<chunkIdx>.<gen>". Inode ids are ULIDs
  *  (no dots), so the greedy `(.+)` correctly backtracks to the last two dot-delimited,
@@ -136,13 +136,26 @@ export class BlobStore {
     return staged;
   }
 
-  async read(id: string, offset: number, length: number, size: number): Promise<Uint8Array> {
+  /**
+   * `isHole(chunk)` must be AUTHORITATIVE: a hole chunk is returned as zeros
+   * unconditionally, never resolved to (or read from) any on-disk version — even if
+   * one lingers on disk (e.g. a truncated-then-re-extended chunk whose stale
+   * pre-truncate version was never deleted, only orphaned for GC/fallback). This is
+   * what closes the multi-reopen truncated-tail resurfacing bug class: the manifest's
+   * `holes` is authoritative, so the reader never guesses a chunk's content from
+   * disk+size.
+   */
+  async read(
+    id: string, offset: number, length: number, size: number,
+    isHole: (chunk: number) => boolean,
+  ): Promise<Uint8Array> {
     if (offset >= size || length === 0) return new Uint8Array(0);
     const end = Math.min(offset + length, size);
     const out = new Uint8Array(end - offset); // zero-initialized: sparse/absent chunks read as zeros
     const first = Math.floor(offset / this.chunkSize);
     const last = Math.floor((end - 1) / this.chunkSize);
     for (let idx = first; idx <= last; idx++) {
+      if (isHole(idx)) continue; // authoritative zeros: never resolve/read a version for a hole chunk
       const v = this.chunkVersion.get(this.key(id, idx));
       if (v === undefined) continue; // sparse: no version resolves for this chunk
       const h = await this.handleVersioned(id, idx, v, false);
@@ -288,13 +301,18 @@ export class BlobStore {
 
   /**
    * At open: resolve the working `chunkVersion` map from disk for the selected generation,
-   * SIZE-GATED to each file inode's current size in `manifest`. A chunk beyond an inode's size
-   * must NOT resurface in the working view even if a versioned file for it still exists on disk
-   * (e.g. a shrink+flush keeps the old physical tail chunk around for GC/fallback) — otherwise a
-   * later extend or sparse write would COW those stale bytes into what should read as a
-   * zero-filled gap, resurrecting truncated-away data. This only narrows the WORKING map; GC's
-   * union-live-set computation (`unionLiveChunkFiles`/`resolveGenerationVersions`) is unaffected
-   * and still keeps a fallback generation's in-its-size chunks live independently.
+   * gated to each file inode's current size AND its `holes` in `manifest`. A chunk beyond an
+   * inode's size, OR a chunk marked as a hole, must NOT resurface a version in the working view
+   * even if a versioned file for it still exists on disk (e.g. a shrink+flush keeps the old
+   * physical tail chunk around for GC/fallback) — otherwise a later write into that chunk would
+   * COW those stale bytes forward via `cow()`'s "copy the committed source bytes" path instead of
+   * starting fresh from an empty (zero) chunk, resurrecting truncated-away data into what should
+   * read as zeros for the chunk's untouched portion. `holes` is authoritative for `read()`
+   * (§ read above), but `chunkVersion` must independently stay clean of hole chunks too, or a
+   * subsequent COW would silently reintroduce the same resurfacing bug via the write path. This
+   * only narrows the WORKING map; GC's union-live-set computation
+   * (`unionLiveChunkFiles`/`resolveGenerationVersions`) is unaffected and still keeps a fallback
+   * generation's in-its-size, non-hole chunks live independently.
    */
   async buildVersionMap(selectedGen: number, manifest: Manifest): Promise<void> {
     const available = await this.resolveGenerationVersions(selectedGen);
@@ -302,7 +320,9 @@ export class BlobStore {
     for (const [id, rec] of Object.entries(manifest.inodes)) {
       if (rec.kind !== "file") continue;
       const chunkCount = rec.size === 0 ? 0 : Math.ceil(rec.size / this.chunkSize);
+      const holes = rec.holes ?? [];
       for (let chunk = 0; chunk < chunkCount; chunk++) {
+        if (holesHas(holes, chunk)) continue; // hole: never resolve a version into the working view
         const key = `${id}.${chunk}`;
         const v = available.get(key);
         if (v !== undefined) map.set(key, v);

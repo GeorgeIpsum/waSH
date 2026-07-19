@@ -8,6 +8,16 @@ export interface InodeRecord {
   ctimeMs: number;
   nlink: number;
   target?: string;
+  /**
+   * Range-encoded, sorted, non-overlapping, half-open [startChunk, endChunkExclusive)
+   * ranges of chunk indices that are all-zero HOLES (never-written or truncated-away).
+   * Authoritative: the reader returns zeros for a hole chunk and NEVER guesses its
+   * content from a lingering on-disk version (closes the truncated-tail resurfacing
+   * bug class — see holesHas/holesAdd/holesRemove/holesClamp below). Omitted (not an
+   * empty array) when the file has no holes, so a normal contiguous file adds zero
+   * manifest bytes.
+   */
+  holes?: Array<[number, number]>;
 }
 
 export interface Manifest {
@@ -92,4 +102,83 @@ export function emptyManifest(rootId: NodeId): Manifest {
 
 export function liveIds(m: Manifest): Set<NodeId> {
   return new Set(Object.keys(m.inodes));
+}
+
+// ---- Pure interval helpers over holes ranges: sorted, non-overlapping, half-open
+// [start, end) chunk-index ranges. These gate correctness (a hole chunk is
+// authoritative for zeros — see InodeRecord.holes), so they are exact and
+// thoroughly Node-unit-tested rather than approximated. ----
+
+/** Is chunk index `idx` inside any range? Ranges are sorted ascending by start, so
+ *  scanning can stop as soon as a range starts after `idx`. */
+export function holesHas(ranges: ReadonlyArray<[number, number]>, idx: number): boolean {
+  for (const [start, end] of ranges) {
+    if (idx < start) return false;
+    if (idx < end) return true;
+  }
+  return false;
+}
+
+/** Union `[start, end)` into `ranges`, merging adjacent (touching) or overlapping
+ *  ranges. Returns a new normalized (sorted, non-overlapping) list; `ranges` is untouched. */
+export function holesAdd(
+  ranges: ReadonlyArray<[number, number]>,
+  start: number,
+  end: number,
+): Array<[number, number]> {
+  if (start >= end) return ranges.map(([s, e]): [number, number] => [s, e]);
+  const out: Array<[number, number]> = [];
+  let s = start;
+  let e = end;
+  let i = 0;
+  const n = ranges.length;
+  // Ranges strictly before the new one (a real gap, not touching) pass through unchanged.
+  while (i < n && ranges[i]![1] < s) {
+    out.push(ranges[i]!);
+    i++;
+  }
+  // Ranges overlapping OR touching (`start <= e`) the growing union get absorbed.
+  while (i < n && ranges[i]![0] <= e) {
+    s = Math.min(s, ranges[i]![0]);
+    e = Math.max(e, ranges[i]![1]);
+    i++;
+  }
+  out.push([s, e]);
+  while (i < n) {
+    out.push(ranges[i]!);
+    i++;
+  }
+  return out;
+}
+
+/** Subtract `[start, end)` from `ranges`, splitting any range that straddles a
+ *  boundary. Returns a new normalized list; `ranges` is untouched. */
+export function holesRemove(
+  ranges: ReadonlyArray<[number, number]>,
+  start: number,
+  end: number,
+): Array<[number, number]> {
+  if (start >= end) return ranges.map(([s, e]): [number, number] => [s, e]);
+  const out: Array<[number, number]> = [];
+  for (const [s, e] of ranges) {
+    if (e <= start || s >= end) {
+      out.push([s, e]); // no overlap
+      continue;
+    }
+    if (s < start) out.push([s, start]); // left remainder
+    if (e > end) out.push([end, e]); // right remainder
+  }
+  return out;
+}
+
+/** Drop/trim everything `>= count` (used on shrink so out-of-range chunks are not
+ *  holes). Returns a new normalized list; `ranges` is untouched. */
+export function holesClamp(ranges: ReadonlyArray<[number, number]>, count: number): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  for (const [s, e] of ranges) {
+    if (s >= count) continue; // entirely out of range: dropped
+    if (e <= count) { out.push([s, e]); continue; } // entirely in range: kept
+    out.push([s, count]); // straddles the boundary: trimmed
+  }
+  return out;
 }

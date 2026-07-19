@@ -5,6 +5,7 @@ import type { RpcRequest, RpcResponse } from "./rpc.js";
 import {
   type Manifest, type InodeRecord,
   serializeManifest, parseManifest, selectGeneration, emptyManifest,
+  holesHas, holesAdd, holesRemove, holesClamp,
 } from "./manifest.js";
 import { BlobStore } from "./blobs.js";
 
@@ -87,6 +88,18 @@ function defaultMode(kind: NodeKind): number {
 }
 function attrsOf(rec: InodeRecord): Attrs {
   return { kind: rec.kind, size: rec.size, mode: rec.mode, mtimeMs: rec.mtimeMs, ctimeMs: rec.ctimeMs, nlink: rec.nlink };
+}
+
+/** Number of chunks a file of `size` bytes spans (0 for an empty file). */
+function chunkCountOf(size: number): number {
+  return size === 0 ? 0 : Math.ceil(size / CHUNK_SIZE);
+}
+/** Normalize `rec.holes`: DELETE the key when the range list becomes empty (§1 of the
+ *  holes brief — omitted, not `holes: []`, so a normal contiguous file adds zero
+ *  manifest bytes), otherwise set it to the new normalized ranges. */
+function setHoles(rec: InodeRecord, ranges: Array<[number, number]>): void {
+  if (ranges.length === 0) delete rec.holes;
+  else rec.holes = ranges;
 }
 
 /** Read both manifest slots as raw bytes (null if absent/unreadable). */
@@ -206,12 +219,17 @@ async function unionLiveChunkFiles(): Promise<Set<string>> {
 }
 
 /** Add, for every file inode in `m` whose chunk resolves a version in `versions`, that chunk's
- *  FULL versioned filename to `live`. Chunks beyond an inode's size are size-gated out. */
+ *  FULL versioned filename to `live`. Chunks beyond an inode's size are size-gated out; chunks
+ *  that are HOLES per THIS view's own `rec.holes` (P1 deep) reference no live file and are
+ *  skipped too — a hole chunk's stale on-disk version becomes collectible once no retained
+ *  view marks it non-hole within size. */
 function addLiveChunkFiles(live: Set<string>, versions: ReadonlyMap<string, number>, m: Manifest): void {
   for (const [id, rec] of Object.entries(m.inodes)) {
     if (rec.kind !== "file") continue;
     const chunkCount = Math.ceil(rec.size / blobs.chunkSize);
+    const holes = rec.holes ?? [];
     for (let idx = 0; idx < chunkCount; idx++) {
+      if (holesHas(holes, idx)) continue; // hole: references no live chunk file in this view
       const key = `${id}.${idx}`;
       const v = versions.get(key);
       if (v !== undefined) live.add(`${key}.${v}`);
@@ -363,7 +381,8 @@ const ops: Record<string, OpFn> = {
 
   async read(id: NodeId, offset: number, length: number): Promise<OpResult> {
     const rec = requireFile(id);
-    return { value: await blobs.read(id, offset, length, rec.size) };
+    const isHole = (chunk: number): boolean => holesHas(rec.holes ?? [], chunk);
+    return { value: await blobs.read(id, offset, length, rec.size, isHole) };
   },
 
   async write(id: NodeId, offset: number, data: Uint8Array | ArrayBuffer): Promise<OpResult> {
@@ -372,6 +391,7 @@ const ops: Record<string, OpFn> = {
     // BlobStore.write calls .subarray(...) on it, which ArrayBuffer lacks — wrap first.
     const bytes = data instanceof Uint8Array ? data : new Uint8Array(data as ArrayBuffer);
     if (bytes.byteLength === 0) return { value: undefined }; // POSIX no-op
+    const oldSize = rec.size;
     // generation is constant within a batch (advances only on a successful commit), so
     // generation + 1 is a stable staged-gen for every content op in this batch.
     try {
@@ -383,20 +403,42 @@ const ops: Record<string, OpFn> = {
     const end = offset + bytes.byteLength;
     if (end > rec.size) rec.size = end;
     rec.mtimeMs = Date.now();
+    // holes maintenance (P1 deep — holes brief §2 `write`): touched chunks now have content;
+    // a sparse gap opened up by writing past the old EOF becomes new all-zero holes. No chunk
+    // above the write's last touched chunk is newly in-range here — `newCount - 1 === lastT`
+    // whenever this write grows the file (end defines newSize), so nothing else needs adding.
+    const oldCount = chunkCountOf(oldSize);
+    const firstT = Math.floor(offset / CHUNK_SIZE);
+    const lastT = Math.floor((end - 1) / CHUNK_SIZE);
+    let holes = rec.holes ?? [];
+    holes = holesRemove(holes, firstT, lastT + 1);
+    if (offset > oldSize) holes = holesAdd(holes, oldCount, firstT);
+    setHoles(rec, holes);
     dirty = true;
     return { value: undefined };
   },
 
   async truncate(id: NodeId, size: number): Promise<OpResult> {
     const rec = requireFile(id);
+    const oldSize = rec.size;
     try {
-      await blobs.truncate(id, size, rec.size, generation + 1);
+      await blobs.truncate(id, size, oldSize, generation + 1);
     } catch (e) {
       await rollbackToCommitted(); // abort the whole batch: discard staged chunks + revert manifest to last-committed
       throw e;
     }
     rec.size = size;
     rec.mtimeMs = Date.now();
+    // holes maintenance (P1 deep — holes brief §2 `truncate`): shrink clamps out-of-range
+    // chunks out of holes (the boundary chunk stays content via the cow-shorten in blobs.ts);
+    // extend opens the newly-in-range chunks as new all-zero holes (the old boundary chunk's
+    // intra-chunk tail already reads as zeros via short-read, so it is NOT itself a new hole).
+    const oldCount = chunkCountOf(oldSize);
+    const newCount = chunkCountOf(size);
+    let holes = rec.holes ?? [];
+    if (size < oldSize) holes = holesClamp(holes, newCount);
+    else if (size > oldSize) holes = holesAdd(holes, oldCount, newCount);
+    setHoles(rec, holes);
     dirty = true;
     return { value: undefined };
   },

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   fnv1a, serializeManifest, parseManifest, selectGeneration, emptyManifest, liveIds,
+  holesHas, holesAdd, holesRemove, holesClamp,
   type Manifest,
 } from "../../src/manifest.js";
 
@@ -72,5 +73,181 @@ describe("manifest core", () => {
     expect(m.inodes.ROOT.kind).toBe("dir");
     expect(m.dirents).toEqual({});
     expect(liveIds(sample())).toEqual(new Set(["R", "F", "L"]));
+  });
+});
+
+describe("holes interval helpers (P1 deep — pure, gate correctness)", () => {
+  describe("holesHas", () => {
+    it("empty ranges: nothing is a hole", () => {
+      expect(holesHas([], 0)).toBe(false);
+      expect(holesHas([], 5)).toBe(false);
+    });
+
+    it("single range: inside/at-boundaries/outside", () => {
+      const r: Array<[number, number]> = [[3, 6]];
+      expect(holesHas(r, 2)).toBe(false);
+      expect(holesHas(r, 3)).toBe(true); // start inclusive
+      expect(holesHas(r, 5)).toBe(true);
+      expect(holesHas(r, 6)).toBe(false); // end exclusive
+      expect(holesHas(r, 100)).toBe(false);
+    });
+
+    it("multiple ranges: gaps between them are not holes", () => {
+      const r: Array<[number, number]> = [[0, 2], [5, 8], [10, 11]];
+      expect(holesHas(r, 0)).toBe(true);
+      expect(holesHas(r, 1)).toBe(true);
+      expect(holesHas(r, 2)).toBe(false);
+      expect(holesHas(r, 4)).toBe(false);
+      expect(holesHas(r, 5)).toBe(true);
+      expect(holesHas(r, 7)).toBe(true);
+      expect(holesHas(r, 8)).toBe(false);
+      expect(holesHas(r, 10)).toBe(true);
+      expect(holesHas(r, 11)).toBe(false);
+      expect(holesHas(r, 50)).toBe(false);
+    });
+  });
+
+  describe("holesAdd", () => {
+    it("into empty ranges", () => {
+      expect(holesAdd([], 3, 7)).toEqual([[3, 7]]);
+    });
+
+    it("no-op for an empty/inverted interval", () => {
+      expect(holesAdd([[1, 2]], 5, 5)).toEqual([[1, 2]]);
+      expect(holesAdd([[1, 2]], 6, 4)).toEqual([[1, 2]]);
+    });
+
+    it("merges adjacent (touching) ranges into one", () => {
+      expect(holesAdd([[0, 3]], 3, 6)).toEqual([[0, 6]]); // touches from the right
+      expect(holesAdd([[3, 6]], 0, 3)).toEqual([[0, 6]]); // touches from the left
+    });
+
+    it("merges overlapping ranges", () => {
+      expect(holesAdd([[0, 5]], 3, 8)).toEqual([[0, 8]]);
+      expect(holesAdd([[3, 8]], 0, 5)).toEqual([[0, 8]]);
+      expect(holesAdd([[0, 10]], 3, 6)).toEqual([[0, 10]]); // fully contained: no-op shape
+    });
+
+    it("bridges multiple existing ranges into one merged range", () => {
+      expect(holesAdd([[0, 2], [5, 8], [10, 12]], 1, 11)).toEqual([[0, 12]]);
+    });
+
+    it("leaves disjoint (non-adjacent, non-overlapping) ranges untouched", () => {
+      expect(holesAdd([[0, 2], [10, 12]], 4, 6)).toEqual([[0, 2], [4, 6], [10, 12]]);
+    });
+
+    it("does not mutate the input array", () => {
+      const input: Array<[number, number]> = [[0, 2]];
+      const out = holesAdd(input, 5, 7);
+      expect(input).toEqual([[0, 2]]);
+      expect(out).toEqual([[0, 2], [5, 7]]);
+    });
+
+    it("is idempotent", () => {
+      const once = holesAdd([[0, 2], [5, 8]], 2, 5);
+      const twice = holesAdd(once, 2, 5);
+      expect(twice).toEqual(once);
+      expect(once).toEqual([[0, 8]]);
+    });
+  });
+
+  describe("holesRemove", () => {
+    it("from empty ranges is a no-op", () => {
+      expect(holesRemove([], 2, 5)).toEqual([]);
+    });
+
+    it("no-op for an empty/inverted interval", () => {
+      expect(holesRemove([[1, 5]], 3, 3)).toEqual([[1, 5]]);
+      expect(holesRemove([[1, 5]], 4, 2)).toEqual([[1, 5]]);
+    });
+
+    it("removes a range entirely", () => {
+      expect(holesRemove([[3, 6]], 3, 6)).toEqual([]);
+      expect(holesRemove([[3, 6]], 0, 10)).toEqual([]);
+    });
+
+    it("splits a range in the middle", () => {
+      expect(holesRemove([[0, 10]], 3, 6)).toEqual([[0, 3], [6, 10]]);
+    });
+
+    it("trims from the left / right without splitting", () => {
+      expect(holesRemove([[0, 10]], 0, 4)).toEqual([[4, 10]]);
+      expect(holesRemove([[0, 10]], 7, 10)).toEqual([[0, 7]]);
+    });
+
+    it("removes a span covering (and trimming) multiple ranges", () => {
+      expect(holesRemove([[0, 2], [3, 6], [8, 12]], 1, 10)).toEqual([[0, 1], [10, 12]]);
+    });
+
+    it("leaves ranges outside the removed span untouched", () => {
+      expect(holesRemove([[0, 2], [10, 12]], 4, 6)).toEqual([[0, 2], [10, 12]]);
+    });
+
+    it("does not mutate the input array", () => {
+      const input: Array<[number, number]> = [[0, 10]];
+      const out = holesRemove(input, 3, 6);
+      expect(input).toEqual([[0, 10]]);
+      expect(out).toEqual([[0, 3], [6, 10]]);
+    });
+
+    it("is idempotent", () => {
+      const once = holesRemove([[0, 10]], 3, 6);
+      const twice = holesRemove(once, 3, 6);
+      expect(twice).toEqual(once);
+    });
+  });
+
+  describe("holesClamp", () => {
+    it("empty ranges stay empty", () => {
+      expect(holesClamp([], 5)).toEqual([]);
+    });
+
+    it("drops ranges entirely beyond the clamp count", () => {
+      expect(holesClamp([[5, 8]], 5)).toEqual([]);
+      expect(holesClamp([[5, 8]], 3)).toEqual([]);
+    });
+
+    it("keeps ranges entirely within the clamp count untouched", () => {
+      expect(holesClamp([[0, 3]], 5)).toEqual([[0, 3]]);
+    });
+
+    it("trims a range straddling the clamp boundary (mid-range clamp)", () => {
+      expect(holesClamp([[0, 8]], 5)).toEqual([[0, 5]]);
+    });
+
+    it("clamp count 0 drops everything", () => {
+      expect(holesClamp([[0, 3], [5, 8]], 0)).toEqual([]);
+    });
+
+    it("handles a mix: kept, trimmed, and dropped ranges together", () => {
+      expect(holesClamp([[0, 2], [3, 8], [10, 15]], 5)).toEqual([[0, 2], [3, 5]]);
+    });
+
+    it("does not mutate the input array", () => {
+      const input: Array<[number, number]> = [[0, 8]];
+      const out = holesClamp(input, 5);
+      expect(input).toEqual([[0, 8]]);
+      expect(out).toEqual([[0, 5]]);
+    });
+
+    it("is idempotent", () => {
+      const once = holesClamp([[0, 8]], 5);
+      const twice = holesClamp(once, 5);
+      expect(twice).toEqual(once);
+    });
+  });
+
+  it("round-trips through add→remove→clamp for a representative scenario", () => {
+    // Simulates: write chunks 2..5 leaves a sparse gap 0..2, then a shrink to count 4
+    // clamps chunk 4 out, then chunk 3 gets written (removed from holes).
+    let holes: Array<[number, number]> = [];
+    holes = holesAdd(holes, 0, 2); // sparse gap chunks 0,1
+    expect(holes).toEqual([[0, 2]]);
+    holes = holesClamp(holes, 4); // shrink to 4 chunks: gap untouched (fully < 4)
+    expect(holes).toEqual([[0, 2]]);
+    holes = holesRemove(holes, 1, 2); // chunk 1 gets written
+    expect(holes).toEqual([[0, 1]]);
+    expect(holesHas(holes, 0)).toBe(true);
+    expect(holesHas(holes, 1)).toBe(false);
   });
 });

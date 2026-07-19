@@ -301,28 +301,106 @@ describe("OpfsBackend durability + GC", () => {
     await be.close();
   });
 
-  it("shrink+reopen+extend reads zeros in the reclaimed gap — no truncated tail resurfacing (P1)", async () => {
+  it("truncated tail never resurfaces across shrink→reopen→extend→reopen (P1 deep)", async () => {
     const name = testRoot();
     const be = await OpfsBackend.open(name);
     const root = await be.root();
     const f = ulid();
     await be.create(root, "f", f, "file");
-    const N = 130000; // spans chunks 0 and 1 (CHUNK_SIZE 65536)
+    const N = 130000; // chunks 0 and 1 (CHUNK_SIZE 65536)
     const payload = new Uint8Array(N);
-    for (let i = 0; i < N; i++) payload[i] = (i % 250) + 1; // non-zero so resurfacing is detectable
+    for (let i = 0; i < N; i++) payload[i] = (i % 250) + 1; // non-zero → resurfacing detectable
     await be.write(f, 0, payload);
     await be.flush();
-    await be.truncate(f, 5000); // drop chunk 1 + shrink chunk 0
+    await be.truncate(f, 5000);
     await be.flush();
-    await be.close(); // committed at size 5000; old <f>.1.<gen> survives on disk for GC
-    // Reopen: the working map must NOT include the beyond-size chunk 1.
+    await be.close();
+    // reopen #1: extend back over the reclaimed region WITHOUT rewriting it
     const be2 = await OpfsBackend.open(name);
     const f2 = (await be2.lookup(await be2.root(), "f"))!.id;
-    await be2.truncate(f2, N); // extend back over the reclaimed region
-    const back = await be2.read(f2, 0, N);
-    expect(back.byteLength).toBe(N);
-    expect([...back.subarray(0, 5000)]).toEqual([...payload.subarray(0, 5000)]); // kept prefix
-    expect([...back.subarray(5000, N)]).toEqual(new Array(N - 5000).fill(0)); // reclaimed region reads ZEROS, not old bytes
+    await be2.truncate(f2, N);
+    await be2.flush();
     await be2.close();
+    // reopen #2: the reclaimed region MUST read zeros (manifest records chunk 1 as a hole)
+    const be3 = await OpfsBackend.open(name);
+    const f3 = (await be3.lookup(await be3.root(), "f"))!.id;
+    const back = await be3.read(f3, 0, N);
+    expect([...back.subarray(0, 5000)]).toEqual([...payload.subarray(0, 5000)]);
+    expect([...back.subarray(5000, N)]).toEqual(new Array(N - 5000).fill(0)); // NOT the old bytes
+    await be3.close();
+  });
+
+  it("a sparse write leaves the skipped gap as zeros across reopen", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name);
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("head"));
+    await be.write(f, 130000, enc.encode("tail")); // gap chunk 1 is a hole
+    await be.flush();
+    await be.close();
+    const be2 = await OpfsBackend.open(name);
+    const f2 = (await be2.lookup(await be2.root(), "f"))!.id;
+    const out = await be2.read(f2, 0, 130004);
+    expect(dec.decode(out.subarray(0, 4))).toBe("head");
+    expect([...out.subarray(65536, 130000)]).toEqual(new Array(130000 - 65536).fill(0));
+    expect(dec.decode(out.subarray(130000, 130004))).toBe("tail");
+    await be2.close();
+  });
+
+  it("a write into a reclaimed hole chunk after reopen never COWs forward stale bytes (P1 deep, write path)", async () => {
+    // Companion to the read-path regression above: after shrink→reopen→extend→reopen, the
+    // reclaimed chunk is a hole with a stale on-disk version still lingering (kept for GC/
+    // fallback). A *partial* write into that chunk must start the chunk fresh (all zeros)
+    // and only place the new bytes — it must NOT resolve/COW-forward the stale on-disk
+    // version's bytes into the untouched portion of the chunk. This exercises
+    // `BlobStore.buildVersionMap`'s hole-gating of the working `chunkVersion` map, not just
+    // `read()`'s hole gate.
+    const name = testRoot();
+    const be = await OpfsBackend.open(name);
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    const N = 130000; // chunks 0 and 1 (CHUNK_SIZE 65536)
+    const payload = new Uint8Array(N);
+    for (let i = 0; i < N; i++) payload[i] = (i % 250) + 1; // non-zero → resurfacing detectable
+    await be.write(f, 0, payload);
+    await be.flush();
+    await be.truncate(f, 5000); // drop chunk 1 (stale version lingers on disk for GC)
+    await be.flush();
+    await be.close();
+    // reopen: extend back over the reclaimed region without rewriting it, then commit
+    const be2 = await OpfsBackend.open(name);
+    const f2 = (await be2.lookup(await be2.root(), "f"))!.id;
+    await be2.truncate(f2, N);
+    await be2.flush();
+    await be2.close();
+    // reopen again: chunk 1 is a hole with a stale on-disk version still present. Write a few
+    // bytes into the MIDDLE of chunk 1 (not the start) — the untouched rest of the chunk must
+    // read zeros, not the stale pre-truncate payload.
+    const be3 = await OpfsBackend.open(name);
+    const f3 = (await be3.lookup(await be3.root(), "f"))!.id;
+    const patch = enc.encode("PATCH");
+    const patchOffset = 65536 + 100; // well inside chunk 1
+    await be3.write(f3, patchOffset, patch);
+    const back = await be3.read(f3, 0, N);
+    expect([...back.subarray(0, 5000)]).toEqual([...payload.subarray(0, 5000)]); // kept prefix intact
+    expect([...back.subarray(5000, patchOffset)]).toEqual(new Array(patchOffset - 5000).fill(0)); // hole, still zero
+    expect(dec.decode(back.subarray(patchOffset, patchOffset + patch.byteLength))).toBe("PATCH"); // the new bytes
+    expect([...back.subarray(patchOffset + patch.byteLength, N)]).toEqual(
+      new Array(N - (patchOffset + patch.byteLength)).fill(0),
+    ); // rest of the chunk: zero, NOT the stale pre-truncate bytes
+    await be3.flush();
+    await be3.close();
+    // survives a further reopen too
+    const be4 = await OpfsBackend.open(name);
+    const f4 = (await be4.lookup(await be4.root(), "f"))!.id;
+    const back2 = await be4.read(f4, 0, N);
+    expect(dec.decode(back2.subarray(patchOffset, patchOffset + patch.byteLength))).toBe("PATCH");
+    expect([...back2.subarray(patchOffset + patch.byteLength, N)]).toEqual(
+      new Array(N - (patchOffset + patch.byteLength)).fill(0),
+    );
+    await be4.close();
   });
 });
