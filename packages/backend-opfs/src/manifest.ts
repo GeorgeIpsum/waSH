@@ -133,8 +133,9 @@ export function holesAdd(
   let i = 0;
   const n = ranges.length;
   // Ranges strictly before the new one (a real gap, not touching) pass through unchanged.
+  // Push COPIES, never the input tuples, so a returned range can never alias `ranges`.
   while (i < n && ranges[i]![1] < s) {
-    out.push(ranges[i]!);
+    out.push([ranges[i]![0], ranges[i]![1]]);
     i++;
   }
   // Ranges overlapping OR touching (`start <= e`) the growing union get absorbed.
@@ -145,7 +146,7 @@ export function holesAdd(
   }
   out.push([s, e]);
   while (i < n) {
-    out.push(ranges[i]!);
+    out.push([ranges[i]![0], ranges[i]![1]]);
     i++;
   }
   return out;
