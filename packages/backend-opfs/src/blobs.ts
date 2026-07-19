@@ -120,17 +120,27 @@ export class BlobStore {
       }
     }
     const staged = (await this.handleVersioned(id, idx, stagedGen, true))!;
-    // Reset the staged version to exactly the committed source (or empty when there is none),
-    // ALWAYS — not just when srcBytes is non-null. `handleVersioned(create:true)` can reopen a
-    // file that lingered from a swallowed rollback `removeEntry`; without this truncate a reused
-    // version (especially a sparse/empty-source chunk) could leak stale bytes into a later
-    // partial write. truncate(0) on a fresh handle is a no-op.
-    staged.truncate(srcBytes ? srcBytes.byteLength : 0);
-    if (srcBytes) {
-      const n = staged.write(srcBytes, { at: 0 }); // copy committed bytes forward so unmutated parts survive
-      // A short copy-forward is an internal integrity failure (not caller-facing pressure like a
-      // partial content write) — the staged version would silently diverge from the committed one.
-      if (n < srcBytes.byteLength) throw new VfsError("EIO", key);
+    try {
+      // Reset the staged version to exactly the committed source (or empty when there is none),
+      // ALWAYS — not just when srcBytes is non-null. `handleVersioned(create:true)` can reopen a
+      // file that lingered from a swallowed rollback `removeEntry`; without this truncate a reused
+      // version (especially a sparse/empty-source chunk) could leak stale bytes into a later
+      // partial write. truncate(0) on a fresh handle is a no-op.
+      staged.truncate(srcBytes ? srcBytes.byteLength : 0);
+      if (srcBytes) {
+        this.maybeFault("cowWrite"); // test-only: fail the copy-forward byte write itself
+        const n = staged.write(srcBytes, { at: 0 }); // copy committed bytes forward so unmutated parts survive
+        // A short copy-forward is an internal integrity failure (not caller-facing pressure like a
+        // partial content write) — the staged version would silently diverge from the committed one.
+        if (n < srcBytes.byteLength) throw new VfsError("EIO", key);
+      }
+    } catch (e) {
+      // `truncate`/`write` on the sync access handle can throw a raw DOMException (e.g. under
+      // quota pressure while materializing the staged version) — map it the same way the
+      // content-write path does, instead of letting it surface as an unmapped generic error.
+      if (e instanceof VfsError) throw e; // preserve the EIO above (and any already-mapped error)
+      if ((e as { name?: string }).name === "QuotaExceededError") throw new VfsError("ENOSPC", key);
+      throw new VfsError("EBUSY", key);
     }
     this.chunkVersion.set(key, stagedGen);
     return staged;
@@ -156,10 +166,17 @@ export class BlobStore {
     const last = Math.floor((end - 1) / this.chunkSize);
     for (let idx = first; idx <= last; idx++) {
       if (isHole(idx)) continue; // authoritative zeros: never resolve/read a version for a hole chunk
-      const v = this.chunkVersion.get(this.key(id, idx));
-      if (v === undefined) continue; // sparse: no version resolves for this chunk
+      const key = this.key(id, idx);
+      const v = this.chunkVersion.get(key);
+      // A NON-hole in-range chunk MUST have content: holes are the only legitimate "no bytes"
+      // case, and those are gated out above. An unresolved version here means the manifest
+      // references content the working version map doesn't have — a damaged mount, not sparse.
+      // Fail closed instead of silently returning zeros, which would mask corruption.
+      if (v === undefined) throw new VfsError("EIO", key);
       const h = await this.handleVersioned(id, idx, v, false);
-      if (!h) continue; // sparse (defensive: map claimed a version but file is gone)
+      // The recorded version's file is gone — again, a non-hole chunk must have content, so a
+      // missing version file is corruption, not a defensive sparse case.
+      if (!h) throw new VfsError("EIO", key);
       const chunkStart = idx * this.chunkSize;
       const from = Math.max(offset, chunkStart);
       const to = Math.min(end, chunkStart + this.chunkSize);

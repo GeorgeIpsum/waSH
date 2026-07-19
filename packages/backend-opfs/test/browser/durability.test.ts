@@ -403,4 +403,42 @@ describe("OpfsBackend durability + GC", () => {
     );
     await be4.close();
   });
+
+  it("a missing non-hole chunk fails closed with EIO (not silent zeros)", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name);
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    const N = 130000; // chunks 0 and 1
+    await be.write(f, 0, new Uint8Array(N).fill(7));
+    await be.flush();
+    await be.close();
+    // Corrupt the mount: delete chunk 1's version file (a non-hole chunk within size).
+    const origin = await navigator.storage.getDirectory();
+    const blobDir = await (await origin.getDirectoryHandle(name)).getDirectoryHandle("blobs");
+    for await (const n2 of (blobDir as unknown as { keys(): AsyncIterableIterator<string> }).keys()) {
+      if (n2.startsWith(`${f}.1.`)) await blobDir.removeEntry(n2);
+    }
+    const be2 = await OpfsBackend.open(name);
+    const f2 = (await be2.lookup(await be2.root(), "f"))!.id;
+    // Reading the damaged (non-hole, version-missing) chunk must report EIO, not zero-fill.
+    await expect(be2.read(f2, 0, N)).rejects.toMatchObject({ errno: "EIO" });
+    await be2.close();
+  });
+
+  it("a COW copy-forward OPFS failure maps to VfsError (ENOSPC under quota pressure)", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("AAAA"));
+    await be.flush(); // commit gen 1: chunk 0 has committed, non-empty source bytes
+    // Force the copy-forward byte write inside cow() (staged.write of the committed source
+    // bytes) to throw a QuotaExceededError, simulating quota pressure while materializing the
+    // staged version. This must surface as a mapped VfsError, not a raw DOMException.
+    await fault(be)("__injectFault", ["cowWrite", 0, 1]);
+    await expect(be.write(f, 0, enc.encode("BB"))).rejects.toMatchObject({ errno: "ENOSPC" });
+    await be.close();
+  });
 });
