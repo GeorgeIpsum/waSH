@@ -143,25 +143,47 @@ which has landed in this package yet:
 
 ## Browser requirements
 
-The binding constraint is `FileSystemSyncAccessHandle` (specifically
-`createSyncAccessHandle`) — the backend is unusable without it, since it's
-OPFS's only fast synchronous I/O path and this design has no
-`createWritable` fallback. Per MDN's browser-compat-data
-(`api/FileSystemSyncAccessHandle.json`, `mdn/browser-compat-data` on GitHub):
+The backend has two hard requirements, and the higher of the two sets the
+floor for each engine:
+
+1. `FileSystemSyncAccessHandle` (specifically `createSyncAccessHandle`) —
+   OPFS's only fast synchronous I/O path; this design has no
+   `createWritable` fallback.
+2. The **Web Locks API** (`navigator.locks`) — `open()` calls
+   `navigator.locks.request(...)` unconditionally to enforce the
+   single-writer guarantee described above (see "Single-writer, enforced by
+   a Web Lock"). This is not optional: there is no lock-less fallback,
+   because running without it is unsafe, not merely degraded. `worker.ts`
+   feature-detects this at the very start of `open()` and throws a clear
+   `ENOSYS` pointing at `@wash/backend-indexeddb` when it's missing, instead
+   of a bare `TypeError` from inside `acquireLock()`.
+
+Per MDN's browser-compat-data (`api/FileSystemSyncAccessHandle.json` and
+`api/LockManager.json`, `mdn/browser-compat-data` on GitHub):
 
 | Engine | Minimum version |
 |---|---|
 | Chromium (Chrome/Edge) | 102+ |
 | Firefox | 111+ |
-| Safari | 15.2+ |
+| Safari | 15.4+ |
+
+Chromium and Firefox's floors above are set by sync access handles — both
+engines had already shipped Web Locks by then. **Safari is the exception:**
+sync access handles landed in Safari 15.2, but Web Locks didn't ship until
+Safari 15.4, so Web Locks — not sync access handles — is Safari's actual
+floor. Safari 15.2 and 15.3 have OPFS sync access handles but not
+`navigator.locks`, and are therefore **not supported** despite meeting the
+sync-access-handle requirement; `open()` fails fast with `ENOSYS` there
+rather than corrupting state.
 
 The compat data lists Chrome Android at 109+ and reports Firefox
 Android/Safari iOS as mirroring their desktop versions above — not verified
 against a physical device in this pass. OPFS root access itself
 (`navigator.storage.getDirectory`) has shipped since Chrome 86, but that's
-moot here since sync access handles are the actual floor. Below this floor,
-or on a browser without OPFS at all, `wash` falls back to
-`@wash/backend-indexeddb` per the Plan 6 default-backend selection.
+moot here since sync access handles (and, on Safari, Web Locks) are the
+actual floor. Below this floor, or on a browser without OPFS at all, `wash`
+should fall back to `@wash/backend-indexeddb` per the Plan 6 default-backend
+selection.
 
 ## Testing
 

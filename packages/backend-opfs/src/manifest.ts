@@ -1,4 +1,5 @@
 import type { NodeId, NodeKind } from "@wash/vfs";
+import { VfsError } from "@wash/vfs";
 
 export interface InodeRecord {
   kind: NodeKind;
@@ -24,6 +25,30 @@ export interface Manifest {
   rootId: NodeId;
   inodes: Record<NodeId, InodeRecord>;
   dirents: Record<NodeId, Record<string, { id: NodeId; kind: NodeKind }>>;
+}
+
+// ---- Web Locks feature detection (lives here, not in worker.ts, so it stays importable from
+// a plain Node vitest test: worker.ts sets `self.onmessage = ...` at module scope, which throws
+// under Node's `environment: "node"` runtime since `self` is undefined there — see the Node
+// suite under test/node/**). ----
+
+/**
+ * The OPFS backend REQUIRES the Web Locks API for single-writer safety (concurrent writers to
+ * one root corrupt and GC each other's data — see the README's "Single-writer, enforced by a Web
+ * Lock" section). `navigator.locks` shipped in Safari 15.4, one point release after OPFS sync
+ * access handles (15.2) — so Safari 15.2/15.3 would otherwise hit a bare `TypeError` deep inside
+ * `acquireLock()`'s unconditional `navigator.locks.request(...)` call. Call this at the very
+ * start of the `open` op, before anything else, so unsupported browsers instead get a clear,
+ * actionable `ENOSYS` pointing at `@wash/backend-indexeddb`. There is intentionally no lock-less
+ * fallback: running without the lock is unsafe, not merely degraded.
+ */
+export function assertWebLocksAvailable(nav: { locks?: unknown }): void {
+  if (!nav || typeof (nav as { locks?: unknown }).locks === "undefined" || !(nav as { locks?: unknown }).locks) {
+    throw new VfsError(
+      "ENOSYS",
+      "OPFS backend requires the Web Locks API (navigator.locks), unavailable in this browser (e.g. Safari < 15.4); use @wash/backend-indexeddb",
+    );
+  }
 }
 
 const HEADER_PREFIX = "wash-manifest-v1";

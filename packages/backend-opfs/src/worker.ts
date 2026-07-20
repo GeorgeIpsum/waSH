@@ -6,6 +6,7 @@ import {
   type Manifest, type InodeRecord,
   serializeManifest, parseManifest, selectGeneration, emptyManifest,
   holesHas, holesAdd, holesRemove, holesClamp,
+  assertWebLocksAvailable,
 } from "./manifest.js";
 import { BlobStore } from "./blobs.js";
 
@@ -253,6 +254,9 @@ type OpResult = { value: unknown };
 type OpFn = (...args: never[]) => Promise<OpResult> | OpResult;
 const ops: Record<string, OpFn> = {
   async open(rootDirName: string, poolSizeOpt: number, testHooks: boolean): Promise<OpResult> {
+    // Feature-detect BEFORE touching OPFS or the lock: a missing navigator.locks must surface
+    // as a clear ENOSYS here, not as a TypeError deep inside acquireLock() below.
+    assertWebLocksAvailable(navigator);
     if (testHooks) {
       faults = new Map();
       ops.__injectFault = (site: string, skip = 0, times = 1): OpResult => {
