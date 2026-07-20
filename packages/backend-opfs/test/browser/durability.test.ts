@@ -1,0 +1,444 @@
+import { describe, it, expect, afterEach } from "vitest";
+import { OpfsBackend } from "@wash/backend-opfs";
+import { CHUNK_SIZE, ulid } from "@wash/vfs";
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+const roots: string[] = [];
+function testRoot(): string { const n = `wash-test-${ulid()}`; roots.push(n); return n; }
+afterEach(async () => {
+  const o = await navigator.storage.getDirectory();
+  for (const n of roots.splice(0)) await o.removeEntry(n, { recursive: true }).catch(() => {});
+});
+function fault(be: unknown) {
+  return (be as { call: (op: string, a: unknown[]) => Promise<unknown> }).call.bind(be) as
+    (op: string, a: unknown[]) => Promise<unknown>;
+}
+
+describe("OpfsBackend durability + GC", () => {
+  it("a torn manifest-slot write falls back to the prior generation on reopen", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name, { testHooks: true });
+    const root = await be.root();
+    await be.create(root, "safe", ulid(), "file");
+    await be.flush(); // commits generation 1 (slot a)
+    const c = fault(be);
+    await c("__injectFault", ["slotWrite", 0, 1]); // next generation write tears
+    await be.create(root, "doomed", ulid(), "file");
+    await expect(be.flush()).rejects.toBeTruthy(); // slot write fails; working rolled back
+    await be.close();
+    const be2 = await OpfsBackend.open(name);
+    const root2 = await be2.root();
+    expect((await be2.lookup(root2, "safe"))?.id).toBeTruthy(); // gen 1 intact
+    expect(await be2.lookup(root2, "doomed")).toBeNull();        // torn gen 2 discarded
+    await be2.close();
+  });
+
+  it("a blob-flush failure aborts the commit and rolls the working manifest back", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("data"));
+    const c = fault(be);
+    await c("__injectFault", ["blobFlush", 0, 1]); // blob flush during commit fails
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" });
+    // whole-batch rollback: the uncommitted file is dropped from the working manifest
+    expect(await be.lookup(root, "f")).toBeNull();
+    await be.flush(); // fault consumed (times:1) → clean commit succeeds
+    await be.close();
+  });
+
+  it("union GC preserves a blob still referenced by a retained (fallback) generation", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name, { testHooks: true });
+    const root = await be.root();
+    const x = ulid();
+    await be.create(root, "x", x, "file");
+    await be.write(x, 0, enc.encode("valuable"));
+    await be.flush();            // gen 1 → slot a; references x
+    await be.unlink(root, "x");  // working manifest drops x (deferred delete: blob NOT removed)
+    await be.flush();            // gen 2 → slot b; does NOT reference x. But gen 1 (slot a) is retained.
+    // x is gone from the working namespace, yet its blob must survive (referenced by retained gen 1)
+    expect(await be.lookup(root, "x")).toBeNull();
+    await fault(be)("gc", []);   // GC must keep x's blob: gen 1 (fallback) still references it
+    // x's blob is still on disk (reachable from the retained gen 1)
+    const origin = await navigator.storage.getDirectory();
+    const blobDir = await (await origin.getDirectoryHandle(name)).getDirectoryHandle("blobs");
+    const names: string[] = [];
+    for await (const n of (blobDir as unknown as { keys(): AsyncIterableIterator<string> }).keys()) names.push(n);
+    expect(names.some((n) => n.startsWith(x))).toBe(true);
+    await be.close();
+  });
+
+  it("both manifest slots corrupt → open rejects EIO and does NOT GC blobs", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name);
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("keep"));
+    await be.flush();
+    await be.close();
+    const origin = await navigator.storage.getDirectory();
+    const dir = await origin.getDirectoryHandle(name);
+    for (const slot of ["manifest.a", "manifest.b"]) {
+      const fh = await dir.getFileHandle(slot, { create: true });
+      // `createSyncAccessHandle` is worker-only (not exposed on the main thread in any
+      // browser — see https://developer.mozilla.org/en-US/docs/Web/API/FileSystemFileHandle/createSyncAccessHandle);
+      // this test file runs on the main thread, so use the async writable stream instead.
+      // `createWritable()` truncates the file by default, so the write below fully replaces
+      // its contents with garbage bytes.
+      const w = await fh.createWritable();
+      await w.write(enc.encode("garbage"));
+      await w.close();
+    }
+    await expect(OpfsBackend.open(name)).rejects.toMatchObject({ errno: "EIO" });
+    // blobs untouched: the file's chunk still present
+    const blobDir = await dir.getDirectoryHandle("blobs");
+    const names: string[] = [];
+    for await (const n of (blobDir as unknown as { keys(): AsyncIterableIterator<string> }).keys()) names.push(n);
+    expect(names.some((n) => n.startsWith(f))).toBe(true);
+  });
+
+  it("unreadable manifest slots (not NotFound) → open rejects EIO and does NOT GC blobs", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name);
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("keep"));
+    await be.flush();
+    await be.close();
+    const origin = await navigator.storage.getDirectory();
+    const dir = await origin.getDirectoryHandle(name);
+    // Replace each manifest slot FILE with a DIRECTORY of the same name → getFileHandle
+    // throws TypeMismatchError (a non-NotFound read error), which must NOT be seen as "absent".
+    for (const slot of ["manifest.a", "manifest.b"]) {
+      await dir.removeEntry(slot).catch(() => {});
+      await dir.getDirectoryHandle(slot, { create: true });
+    }
+    await expect(OpfsBackend.open(name)).rejects.toMatchObject({ errno: "EIO" });
+    // blobs must survive (no empty-init GC)
+    const blobDir = await dir.getDirectoryHandle("blobs");
+    const names: string[] = [];
+    for await (const n of (blobDir as unknown as { keys(): AsyncIterableIterator<string> }).keys()) names.push(n);
+    expect(names.some((n) => n.startsWith(f))).toBe(true);
+  });
+
+  it("failed flush rolls back an in-place OVERWRITE — committed content is not corrupted", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name, { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("AAAA"));
+    await be.flush();                      // commit F="AAAA"
+    await be.write(f, 0, enc.encode("BB")); // in-place overwrite → blob physically "BBAA"
+    await fault(be)("__injectFault", ["blobFlush", 0, 1]);
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" }); // rollback restores content
+    expect(dec.decode(await be.read(f, 0, 4))).toBe("AAAA"); // NOT "BBAA"
+    await be.close();
+    const be2 = await OpfsBackend.open(name);
+    const f2 = await be2.lookup(await be2.root(), "f");
+    expect(dec.decode(await be2.read(f2!.id, 0, 4))).toBe("AAAA"); // survives reopen
+    await be2.close();
+  });
+
+  it("failed flush rolls back a TRUNCATE-shrink — the discarded tail is restored", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name, { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    const N = 70000;
+    const payload = new Uint8Array(N);
+    for (let i = 0; i < N; i++) payload[i] = (i % 250) + 1; // non-zero, so "zeros" corruption is detectable
+    await be.write(f, 0, payload);
+    await be.flush();                       // commit F size 70000
+    await be.truncate(f, 5000);             // eager physical shrink (delete tail + shrink boundary)
+    await fault(be)("__injectFault", ["blobFlush", 0, 1]);
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" }); // rollback restores blobs
+    expect((await be.getattr(f)).size).toBe(N); // manifest rolled back to 70000
+    const back = await be.read(f, 0, N);
+    expect(back.byteLength).toBe(N);
+    expect([...back]).toEqual([...payload]); // original bytes restored, NOT zeros
+    await be.close();
+    const be2 = await OpfsBackend.open(name);
+    const f2 = await be2.lookup(await be2.root(), "f");
+    const back2 = await be2.read(f2!.id, 0, N);
+    expect([...back2]).toEqual([...payload]); // survives reopen
+    await be2.close();
+  });
+
+  // The pre-COW "unpooled snapshot" regression (a fresh worker's first mutation of a
+  // committed-but-unpooled chunk must not be treated as absent by the undo-log) no longer
+  // applies: COW has no undo-log, and `buildVersionMap` always resolves a committed chunk's
+  // version from disk at open regardless of pool state. Its intent — that a reopened,
+  // freshly-pooled worker resolves committed content correctly rather than corrupting or
+  // losing it — is now covered by the crash-mid-commit test below (also a reopen scenario).
+
+  it("a crash mid-commit (orphan staged chunk on disk) does not corrupt the prior generation", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name);
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("AAAA"));
+    await be.flush();           // commit gen 1: <f>.0.1 = "AAAA"
+    await be.close();
+    // Simulate a crash mid-commit toward gen 2: an orphan staged chunk exists on disk
+    // (bytes already flushed) but the gen-2 manifest slot was never written.
+    const origin = await navigator.storage.getDirectory();
+    const blobDir = await (await origin.getDirectoryHandle(name)).getDirectoryHandle("blobs");
+    // find the committed chunk file name for f, chunk 0, gen 1
+    let base = "";
+    for await (const n of (blobDir as unknown as { keys(): AsyncIterableIterator<string> }).keys()) {
+      if (n.startsWith(`${f}.0.`)) base = n;
+    }
+    expect(base).toBeTruthy();
+    // write an orphan gen-2 version with corrupted bytes. `createSyncAccessHandle` is
+    // worker-only (not exposed on the main thread in any browser — see
+    // https://developer.mozilla.org/en-US/docs/Web/API/FileSystemFileHandle/createSyncAccessHandle);
+    // this test file runs on the main thread, so use the async writable stream instead, same
+    // as the "both manifest slots corrupt" test above.
+    const oh = await (await blobDir.getFileHandle(`${f}.0.2`, { create: true })).createWritable();
+    await oh.write(enc.encode("BBBB"));
+    await oh.close();
+    // Reopen: gen 2 manifest was never committed → selects gen 1 → must resolve <f>.0.1, NOT the orphan <f>.0.2
+    const be2 = await OpfsBackend.open(name);
+    const f2 = (await be2.lookup(await be2.root(), "f"))!.id;
+    expect(dec.decode(await be2.read(f2, 0, 4))).toBe("AAAA"); // prior generation intact
+    await be2.close();
+  });
+
+  it("a content op that fails after staging aborts the batch — committed content survives, nothing partial promoted", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    // Baseline spans TWO chunks (CHUNK_SIZE = 65536) so a single write() call touches chunk 0
+    // then chunk 1 in order — this is what makes the test discriminating: a single-chunk
+    // fault-before-the-byte-write leaves nothing behind to promote either way (the staged file
+    // only ever holds the unmodified COW-forwarded bytes), so it can't tell a real batch-abort
+    // apart from a naive implementation. With two chunks, chunk 0's write actually lands on
+    // disk before chunk 1's write faults — a naive (non-aborting) implementation would leave
+    // chunk 0's new bytes visible while chunk 1 stays at its old content: a torn, half-promoted
+    // write. Fix 1 must roll BOTH chunks back, not just the one that failed.
+    const N = CHUNK_SIZE + 4;
+    const baseline = new Uint8Array(N).fill(0x41); // 'A' * N
+    await be.write(f, 0, baseline);
+    await be.flush(); // commit gen 1: all 'A's across 2 chunks
+    // skip=1: the first maybeFault("blobWrite") call (chunk 0) is a no-op, so chunk 0's cow +
+    // real byte write succeeds; the SECOND call (chunk 1) throws AFTER cow stages it, BEFORE
+    // its byte write.
+    await fault(be)("__injectFault", ["blobWrite", 1, 1]);
+    const attempted = new Uint8Array(N).fill(0x42); // 'B' * N
+    await expect(be.write(f, 0, attempted)).rejects.toBeTruthy(); // op aborts the batch
+    // Nothing partial promoted: chunk 0's already-written 'B's must NOT be visible either — the
+    // WHOLE batch is rolled back, not just the chunk that failed.
+    const back = await be.read(f, 0, N);
+    expect(back.every((b) => b === 0x41)).toBe(true); // still all 'A's, not a 'B'/'A' mix
+    // a later clean write+flush works (no wedged/poisoned state)
+    await be.write(f, 0, enc.encode("CCCC"));
+    await be.flush();
+    expect(dec.decode(await be.read(f, 0, 4))).toBe("CCCC");
+    await be.close();
+  });
+
+  it("a partially failed multi-chunk write does not persist (P1-B)", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true, handlePoolSize: 8 });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("AAAA"));
+    await be.flush(); // committed size 4
+    // A write that fails partway must leave NO committed effect: after a failed flush the
+    // file still reads its committed "AAAA" and size 4.
+    // (Drive the failure through the existing blobFlush fault at commit; the staged versions
+    //  are discarded by rollbackBatch.)
+    await be.write(f, 0, enc.encode("ZZZZ"));
+    await fault(be)("__injectFault", ["blobFlush", 0, 1]);
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" });
+    expect(dec.decode(await be.read(f, 0, 4))).toBe("AAAA");
+    expect((await be.getattr(f)).size).toBe(4);
+    await be.close();
+  });
+
+  it("a slot-flush failure that may have landed does not strand a batch's new content (P1)", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name, { testHooks: true });
+    const root = await be.root();
+    await be.create(root, "keep", ulid(), "file");
+    await be.flush(); // commit gen 1 (no "g")
+    // Batch: create + write a NEW file, then the slot flush faults after the bytes landed.
+    const g = ulid();
+    await be.create(root, "g", g, "file");
+    await be.write(g, 0, enc.encode("GGGG"));
+    await fault(be)("__injectFault", ["slotFlush", 0, 1]);
+    await expect(be.flush()).rejects.toBeTruthy();
+    await be.close();
+    // Reopen: the half-written gen-2 slot must be invalidated → gen 1 selected → "g" absent
+    // (not present-but-reading-zeros). Its staged chunk being deleted is then safe.
+    const be2 = await OpfsBackend.open(name);
+    const root2 = await be2.root();
+    expect(await be2.lookup(root2, "g")).toBeNull();
+    expect(await be2.lookup(root2, "keep")).not.toBeNull();
+    await be2.close();
+  });
+
+  it("COW overwrite/truncate work with a single-entry handle pool (P2)", async () => {
+    const be = await OpfsBackend.open(testRoot(), { handlePoolSize: 1 });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("AAAA"));
+    await be.flush();
+    await be.write(f, 0, enc.encode("BB")); // overwrite committed data → cow under pool size 1
+    expect(dec.decode(await be.read(f, 0, 4))).toBe("BBAA");
+    await be.truncate(f, 2); // truncate-shrink committed data → cow boundary under pool size 1
+    expect(dec.decode(await be.read(f, 0, 4))).toBe("BB");
+    await be.flush();
+    await be.close();
+  });
+
+  it("truncated tail never resurfaces across shrink→reopen→extend→reopen (P1 deep)", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name);
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    const N = 130000; // chunks 0 and 1 (CHUNK_SIZE 65536)
+    const payload = new Uint8Array(N);
+    for (let i = 0; i < N; i++) payload[i] = (i % 250) + 1; // non-zero → resurfacing detectable
+    await be.write(f, 0, payload);
+    await be.flush();
+    await be.truncate(f, 5000);
+    await be.flush();
+    await be.close();
+    // reopen #1: extend back over the reclaimed region WITHOUT rewriting it
+    const be2 = await OpfsBackend.open(name);
+    const f2 = (await be2.lookup(await be2.root(), "f"))!.id;
+    await be2.truncate(f2, N);
+    await be2.flush();
+    await be2.close();
+    // reopen #2: the reclaimed region MUST read zeros (manifest records chunk 1 as a hole)
+    const be3 = await OpfsBackend.open(name);
+    const f3 = (await be3.lookup(await be3.root(), "f"))!.id;
+    const back = await be3.read(f3, 0, N);
+    expect([...back.subarray(0, 5000)]).toEqual([...payload.subarray(0, 5000)]);
+    expect([...back.subarray(5000, N)]).toEqual(new Array(N - 5000).fill(0)); // NOT the old bytes
+    await be3.close();
+  });
+
+  it("a sparse write leaves the skipped gap as zeros across reopen", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name);
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("head"));
+    await be.write(f, 130000, enc.encode("tail")); // gap chunk 1 is a hole
+    await be.flush();
+    await be.close();
+    const be2 = await OpfsBackend.open(name);
+    const f2 = (await be2.lookup(await be2.root(), "f"))!.id;
+    const out = await be2.read(f2, 0, 130004);
+    expect(dec.decode(out.subarray(0, 4))).toBe("head");
+    expect([...out.subarray(65536, 130000)]).toEqual(new Array(130000 - 65536).fill(0));
+    expect(dec.decode(out.subarray(130000, 130004))).toBe("tail");
+    await be2.close();
+  });
+
+  it("a write into a reclaimed hole chunk after reopen never COWs forward stale bytes (P1 deep, write path)", async () => {
+    // Companion to the read-path regression above: after shrink→reopen→extend→reopen, the
+    // reclaimed chunk is a hole with a stale on-disk version still lingering (kept for GC/
+    // fallback). A *partial* write into that chunk must start the chunk fresh (all zeros)
+    // and only place the new bytes — it must NOT resolve/COW-forward the stale on-disk
+    // version's bytes into the untouched portion of the chunk. This exercises
+    // `BlobStore.buildVersionMap`'s hole-gating of the working `chunkVersion` map, not just
+    // `read()`'s hole gate.
+    const name = testRoot();
+    const be = await OpfsBackend.open(name);
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    const N = 130000; // chunks 0 and 1 (CHUNK_SIZE 65536)
+    const payload = new Uint8Array(N);
+    for (let i = 0; i < N; i++) payload[i] = (i % 250) + 1; // non-zero → resurfacing detectable
+    await be.write(f, 0, payload);
+    await be.flush();
+    await be.truncate(f, 5000); // drop chunk 1 (stale version lingers on disk for GC)
+    await be.flush();
+    await be.close();
+    // reopen: extend back over the reclaimed region without rewriting it, then commit
+    const be2 = await OpfsBackend.open(name);
+    const f2 = (await be2.lookup(await be2.root(), "f"))!.id;
+    await be2.truncate(f2, N);
+    await be2.flush();
+    await be2.close();
+    // reopen again: chunk 1 is a hole with a stale on-disk version still present. Write a few
+    // bytes into the MIDDLE of chunk 1 (not the start) — the untouched rest of the chunk must
+    // read zeros, not the stale pre-truncate payload.
+    const be3 = await OpfsBackend.open(name);
+    const f3 = (await be3.lookup(await be3.root(), "f"))!.id;
+    const patch = enc.encode("PATCH");
+    const patchOffset = 65536 + 100; // well inside chunk 1
+    await be3.write(f3, patchOffset, patch);
+    const back = await be3.read(f3, 0, N);
+    expect([...back.subarray(0, 5000)]).toEqual([...payload.subarray(0, 5000)]); // kept prefix intact
+    expect([...back.subarray(5000, patchOffset)]).toEqual(new Array(patchOffset - 5000).fill(0)); // hole, still zero
+    expect(dec.decode(back.subarray(patchOffset, patchOffset + patch.byteLength))).toBe("PATCH"); // the new bytes
+    expect([...back.subarray(patchOffset + patch.byteLength, N)]).toEqual(
+      new Array(N - (patchOffset + patch.byteLength)).fill(0),
+    ); // rest of the chunk: zero, NOT the stale pre-truncate bytes
+    await be3.flush();
+    await be3.close();
+    // survives a further reopen too
+    const be4 = await OpfsBackend.open(name);
+    const f4 = (await be4.lookup(await be4.root(), "f"))!.id;
+    const back2 = await be4.read(f4, 0, N);
+    expect(dec.decode(back2.subarray(patchOffset, patchOffset + patch.byteLength))).toBe("PATCH");
+    expect([...back2.subarray(patchOffset + patch.byteLength, N)]).toEqual(
+      new Array(N - (patchOffset + patch.byteLength)).fill(0),
+    );
+    await be4.close();
+  });
+
+  it("a missing non-hole chunk fails closed with EIO (not silent zeros)", async () => {
+    const name = testRoot();
+    const be = await OpfsBackend.open(name);
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    const N = 130000; // chunks 0 and 1
+    await be.write(f, 0, new Uint8Array(N).fill(7));
+    await be.flush();
+    await be.close();
+    // Corrupt the mount: delete chunk 1's version file (a non-hole chunk within size).
+    const origin = await navigator.storage.getDirectory();
+    const blobDir = await (await origin.getDirectoryHandle(name)).getDirectoryHandle("blobs");
+    for await (const n2 of (blobDir as unknown as { keys(): AsyncIterableIterator<string> }).keys()) {
+      if (n2.startsWith(`${f}.1.`)) await blobDir.removeEntry(n2);
+    }
+    const be2 = await OpfsBackend.open(name);
+    const f2 = (await be2.lookup(await be2.root(), "f"))!.id;
+    // Reading the damaged (non-hole, version-missing) chunk must report EIO, not zero-fill.
+    await expect(be2.read(f2, 0, N)).rejects.toMatchObject({ errno: "EIO" });
+    await be2.close();
+  });
+
+  it("a COW copy-forward OPFS failure maps to VfsError (ENOSPC under quota pressure)", async () => {
+    const be = await OpfsBackend.open(testRoot(), { testHooks: true });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("AAAA"));
+    await be.flush(); // commit gen 1: chunk 0 has committed, non-empty source bytes
+    // Force the copy-forward byte write inside cow() (staged.write of the committed source
+    // bytes) to throw a QuotaExceededError, simulating quota pressure while materializing the
+    // staged version. This must surface as a mapped VfsError, not a raw DOMException.
+    await fault(be)("__injectFault", ["cowWrite", 0, 1]);
+    await expect(be.write(f, 0, enc.encode("BB"))).rejects.toMatchObject({ errno: "ENOSPC" });
+    await be.close();
+  });
+});

@@ -44,6 +44,21 @@ export class IndexedDBBackend implements WashBackend {
   private lastAbort: unknown = null;
 
   /**
+   * Maps a raw IDB request/transaction error to a VfsError where we know what
+   * it means; anything else passes through unchanged (including an
+   * already-mapped VfsError, whose `.name` is "VfsError" and never matches).
+   * Applied both where a failing request's error becomes `lastAbort` (so an
+   * aborted-batch quota failure is pre-mapped by the time `flush()` or the
+   * next `withTx` loop-top check rethrows it) and at `withTx`'s own
+   * non-retryable rethrow (a same-attempt request failure that never reaches
+   * transaction abort, e.g. within a single-request op).
+   */
+  private static toVfsError(e: unknown): unknown {
+    const name = (e as { name?: string } | null)?.name;
+    return name === "QuotaExceededError" ? new VfsError("ENOSPC") : e;
+  }
+
+  /**
    * Per-inode mutation serialization for `write`/`truncate` (Codex finding
    * C). The blessed stack (Vfs + CachedBackend) already serializes mutations
    * above this layer, but the raw backend is legal to use directly, and two
@@ -121,8 +136,8 @@ export class IndexedDBBackend implements WashBackend {
     this.tx = tx;
     const completion = txDone(tx)
       .catch((e) => {
-        this.lastAbort = e;
-        throw e;
+        this.lastAbort = IndexedDBBackend.toVfsError(e);
+        throw this.lastAbort;
       })
       .finally(() => {
         if (this.tx === tx) this.tx = null;
@@ -181,7 +196,7 @@ export class IndexedDBBackend implements WashBackend {
           if (completion) await completion.catch(() => {});
           continue;
         }
-        throw e;
+        throw IndexedDBBackend.toVfsError(e);
       }
     }
   }

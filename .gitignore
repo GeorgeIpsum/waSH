@@ -3,3 +3,4 @@ dist/
 .turbo/
 *.log
 .lil-bro/
+__screenshots__/
