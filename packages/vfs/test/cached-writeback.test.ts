@@ -3,6 +3,7 @@ import { CachedBackend } from "../src/cache/cached-backend.js";
 import { MemoryBackend } from "../src/backend/memory.js";
 import { ulid } from "../src/ulid.js";
 import type { WashBackend } from "../src/types.js";
+import { VfsError } from "../src/errors.js";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -19,6 +20,36 @@ function delayedBackend(inner: MemoryBackend, delayMs: number): WashBackend {
         };
       }
       return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+    },
+  }) as unknown as WashBackend;
+}
+
+// Faithful barrier-rollback double. Reaches into MemoryBackend's private `nodes`
+// (test-only coupling, documented) to snapshot/restore via structuredClone (deep-
+// clones the nested Map<NodeId, MemNode> incl. Uint8Array data + children Maps).
+// Models the spec-mandated contract: a backend whose flush() can fail rolls its
+// un-flushed batch back to the last successful flush (OPFS rollbackToCommitted /
+// IDB txn abort). Hoisted to module scope so later tasks in this plan
+// (fsync-strict, backpressure) can reuse it.
+function rollbackFlaky(inner: MemoryBackend, failTimes: number): WashBackend {
+  const state = () => inner as unknown as { nodes: Map<string, unknown> };
+  let committed = structuredClone(state().nodes); // last durable snapshot
+  let n = failTimes;
+  return new Proxy(inner, {
+    get(t, p, r) {
+      const v = Reflect.get(t, p, r);
+      if (p === "flush") {
+        return async (o?: { strict?: boolean }) => {
+          if (n-- > 0) {
+            state().nodes = structuredClone(committed); // roll back to last durable state
+            throw new VfsError("ENOSPC");
+          }
+          const res = await (v as (o?: unknown) => Promise<void>).apply(t, [o]);
+          committed = structuredClone(state().nodes);   // commit: new durable point
+          return res;
+        };
+      }
+      return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(t) : v;
     },
   }) as unknown as WashBackend;
 }
@@ -323,5 +354,49 @@ describe("CachedBackend write-back", () => {
     await expect(wb.unlink(r, ".wash-attrs")).rejects.toMatchObject({ errno: "EPERM" });
     await wb.flush(); // queue clean, nothing poisoned
     expect((await wb.readdir(r)).map((d) => d.name)).toEqual(["ok"]);
+  });
+
+  it("a failed barrier keeps the dirty buffer so the retry writes the real bytes", async () => {
+    const inner = new MemoryBackend();
+    const be = new CachedBackend(rollbackFlaky(inner, 1), { flushDelayMs: 60_000 });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("abc"));
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" }); // barrier fails once
+    await be.flush();                                                    // retry succeeds
+    expect(dec.decode(await inner.read(f, 0, 100))).toBe("abc");
+  });
+
+  it("no divergence: a failed barrier re-queues the batch; a later flush makes it durable", async () => {
+    const inner = new MemoryBackend();
+    const be = new CachedBackend(rollbackFlaky(inner, 1), { flushDelayMs: 60_000 });
+    const root = await be.root();
+    const a = ulid(), b = ulid();
+    await be.create(root, "a", a, "file");
+    await be.create(root, "b", b, "file");
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" });
+    expect(be.pendingOps()).toBeGreaterThan(0);   // ops NOT lost
+    await be.flush();                              // succeeds now
+    expect((await inner.lookup(root, "a"))?.id).toBe(a);
+    expect((await inner.lookup(root, "b"))?.id).toBe(b);
+  });
+
+  it("a re-dirtied file is not stranded across flushes", async () => {
+    const inner = new MemoryBackend();
+    const be = new CachedBackend(inner, { flushDelayMs: 60_000 });
+    const root = await be.root();
+    const f = ulid(), g = ulid();
+    await be.create(root, "f", f, "file");
+    await be.create(root, "g", g, "file");
+    await be.flush();
+    await be.write(f, 0, enc.encode("F1"));
+    await be.write(g, 0, enc.encode("G1"));
+    await be.flush();
+    await be.write(g, 0, enc.encode("G2")); // re-dirty after g's op ran & confirmed
+    await be.flush();
+    expect(dec.decode(await inner.read(g, 0, 100))).toBe("G2");
+    expect(dec.decode(await inner.read(f, 0, 100))).toBe("F1");
+    expect(be.pendingOps()).toBe(0);
   });
 });

@@ -66,6 +66,12 @@ export class CachedBackend implements WashBackend {
   // optimization for backends (e.g. IndexedDB) where it matters.
   private dirtyData = new Map<NodeId, Uint8Array>();
 
+  /** ids with a content-flush op queued or in-flight (coalescing gate; replaces the
+   *  old `dirtyData.has` gate, which is unusable now that deletion is deferred). */
+  private contentOpPending = new Set<NodeId>();
+  /** content buffers applied to `inner` this flush cycle, awaiting durable-confirm. */
+  private pendingContentConfirm: Array<{ id: NodeId; buf: Uint8Array }> = [];
+
   private queue: Array<() => Promise<void>> = [];
   private timer: ReturnType<typeof setTimeout> | null = null;
   private flushing: Promise<void> | null = null;
@@ -208,6 +214,7 @@ export class CachedBackend implements WashBackend {
       this.attrCache.delete(id);
       this.readdirCache.delete(id);
       this.dirtyData.delete(id); // dirs never carry a dirty buffer; defensive no-op
+      this.contentOpPending.delete(id);
       return;
     }
     const hit = this.attrCache.get(id);
@@ -218,6 +225,7 @@ export class CachedBackend implements WashBackend {
         this.attrCache.delete(id);
         if (wasOnlyLink || this.caps.hardlinks === false) {
           this.dirtyData.delete(id);
+          this.contentOpPending.delete(id);
         }
       }
     }
@@ -243,7 +251,7 @@ export class CachedBackend implements WashBackend {
     if (this.queue.length > 0 || this.flushing) await this.flush();
   }
 
-  async flush(_opts?: { strict?: boolean }): Promise<void> {
+  async flush(opts?: { strict?: boolean }): Promise<void> {
     // Fully serialize concurrent callers: keep waiting (and re-checking)
     // until no flush cycle is in flight, then start our own. This is a loop
     // rather than a single `if` because a waiter can wake up to find another
@@ -256,20 +264,36 @@ export class CachedBackend implements WashBackend {
       this.timer = null;
     }
     const run = (async () => {
+      const applied: Array<() => Promise<void>> = [];
       while (this.queue.length > 0) {
         const op = this.queue[0]!;
         try {
-          await op(); // rejection leaves the op at the head for retry — see dropVictim/enqueue docs
+          await op();
         } catch (e) {
-          // Give the backend its durability-point callback even though the
-          // drain failed — backends like IndexedDB clear their sticky abort
-          // poison in flush(); without this the queue head can never retry.
-          await this.inner.flush().catch(() => {});
+          // Per-op APPLICATION failure (narrow contract): the op is self-atomic and
+          // stays at the head; the applied prefix stays applied. Give the backend a
+          // durability point (sticky-abort backends clear it in flush()); if THAT
+          // flush also rejects the backend rolled the batch back, so re-queue the
+          // applied prefix (the same rule as the barrier path below).
+          try {
+            await this.inner.flush(opts);
+            this.confirmContent();
+          } catch {
+            this.queue.unshift(...applied);
+            this.discardContentConfirm();
+          }
           throw e;
         }
-        this.queue.shift();
+        applied.push(this.queue.shift()!);
       }
-      await this.inner.flush();
+      try {
+        await this.inner.flush(opts);   // durability BARRIER
+        this.confirmContent();          // the batch is durable
+      } catch (e) {
+        this.queue.unshift(...applied); // backend rolled the batch back → replay next cycle
+        this.discardContentConfirm();   // buffers stay in dirtyData for the replay
+        throw e;
+      }
     })();
     this.flushing = run;
     try {
@@ -436,8 +460,25 @@ export class CachedBackend implements WashBackend {
 
   /** Queues the single write-back op for `id`'s content, once per dirty session. */
   private queueContentFlush(id: NodeId): void {
-    if (this.dirtyData.has(id)) return; // already queued; the op re-reads dirtyData lazily at flush time
+    if (this.contentOpPending.has(id)) return; // op already queued/in-flight; it re-reads dirtyData
+    this.contentOpPending.add(id);
     this.enqueueContentOp(id);
+  }
+
+  /** After a successful inner.flush(): the recorded content buffers are durable.
+   *  Delete each dirtyData[id] only if it is still that op's buffer (a concurrent
+   *  re-dirty installs a fresh Uint8Array with its own later content op). */
+  private confirmContent(): void {
+    for (const { id, buf } of this.pendingContentConfirm) {
+      if (this.dirtyData.get(id) === buf) this.dirtyData.delete(id);
+    }
+    this.pendingContentConfirm = [];
+  }
+
+  /** After a FAILED barrier: buffers stay in dirtyData for the replay (the flush
+   *  re-queue); just clear the confirm list — the next cycle rebuilds it. */
+  private discardContentConfirm(): void {
+    this.pendingContentConfirm = [];
   }
 
   /**
@@ -452,17 +493,14 @@ export class CachedBackend implements WashBackend {
   private enqueueContentOp(id: NodeId): void {
     this.enqueue(async () => {
       const buf = this.dirtyData.get(id);
-      if (!buf) return; // evicted (unlinked) or already flushed before this op ran
-      // Only delete the buffer after the inner ops succeed. A rejection here
-      // must leave dirtyData intact — the queue's failed-op-at-head retry
-      // policy re-runs this same closure, and reads must keep serving the
-      // dirty buffer (not stale inner content) until that retry lands. The
-      // identity check guards against a concurrent re-dirty (write/truncate
-      // always installs a fresh Uint8Array) clobbering the newer buffer.
+      if (!buf) { this.contentOpPending.delete(id); return; } // evicted/unlinked before this op ran
       await this.inner.truncate(id, buf.byteLength);
       if (buf.byteLength > 0) await this.inner.write(id, 0, buf);
-      if (this.dirtyData.get(id) === buf) this.dirtyData.delete(id);
-      else this.enqueueContentOp(id); // re-dirtied mid-flush: newer buffer needs its own op
+      // Applied to inner but NOT durable: keep the buffer so a barrier failure can
+      // replay it; record it for identity-guarded durable-confirm cleanup.
+      this.pendingContentConfirm.push({ id, buf });
+      this.contentOpPending.delete(id);          // op finished applying → gate reopens
+      if (this.dirtyData.get(id) !== buf) this.queueContentFlush(id); // re-dirtied mid-op → fresh op
     });
   }
 
