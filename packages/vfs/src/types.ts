@@ -66,7 +66,9 @@ export interface WashBackend {
   symlink?(parent: NodeId, name: string, id: NodeId, target: string): Promise<void>;
   readlink?(id: NodeId): Promise<string>;
   link?(parent: NodeId, name: string, id: NodeId): Promise<void>;
-  flush(): Promise<void>;
+  /** Durability barrier. `strict: true` REJECTS if the batch cannot be made durable
+   *  (honored by CachedBackend; raw backends are inherently strict and ignore opts). */
+  flush(opts?: { strict?: boolean }): Promise<void>;
   /** Optional bulk namespace export for mount-time cache warming (spec §5). */
   dump?(): Promise<BackendDump>;
 }

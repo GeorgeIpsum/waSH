@@ -152,7 +152,7 @@ export class OpfsBackend implements WashBackend {
     return (await this.call("dump", [])) as BackendDump;
   }
 
-  async flush(): Promise<void> {
+  async flush(_opts?: { strict?: boolean }): Promise<void> {
     await this.call("flush", []);
   }
 }

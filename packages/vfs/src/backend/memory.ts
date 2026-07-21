@@ -187,5 +187,5 @@ export class MemoryBackend implements WashBackend {
     p.children.set(name, { childId: id, kind: n.attrs.kind });
   }
 
-  async flush(): Promise<void> {}
+  async flush(_opts?: { strict?: boolean }): Promise<void> {}
 }

@@ -243,7 +243,7 @@ export class CachedBackend implements WashBackend {
     if (this.queue.length > 0 || this.flushing) await this.flush();
   }
 
-  async flush(): Promise<void> {
+  async flush(_opts?: { strict?: boolean }): Promise<void> {
     // Fully serialize concurrent callers: keep waiting (and re-checking)
     // until no flush cycle is in flight, then start our own. This is a loop
     // rather than a single `if` because a waiter can wake up to find another

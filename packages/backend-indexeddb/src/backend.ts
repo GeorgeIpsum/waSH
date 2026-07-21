@@ -219,7 +219,7 @@ export class IndexedDBBackend implements WashBackend {
    * CachedBackend, tracked alongside the fsync-strict contract work
    * (pre-Plan-4).
    */
-  async flush(): Promise<void> {
+  async flush(_opts?: { strict?: boolean }): Promise<void> {
     const completion = this.txCompletion;
     this.tx = null; // stop reusing; the pending txn auto-commits
     try {
