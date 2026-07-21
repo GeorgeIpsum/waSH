@@ -36,17 +36,27 @@ These three changes are one atomic unit: the re-queue needs the retained buffer 
 
 - [ ] **Step 1: Write the failing tests**
 
-Add three cases to `packages/vfs/test/cached-writeback.test.ts`. Add `import { VfsError } from "../src/errors.js";` if absent. Use a spread/Proxy-based flaky inner whose `flush` rejects a set number of times (hoist this helper to module scope so later tasks reuse it):
+Add three cases to `packages/vfs/test/cached-writeback.test.ts`. Add `import { VfsError } from "../src/errors.js";` if absent. Use a transactional fault-injecting inner that FAITHFULLY models the spec's barrier contract — a backend whose `flush()` can fail MUST roll its un-flushed batch back to the last successful flush (OPFS `rollbackToCommitted` / IDB txn abort). `MemoryBackend` never fails `flush()` and so has no rollback; this test double adds the rollback a real failing backend guarantees, by snapshotting `MemoryBackend`'s state on each successful flush and restoring it on an injected failure. **A plain "just make flush throw" double is out-of-contract** — replaying a re-queued non-idempotent op (`create`/`rename`) against a backend that never reverted would spuriously hit `EEXIST`, an artifact of the double, not a real bug. Hoist this helper to module scope so Tasks 2-5 reuse it:
 ```ts
-  function flushFlaky(inner: MemoryBackend, failTimes: number): WashBackend {
+  // Faithful barrier-rollback double. Reaches into MemoryBackend's private `nodes`
+  // (test-only coupling, documented) to snapshot/restore via structuredClone (deep-
+  // clones the nested Map<NodeId, MemNode> incl. Uint8Array data + children Maps).
+  function rollbackFlaky(inner: MemoryBackend, failTimes: number): WashBackend {
+    const state = () => inner as unknown as { nodes: Map<string, unknown> };
+    let committed = structuredClone(state().nodes); // last durable snapshot
     let n = failTimes;
     return new Proxy(inner, {
       get(t, p, r) {
         const v = Reflect.get(t, p, r);
         if (p === "flush") {
           return async (o?: { strict?: boolean }) => {
-            if (n-- > 0) throw new VfsError("ENOSPC");
-            return (v as (o?: unknown) => Promise<void>).apply(t, [o]);
+            if (n-- > 0) {
+              state().nodes = structuredClone(committed); // roll back to last durable state
+              throw new VfsError("ENOSPC");
+            }
+            const res = await (v as (o?: unknown) => Promise<void>).apply(t, [o]);
+            committed = structuredClone(state().nodes);   // commit: new durable point
+            return res;
           };
         }
         return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(t) : v;
@@ -56,7 +66,7 @@ Add three cases to `packages/vfs/test/cached-writeback.test.ts`. Add `import { V
 
   it("a failed barrier keeps the dirty buffer so the retry writes the real bytes", async () => {
     const inner = new MemoryBackend();
-    const be = new CachedBackend(flushFlaky(inner, 1), { flushDelayMs: 60_000 });
+    const be = new CachedBackend(rollbackFlaky(inner, 1), { flushDelayMs: 60_000 });
     const root = await be.root();
     const f = ulid();
     await be.create(root, "f", f, "file");
@@ -68,7 +78,7 @@ Add three cases to `packages/vfs/test/cached-writeback.test.ts`. Add `import { V
 
   it("no divergence: a failed barrier re-queues the batch; a later flush makes it durable", async () => {
     const inner = new MemoryBackend();
-    const be = new CachedBackend(flushFlaky(inner, 1), { flushDelayMs: 60_000 });
+    const be = new CachedBackend(rollbackFlaky(inner, 1), { flushDelayMs: 60_000 });
     const root = await be.root();
     const a = ulid(), b = ulid();
     await be.create(root, "a", a, "file");
@@ -233,7 +243,7 @@ git commit -m "fix(vfs): CachedBackend re-queues the applied batch on a barrier 
     try {
       const inner = new MemoryBackend();
       const errs: unknown[] = [];
-      const be = new CachedBackend(flushFlaky(inner, 5), { flushDelayMs: 10 });
+      const be = new CachedBackend(rollbackFlaky(inner, 5), { flushDelayMs: 10 });
       be.onFlushError = (e) => errs.push(e);
       const root = await be.root();
       await be.create(root, "a", ulid(), "file"); // arms the auto-flush timer
@@ -244,7 +254,7 @@ git commit -m "fix(vfs): CachedBackend re-queues the applied batch on a barrier 
       vi.useRealTimers();
     }
     const inner2 = new MemoryBackend();
-    const be2 = new CachedBackend(flushFlaky(inner2, 1), { flushDelayMs: 60_000 });
+    const be2 = new CachedBackend(rollbackFlaky(inner2, 1), { flushDelayMs: 60_000 });
     const r2 = await be2.root();
     await be2.create(r2, "a", ulid(), "file");
     await expect(be2.flush({ strict: true })).rejects.toMatchObject({ errno: "ENOSPC" });
@@ -262,10 +272,10 @@ In `packages/vfs/src/core/vfs.ts`, change the flush in `fsync()` (line ~418) fro
 
 - [ ] **Step 4: Add the Vfs.fsync propagation test**
 
-Grep `packages/vfs/test/` for `new Vfs(` to find the vfs-level test file and its mount/construction API. Add a case there asserting `Vfs.fsync(fd)` rejects when the mount's barrier fails (adapt construction to that file's helper; the mount backend must be a `CachedBackend(flushFlaky(inner, 1))`):
+Grep `packages/vfs/test/` for `new Vfs(` to find the vfs-level test file and its mount/construction API. Add a case there asserting `Vfs.fsync(fd)` rejects when the mount's barrier fails (adapt construction to that file's helper; the mount backend must be a `CachedBackend(rollbackFlaky(inner, 1))`):
 ```ts
   it("Vfs.fsync rejects when the mount's durability barrier fails", async () => {
-    // construct a Vfs whose mount backend is new CachedBackend(flushFlaky(inner, 1), { flushDelayMs: 60_000 })
+    // construct a Vfs whose mount backend is new CachedBackend(rollbackFlaky(inner, 1), { flushDelayMs: 60_000 })
     const fd = await vfs.open("/f", "w");
     await vfs.write(fd, enc.encode("x"));
     await expect(vfs.fsync(fd)).rejects.toMatchObject({ errno: "ENOSPC" });
@@ -301,7 +311,7 @@ git commit -m "feat(vfs): fsync-strict — Vfs.fsync/unmount reject on a non-dur
 ```ts
   it("a cache-miss read after a failed drain does not read rolled-back inner state", async () => {
     const inner = new MemoryBackend();
-    const be = new CachedBackend(flushFlaky(inner, 1), { flushDelayMs: 60_000 });
+    const be = new CachedBackend(rollbackFlaky(inner, 1), { flushDelayMs: 60_000 });
     const root = await be.root();
     const a = ulid();
     await be.create(root, "a", a, "file"); // queued, not durable
@@ -356,7 +366,7 @@ git commit -m "test(vfs): read-side drain propagates a barrier failure instead o
 ```ts
   it("backpressure: when write-back is unhealthy and over the byte bound, writes fail ENOSPC before mutating", async () => {
     const inner = new MemoryBackend();
-    const be = new CachedBackend(flushFlaky(inner, 100), { flushDelayMs: 60_000, maxDirtyBytes: 8 });
+    const be = new CachedBackend(rollbackFlaky(inner, 100), { flushDelayMs: 60_000, maxDirtyBytes: 8 });
     be.onFlushError = () => {};
     const root = await be.root();
     const f = ulid();
@@ -453,7 +463,7 @@ git commit -m "feat(vfs): bounded write-back with synchronous ENOSPC backpressur
 ```ts
   it("integration: cache and backend agree after a transient flush outage", async () => {
     const inner = new MemoryBackend();
-    const be = new CachedBackend(flushFlaky(inner, 2), { flushDelayMs: 60_000 });
+    const be = new CachedBackend(rollbackFlaky(inner, 2), { flushDelayMs: 60_000 });
     be.onFlushError = () => {};
     const root = await be.root();
     const f = ulid();
