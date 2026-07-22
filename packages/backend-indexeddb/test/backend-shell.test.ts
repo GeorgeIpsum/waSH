@@ -35,7 +35,7 @@ describe("IndexedDBBackend shell", () => {
       hardlinks: true,
       atomicDirRename: true,
       renameCost: "O1",
-      fdRetention: false,
+      fdRetention: true,
     });
     be.close();
   });
