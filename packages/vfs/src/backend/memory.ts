@@ -27,7 +27,13 @@ function mkAttrs(kind: NodeKind, overrides?: Partial<Attrs>): Attrs {
 }
 
 export class MemoryBackend implements WashBackend {
-  readonly caps: BackendCaps = { symlinks: "supported", hardlinks: true, atomicDirRename: true, renameCost: "O1" };
+  readonly caps: BackendCaps = {
+    symlinks: "supported",
+    hardlinks: true,
+    atomicDirRename: true,
+    renameCost: "O1",
+    fdRetention: false,
+  };
   private nodes = new Map<NodeId, MemNode>();
   private rootId: NodeId = ulid();
 

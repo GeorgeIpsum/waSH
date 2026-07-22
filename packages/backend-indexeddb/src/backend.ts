@@ -37,6 +37,7 @@ export class IndexedDBBackend implements WashBackend {
     hardlinks: true,
     atomicDirRename: true,
     renameCost: "O1",
+    fdRetention: false,
   };
 
   private tx: IDBTransaction | null = null;

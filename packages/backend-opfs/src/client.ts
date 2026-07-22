@@ -17,6 +17,7 @@ export class OpfsBackend implements WashBackend {
     atomicDirRename: true,
     renameCost: "O1",
     reservedNames: [],
+    fdRetention: false,
   };
 
   private nextId = 1;
