@@ -585,6 +585,12 @@ export class CachedBackend implements WashBackend {
    *  displace, then forward to `inner` — ENQUEUED (not awaited now) so it lands ordered
    *  after this id's already-queued `create`/writes and never races ahead of them. */
   async retain(id: NodeId): Promise<void> {
+    // Unlike the raw backends, we deliberately do NOT validate existence here: the
+    // `attrCache` is not an authoritative existence oracle (a live id may be uncached),
+    // so a cache-based check would risk a false ENOENT. Correctness rests on the caller
+    // contract — `Vfs.open` only retains an id it just resolved or created — plus the FIFO
+    // ordering above, which guarantees the enqueued `inner.retain` lands after this id's
+    // `inner.create`, so it never ENOENTs at the backend.
     this.retains.set(id, (this.retains.get(id) ?? 0) + 1);
     this.enqueue(() => Promise.resolve(this.inner.retain?.(id)));
   }

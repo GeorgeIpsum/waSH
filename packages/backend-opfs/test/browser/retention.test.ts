@@ -91,5 +91,6 @@ describe("OpfsBackend retain/release (F4)", () => {
       names.push(n);
     }
     expect(names.some((n) => n.startsWith(f))).toBe(false); // f's chunk file is gone
+    await be2.close(); // opened outside `opened[]` — close it so its worker/Web-Lock doesn't leak
   });
 });

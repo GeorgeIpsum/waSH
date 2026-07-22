@@ -329,7 +329,17 @@ export class Vfs {
     const file = this.fds.alloc(target.backend, target.id, flags);
     // O_APPEND affects writes only (write() re-derives EOF per call);
     // "a+" fds read from the start, so only write-only append flags seed pos.
-    if (flags === "a" || flags === "ax") file.pos = (await target.backend.getattr(target.id)).size;
+    if (flags === "a" || flags === "ax") {
+      try {
+        file.pos = (await target.backend.getattr(target.id)).size;
+      } catch (e) {
+        // all-or-nothing (§A.4): a seek fault after alloc must leak neither the fd
+        // entry nor the retain — undo both before surfacing the error.
+        this.fds.close(file.fd);
+        await Promise.resolve(target.backend.release?.(target.id)).catch(() => {});
+        throw e;
+      }
+    }
     return file.fd;
   }
 
