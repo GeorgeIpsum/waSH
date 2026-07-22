@@ -17,7 +17,7 @@ export class OpfsBackend implements WashBackend {
     atomicDirRename: true,
     renameCost: "O1",
     reservedNames: [],
-    fdRetention: false,
+    fdRetention: true,
   };
 
   private nextId = 1;
@@ -117,6 +117,14 @@ export class OpfsBackend implements WashBackend {
 
   async unlink(parent: NodeId, name: string): Promise<void> {
     await this.call("unlink", [parent, name]);
+  }
+
+  async retain(id: NodeId): Promise<void> {
+    await this.call("retain", [id]);
+  }
+
+  async release(id: NodeId): Promise<void> {
+    await this.call("release", [id]);
   }
 
   async rename(fromParent: NodeId, fromName: string, toParent: NodeId, toName: string): Promise<void> {
