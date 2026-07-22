@@ -32,10 +32,11 @@ export class MemoryBackend implements WashBackend {
     hardlinks: true,
     atomicDirRename: true,
     renameCost: "O1",
-    fdRetention: false,
+    fdRetention: true,
   };
   private nodes = new Map<NodeId, MemNode>();
   private rootId: NodeId = ulid();
+  private retains = new Map<NodeId, number>();
 
   constructor() {
     this.nodes.set(this.rootId, { attrs: mkAttrs("dir"), data: new Uint8Array(0), children: new Map(), target: null });
@@ -129,7 +130,21 @@ export class MemoryBackend implements WashBackend {
   private decNlinkAndMaybeGC(id: NodeId): void {
     const n = this.node(id);
     n.attrs.nlink -= 1;
-    if (n.attrs.nlink <= 0) this.nodes.delete(id);
+    // Keep an anonymous inode alive while an fd retains it (§A.1); release() reclaims it.
+    if (n.attrs.nlink <= 0 && (this.retains.get(id) ?? 0) === 0) this.nodes.delete(id);
+  }
+
+  retain(id: NodeId): void {
+    this.retains.set(id, (this.retains.get(id) ?? 0) + 1);
+  }
+
+  release(id: NodeId): void {
+    const n = (this.retains.get(id) ?? 0) - 1;
+    if (n > 0) { this.retains.set(id, n); return; }
+    this.retains.delete(id);
+    // Reference count hit zero: reclaim iff the inode is now anonymous (nlink 0).
+    const node = this.nodes.get(id);
+    if (node && node.attrs.nlink <= 0) this.nodes.delete(id);
   }
 
   async unlink(parent: NodeId, name: string): Promise<void> {
