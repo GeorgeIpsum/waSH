@@ -450,4 +450,39 @@ describe("CachedBackend write-back", () => {
     await be.flush(); // retry succeeds
     expect((await inner.lookup(root, "a"))?.id).toBe(a);
   });
+
+  it("backpressure: when write-back is unhealthy and over the byte bound, writes fail ENOSPC before mutating", async () => {
+    const inner = new MemoryBackend();
+    // failTimes: 1 — a single barrier failure is enough to flip `unhealthy` (the
+    // property under test). The later `be.read(g, ...)` below is a cache miss (no
+    // dirty buffer for `g`), so its `drain()` performs a second real flush cycle;
+    // that cycle must be allowed to succeed (queue drains, `f`'s content lands)
+    // rather than fail again, or the read would reject instead of resolving to the
+    // empty buffer the assertion checks for — this test is about one barrier
+    // failure gating one over-bound write, not about surviving repeated failures.
+    const be = new CachedBackend(rollbackFlaky(inner, 1), { flushDelayMs: 60_000, maxDirtyBytes: 8 });
+    be.onFlushError = () => {};
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, new Uint8Array(8));                     // fills the bound (healthy → allowed)
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" }); // barrier fails → unhealthy
+    const g = ulid();
+    await be.create(root, "g", g, "file");
+    const before = be.pendingOps();
+    await expect(be.write(g, 0, new Uint8Array(8))).rejects.toMatchObject({ errno: "ENOSPC" });
+    expect(be.pendingOps()).toBe(before);                        // rejected before enqueuing
+    expect((await be.read(g, 0, 100)).byteLength).toBe(0);       // and before mutating dirtyData
+  });
+
+  it("backpressure never fires while write-back is healthy", async () => {
+    const inner = new MemoryBackend();
+    const be = new CachedBackend(inner, { flushDelayMs: 60_000, maxDirtyBytes: 8 });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, new Uint8Array(1000)); // healthy: well over the bound, still accepted
+    await be.flush();
+    expect((await inner.read(f, 0, 1000)).byteLength).toBe(1000);
+  });
 });

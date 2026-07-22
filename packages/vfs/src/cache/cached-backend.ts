@@ -66,6 +66,40 @@ export class CachedBackend implements WashBackend {
   // optimization for backends (e.g. IndexedDB) where it matters.
   private dirtyData = new Map<NodeId, Uint8Array>();
 
+  // Bounded write-back (spec §B.6): `liveDirtyBytes` tracks the summed byteLength
+  // of every live `dirtyData` buffer, maintained solely by `setDirty`/`deleteDirty`
+  // below — no other call site may mutate `dirtyData` for content payloads.
+  // `unhealthy` records whether the last durability barrier failed (cleared on the
+  // next successful barrier); `admit()` only ever rejects while unhealthy.
+  private liveDirtyBytes = 0;
+  private unhealthy = false;
+  private get maxDirtyBytes(): number {
+    return this.opts.maxDirtyBytes ?? 64 * 1024 * 1024;
+  }
+
+  /** Installs `buf` as `id`'s dirty buffer, keeping `liveDirtyBytes` in sync. */
+  private setDirty(id: NodeId, buf: Uint8Array): void {
+    const old = this.dirtyData.get(id);
+    this.liveDirtyBytes += buf.byteLength - (old?.byteLength ?? 0);
+    this.dirtyData.set(id, buf);
+  }
+
+  /** Removes `id`'s dirty buffer (if any), keeping `liveDirtyBytes` in sync. */
+  private deleteDirty(id: NodeId): void {
+    const old = this.dirtyData.get(id);
+    if (old) this.liveDirtyBytes -= old.byteLength;
+    this.dirtyData.delete(id);
+  }
+
+  /** Synchronous reservation: reject before mutating if write-back is unhealthy and
+   *  the projected live-payload total would exceed the bound. delta = new buffer bytes
+   *  minus the buffer this write replaces (negative on a shrink → always admits). */
+  private admit(delta: number): void {
+    if (this.unhealthy && delta > 0 && this.liveDirtyBytes + delta > this.maxDirtyBytes) {
+      throw new VfsError("ENOSPC");
+    }
+  }
+
   /** ids with a content-flush op queued or in-flight (coalescing gate; replaces the
    *  old `dirtyData.has` gate, which is unusable now that deletion is deferred). */
   private contentOpPending = new Set<NodeId>();
@@ -170,7 +204,10 @@ export class CachedBackend implements WashBackend {
       this.enqueue(() => this.inner.link!(parent, name, id));
     });
 
-  constructor(protected inner: WashBackend, protected opts: { flushDelayMs?: number } = {}) {
+  constructor(
+    protected inner: WashBackend,
+    protected opts: { flushDelayMs?: number; maxDirtyBytes?: number } = {},
+  ) {
     this.caps = inner.caps;
     if (!inner.symlink) this.symlink = undefined as never;
     if (!inner.readlink) this.readlink = undefined as never;
@@ -213,7 +250,7 @@ export class CachedBackend implements WashBackend {
     if (kind === "dir") {
       this.attrCache.delete(id);
       this.readdirCache.delete(id);
-      this.dirtyData.delete(id); // dirs never carry a dirty buffer; defensive no-op
+      this.deleteDirty(id); // dirs never carry a dirty buffer; defensive no-op
       this.contentOpPending.delete(id);
       return;
     }
@@ -224,7 +261,7 @@ export class CachedBackend implements WashBackend {
       if (hit.nlink <= 0) {
         this.attrCache.delete(id);
         if (wasOnlyLink || this.caps.hardlinks === false) {
-          this.dirtyData.delete(id);
+          this.deleteDirty(id);
           this.contentOpPending.delete(id);
         }
       }
@@ -281,6 +318,7 @@ export class CachedBackend implements WashBackend {
           } catch {
             this.queue.unshift(...applied);
             this.discardContentConfirm();
+            this.unhealthy = true;
           }
           throw e;
         }
@@ -289,9 +327,11 @@ export class CachedBackend implements WashBackend {
       try {
         await this.inner.flush(opts);   // durability BARRIER
         this.confirmContent();          // the batch is durable
+        this.unhealthy = false;
       } catch (e) {
         this.queue.unshift(...applied); // backend rolled the batch back → replay next cycle
         this.discardContentConfirm();   // buffers stay in dirtyData for the replay
+        this.unhealthy = true;
         throw e;
       }
     })();
@@ -470,7 +510,7 @@ export class CachedBackend implements WashBackend {
    *  re-dirty installs a fresh Uint8Array with its own later content op). */
   private confirmContent(): void {
     for (const { id, buf } of this.pendingContentConfirm) {
-      if (this.dirtyData.get(id) === buf) this.dirtyData.delete(id);
+      if (this.dirtyData.get(id) === buf) this.deleteDirty(id);
     }
     this.pendingContentConfirm = [];
   }
@@ -514,8 +554,9 @@ export class CachedBackend implements WashBackend {
       const next = new Uint8Array(end);
       next.set(cur, 0);
       next.set(data, offset);
+      this.admit(next.byteLength - (this.dirtyData.get(id)?.byteLength ?? 0));
       this.queueContentFlush(id);
-      this.dirtyData.set(id, next);
+      this.setDirty(id, next);
       const hit = this.attrCache.get(id);
       if (hit) {
         hit.size = end;
@@ -531,8 +572,9 @@ export class CachedBackend implements WashBackend {
       const cur = await this.materialize(id, attrs);
       const next = new Uint8Array(size);
       next.set(cur.slice(0, Math.min(size, cur.byteLength)), 0);
+      this.admit(next.byteLength - (this.dirtyData.get(id)?.byteLength ?? 0));
       this.queueContentFlush(id);
-      this.dirtyData.set(id, next);
+      this.setDirty(id, next);
       const hit = this.attrCache.get(id);
       if (hit) {
         hit.size = size;
