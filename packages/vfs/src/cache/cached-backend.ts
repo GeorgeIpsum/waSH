@@ -67,8 +67,12 @@ export class CachedBackend implements WashBackend {
   private dirtyData = new Map<NodeId, Uint8Array>();
 
   // Bounded write-back (spec §B.6): `liveDirtyBytes` tracks the summed byteLength
-  // of every live `dirtyData` buffer, maintained solely by `setDirty`/`deleteDirty`
-  // below — no other call site may mutate `dirtyData` for content payloads.
+  // of every live owned content payload — every content op currently queued or
+  // in-flight owns an immutable buffer (§B.3/§B.4), and this is the sum of those
+  // buffers' byteLengths. Charged in `enqueueContentOp` (op enqueued), uncharged
+  // in `confirmContent` (op durably confirmed) — NOT touched by `dirtyData`
+  // set/delete or by `dropVictim`, since the read-view cache and the owned
+  // write-back payload are tracked independently.
   // `unhealthy` records whether the last durability barrier failed (cleared on the
   // next successful barrier); `admit()` only ever rejects while unhealthy.
   private liveDirtyBytes = 0;
@@ -77,32 +81,15 @@ export class CachedBackend implements WashBackend {
     return this.opts.maxDirtyBytes ?? 64 * 1024 * 1024;
   }
 
-  /** Installs `buf` as `id`'s dirty buffer, keeping `liveDirtyBytes` in sync. */
-  private setDirty(id: NodeId, buf: Uint8Array): void {
-    const old = this.dirtyData.get(id);
-    this.liveDirtyBytes += buf.byteLength - (old?.byteLength ?? 0);
-    this.dirtyData.set(id, buf);
-  }
-
-  /** Removes `id`'s dirty buffer (if any), keeping `liveDirtyBytes` in sync. */
-  private deleteDirty(id: NodeId): void {
-    const old = this.dirtyData.get(id);
-    if (old) this.liveDirtyBytes -= old.byteLength;
-    this.dirtyData.delete(id);
-  }
-
-  /** Synchronous reservation: reject before mutating if write-back is unhealthy and
-   *  the projected live-payload total would exceed the bound. delta = new buffer bytes
-   *  minus the buffer this write replaces (negative on a shrink → always admits). */
-  private admit(delta: number): void {
-    if (this.unhealthy && delta > 0 && this.liveDirtyBytes + delta > this.maxDirtyBytes) {
+  /** Synchronous reservation (spec §B.6): reject before mutating if write-back is unhealthy
+   *  and admitting this new owned payload would exceed the bound. Each write/truncate adds a
+   *  full owned buffer to the live set, so charge the full projected size (spec F11/F12). */
+  private admit(bytes: number): void {
+    if (this.unhealthy && this.liveDirtyBytes + bytes > this.maxDirtyBytes) {
       throw new VfsError("ENOSPC");
     }
   }
 
-  /** ids with a content-flush op queued or in-flight (coalescing gate; replaces the
-   *  old `dirtyData.has` gate, which is unusable now that deletion is deferred). */
-  private contentOpPending = new Set<NodeId>();
   /** content buffers applied to `inner` this flush cycle, awaiting durable-confirm. */
   private pendingContentConfirm: Array<{ id: NodeId; buf: Uint8Array }> = [];
 
@@ -250,8 +237,7 @@ export class CachedBackend implements WashBackend {
     if (kind === "dir") {
       this.attrCache.delete(id);
       this.readdirCache.delete(id);
-      this.deleteDirty(id); // dirs never carry a dirty buffer; defensive no-op
-      this.contentOpPending.delete(id);
+      this.dirtyData.delete(id); // dirs never carry a dirty buffer; defensive no-op
       return;
     }
     const hit = this.attrCache.get(id);
@@ -261,8 +247,7 @@ export class CachedBackend implements WashBackend {
       if (hit.nlink <= 0) {
         this.attrCache.delete(id);
         if (wasOnlyLink || this.caps.hardlinks === false) {
-          this.deleteDirty(id);
-          this.contentOpPending.delete(id);
+          this.dirtyData.delete(id);
         }
       }
     }
@@ -301,17 +286,22 @@ export class CachedBackend implements WashBackend {
       this.timer = null;
     }
     const run = (async () => {
+      // Snapshot the call-time prefix (F4): the barrier applies to a FINITE batch, so
+      // a strict fsync always reaches it — ops enqueued mid-cycle collect in the live
+      // queue as a later batch (never chased by this flush → no writer can starve fsync).
+      const batch = this.queue.splice(0);
       const applied: Array<() => Promise<void>> = [];
-      while (this.queue.length > 0) {
-        const op = this.queue[0]!;
+      while (batch.length > 0) {
+        const op = batch[0]!;
         try {
           await op();
         } catch (e) {
-          // Per-op APPLICATION failure (narrow contract): the op is self-atomic and
-          // stays at the head; the applied prefix stays applied. Give the backend a
-          // durability point (sticky-abort backends clear it in flush()); if THAT
-          // flush also rejects the backend rolled the batch back, so re-queue the
-          // applied prefix (the same rule as the barrier path below).
+          // Per-op APPLICATION failure (narrow contract): self-atomic; the failed op
+          // and the un-run remainder go back to the FRONT of the live queue, ahead of
+          // any mid-cycle ops. Give the backend a durability point for the applied
+          // prefix; if THAT flush also rejects the backend rolled the prefix back, so
+          // re-queue it too (ahead of the remainder).
+          this.queue.unshift(...batch);
           try {
             await this.inner.flush(opts);
             this.confirmContent();
@@ -322,15 +312,15 @@ export class CachedBackend implements WashBackend {
           }
           throw e;
         }
-        applied.push(this.queue.shift()!);
+        applied.push(batch.shift()!);
       }
       try {
-        await this.inner.flush(opts);   // durability BARRIER
-        this.confirmContent();          // the batch is durable
+        await this.inner.flush(opts);   // durability BARRIER (finite batch)
+        this.confirmContent();
         this.unhealthy = false;
       } catch (e) {
         this.queue.unshift(...applied); // backend rolled the batch back → replay next cycle
-        this.discardContentConfirm();   // buffers stay in dirtyData for the replay
+        this.discardContentConfirm();
         this.unhealthy = true;
         throw e;
       }
@@ -498,19 +488,28 @@ export class CachedBackend implements WashBackend {
     return this.inner.read(id, 0, attrs.size);
   }
 
-  /** Queues the single write-back op for `id`'s content, once per dirty session. */
-  private queueContentFlush(id: NodeId): void {
-    if (this.contentOpPending.has(id)) return; // op already queued/in-flight; it re-reads dirtyData
-    this.contentOpPending.add(id);
-    this.enqueueContentOp(id);
+  /** Enqueue a content-flush op that OWNS the immutable buffer `buf` (§B.3): replay
+   *  writes exactly `buf`, never re-reading live `dirtyData` (which could apply a newer
+   *  version under an fsync that barriered this one). `write`/`truncate` install a fresh
+   *  Uint8Array each time, so each call is its own entry; `dirtyData[id]` stays the
+   *  optimistic latest for reads. The owned buffer is a live write-back payload
+   *  (`liveDirtyBytes`) until its batch is durably confirmed. */
+  private enqueueContentOp(id: NodeId, buf: Uint8Array): void {
+    this.liveDirtyBytes += buf.byteLength;
+    this.enqueue(async () => {
+      await this.inner.truncate(id, buf.byteLength);
+      if (buf.byteLength > 0) await this.inner.write(id, 0, buf);
+      this.pendingContentConfirm.push({ id, buf });
+    });
   }
 
-  /** After a successful inner.flush(): the recorded content buffers are durable.
-   *  Delete each dirtyData[id] only if it is still that op's buffer (a concurrent
-   *  re-dirty installs a fresh Uint8Array with its own later content op). */
+  /** After a successful barrier: each owned content buffer is durable — uncharge it and
+   *  drop the read-view `dirtyData[id]` if it is still that buffer (a later write installed
+   *  a newer buffer with its own entry — keep that one). */
   private confirmContent(): void {
     for (const { id, buf } of this.pendingContentConfirm) {
-      if (this.dirtyData.get(id) === buf) this.deleteDirty(id);
+      this.liveDirtyBytes -= buf.byteLength;
+      if (this.dirtyData.get(id) === buf) this.dirtyData.delete(id);
     }
     this.pendingContentConfirm = [];
   }
@@ -519,29 +518,6 @@ export class CachedBackend implements WashBackend {
    *  re-queue); just clear the confirm list — the next cycle rebuilds it. */
   private discardContentConfirm(): void {
     this.pendingContentConfirm = [];
-  }
-
-  /**
-   * The actual content-flush op. Split out from `queueContentFlush` so a
-   * write/truncate that re-dirties `id` while this op's inner calls are still
-   * in flight can re-enqueue itself once the identity check below detects the
-   * newer buffer — otherwise `queueContentFlush`'s "buffer present ⟹ op
-   * pending" gate would stay closed forever (the buffer is only deleted
-   * *after* inner succeeds), permanently stranding the newer content
-   * unflushed even though `pendingOps()` reports zero.
-   */
-  private enqueueContentOp(id: NodeId): void {
-    this.enqueue(async () => {
-      const buf = this.dirtyData.get(id);
-      if (!buf) { this.contentOpPending.delete(id); return; } // evicted/unlinked before this op ran
-      await this.inner.truncate(id, buf.byteLength);
-      if (buf.byteLength > 0) await this.inner.write(id, 0, buf);
-      // Applied to inner but NOT durable: keep the buffer so a barrier failure can
-      // replay it; record it for identity-guarded durable-confirm cleanup.
-      this.pendingContentConfirm.push({ id, buf });
-      this.contentOpPending.delete(id);          // op finished applying → gate reopens
-      if (this.dirtyData.get(id) !== buf) this.queueContentFlush(id); // re-dirtied mid-op → fresh op
-    });
   }
 
   async write(id: NodeId, offset: number, data: Uint8Array): Promise<void> {
@@ -554,9 +530,9 @@ export class CachedBackend implements WashBackend {
       const next = new Uint8Array(end);
       next.set(cur, 0);
       next.set(data, offset);
-      this.admit(next.byteLength - (this.dirtyData.get(id)?.byteLength ?? 0));
-      this.queueContentFlush(id);
-      this.setDirty(id, next);
+      this.admit(next.byteLength);
+      this.enqueueContentOp(id, next);
+      this.dirtyData.set(id, next);
       const hit = this.attrCache.get(id);
       if (hit) {
         hit.size = end;
@@ -572,9 +548,9 @@ export class CachedBackend implements WashBackend {
       const cur = await this.materialize(id, attrs);
       const next = new Uint8Array(size);
       next.set(cur.slice(0, Math.min(size, cur.byteLength)), 0);
-      this.admit(next.byteLength - (this.dirtyData.get(id)?.byteLength ?? 0));
-      this.queueContentFlush(id);
-      this.setDirty(id, next);
+      this.admit(next.byteLength);
+      this.enqueueContentOp(id, next);
+      this.dirtyData.set(id, next);
       const hit = this.attrCache.get(id);
       if (hit) {
         hit.size = size;

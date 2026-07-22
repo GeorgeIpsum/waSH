@@ -503,4 +503,46 @@ describe("CachedBackend write-back", () => {
     expect(dec.decode(await inner.read(f, 0, 100))).toBe("hello");
     expect(be.pendingOps()).toBe(0);
   });
+
+  it("a flush barriers only the call-time batch; a mid-flush write is a later batch (F4 termination)", async () => {
+    const inner = new MemoryBackend();
+    const be = new CachedBackend(inner, { flushDelayMs: 60_000 });
+    const root = await be.root();
+    const a = ulid(), b = ulid();
+    await be.create(root, "a", a, "file");
+    const flushing = be.flush({ strict: true }); // synchronously snapshots [createA]
+    await be.create(root, "b", b, "file");        // enqueued AFTER the splice → a later batch
+    await flushing;
+    expect((await inner.lookup(root, "a"))?.id).toBe(a); // call-time batch durable
+    expect(be.pendingOps()).toBe(1);                     // b was NOT drained by a's flush
+    await be.flush();
+    expect((await inner.lookup(root, "b"))?.id).toBe(b);
+  });
+
+  it("each write enqueues its own owned content entry (no coalescing) and applies in order", async () => {
+    const inner = new MemoryBackend();
+    const be = new CachedBackend(inner, { flushDelayMs: 60_000 });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.flush();
+    await be.write(f, 0, enc.encode("AAAA"));
+    await be.write(f, 0, enc.encode("BBBB")); // re-dirty → its OWN entry, not coalesced
+    expect(be.pendingOps()).toBe(2);           // two owned content ops (§B.4: a re-dirty enqueues its own entry)
+    await be.flush();
+    expect(dec.decode(await inner.read(f, 0, 100))).toBe("BBBB"); // ops replay in order → latest wins
+  });
+
+  it("owned payload: a barrier-failed content batch replays its captured buffer on retry", async () => {
+    // (Reconfirms the retain/replay property under the owned-payload model.)
+    const inner = new MemoryBackend();
+    const be = new CachedBackend(rollbackFlaky(inner, 1), { flushDelayMs: 60_000 });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("hello"));
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" }); // barrier fails; batch re-queued (owns "hello")
+    await be.flush();                                                     // retry writes the owned buffer
+    expect(dec.decode(await inner.read(f, 0, 100))).toBe("hello");
+  });
 });
