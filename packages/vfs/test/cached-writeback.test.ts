@@ -431,4 +431,23 @@ describe("CachedBackend write-back", () => {
     await vfs.write(fd, enc.encode("x"));
     await expect(vfs.fsync()).rejects.toMatchObject({ errno: "ENOSPC" });
   });
+
+  // Task 3 (read-side drain propagation): a cache-miss read must reject when its
+  // drain()'s barrier fails, never silently fall through to reading rolled-back
+  // `inner` state. `create()` primes attrCache/readdirCache/lookupCache for
+  // everything it touches (root's dirent map and node `a`'s attrs), so readdir(root)
+  // or getattr(a) would be served from cache without draining at all — not a
+  // genuine cache miss. `ghost` is an id `be` has never seen, so getattr(ghost) is
+  // guaranteed to miss attrCache and call drain() unconditionally.
+  it("a cache-miss read after a failed drain does not read rolled-back inner state", async () => {
+    const inner = new MemoryBackend();
+    const be = new CachedBackend(rollbackFlaky(inner, 1), { flushDelayMs: 60_000 });
+    const root = await be.root();
+    const a = ulid();
+    await be.create(root, "a", a, "file"); // queued, not durable
+    const ghost = ulid(); // never touched by `be` — guaranteed attrCache miss
+    await expect(be.getattr(ghost)).rejects.toMatchObject({ errno: "ENOSPC" }); // drain's barrier fails
+    await be.flush(); // retry succeeds
+    expect((await inner.lookup(root, "a"))?.id).toBe(a);
+  });
 });
