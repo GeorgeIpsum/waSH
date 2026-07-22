@@ -15,7 +15,7 @@
 - **CachedBackend is the retain owner (§A.2):** keeps its own per-id retain-count; while retain-count > 0 it does NOT drop that id's `attrCache`/`dirtyData` on `unlink`/`rename`-displace (`dropVictim` respects retain); `inner.retain`/`inner.release` are **enqueued into and ordered with the write-back queue** (an inner retain never precedes the inode's queued `create`).
 - **Every last-reference drop respects retain (§A.3):** `unlink`, `rename`-over (displaced target), overwrite — in BOTH `CachedBackend.dropVictim` AND the raw backends' reclamation choke points. Not just `unlink`.
 - **open() is all-or-nothing (§A.4):** `Vfs.open` leaves no visible side effect when it returns no fd. For `O_TRUNC` on an existing inode, `retain` BEFORE the truncate. For create, `create → retain`, and roll back the create (`unlink`) on retain failure. Any failure after a successful `retain` calls `release`. (Accepted residual: an `O_TRUNC` that truncates then fails on a purely in-memory later step leaves the file truncated — POSIX-acceptable.)
-- **release is best-effort (§A.5):** the backend's `release` is a per-fd decrement (reclaim at zero-with-`nlink`-zero); a transient failure must not wedge `close`. `Vfs.close` must not reject because `release` rejected.
+- **retain validates, release is lenient (§A.2/A.5):** `retain(id)` throws `ENOENT` if the inode is unknown — this is what makes the write-back **ordering** requirement meaningful (a premature `inner.retain` before a queued `create` would ENOENT; ordering avoids it). `release(id)` is best-effort: a per-fd decrement that **no-ops on an unknown id** (never throws), reclaiming only at retain-0-with-`nlink`-0; a transient failure must not wedge `close`. `Vfs.close` must not reject because `release` rejected.
 - **Explicit capability (§A.6):** `caps.fdRetention: boolean`. All three backends set it `true` once they implement retain/release. A WRITABLE mount used by the shell engine requires it — `Vfs.mount` rejects (clear error) a writable mount whose backend lacks `fdRetention`. The `retain?`/`release?` hooks stay `?`-optional in the TS interface for read-only/exotic backends.
 - **Open-time unreachable-`nlink0` sweep (§A.7):** on open, treat an inode with `nlink === 0` AND no dirent (unreachable) as garbage in EVERY GC view (OPFS: the working manifest AND both on-disk A/B slots via `unionLiveChunkFiles`; IDB: a new orphan sweep). Safe because retain is gone on reopen — no live fd needs an `nlink:0`-unreachable inode.
 - ESM, TS strict, ES2022. `VfsError` from `../errors.js`. Conventional commits per green cycle. Branch: continue on `feat/pre-plan4-durability` (this is Plan 3 of the same branch/PR #4) — verify with `git branch --show-current`.
@@ -468,6 +468,7 @@ Run RED (browser): `pnpm --filter @wash/backend-opfs test:browser retention` →
 In `packages/backend-opfs/src/worker.ts`, inside the module/worker scope add `const retains = new Map<string, number>();` and two ops in the `ops` registry (mirror `ops.gc`):
 ```ts
     async retain(id: NodeId): Promise<OpResult> {
+      if (!mani.inodes[id]) throw new VfsError("ENOENT", id); // retain validates existence (contract)
       retains.set(id, (retains.get(id) ?? 0) + 1);
       return { value: undefined };
     },
@@ -550,7 +551,8 @@ Run RED (Node): `pnpm --filter @wash/backend-indexeddb test retention` → FAIL.
 
 In `packages/backend-indexeddb/src/backend.ts`: add `private retains = new Map<NodeId, number>();` and:
 ```ts
-  retain(id: NodeId): void {
+  async retain(id: NodeId): Promise<void> {
+    await this.withTx(async (tx, r) => { await this.getInode(tx, r, id); }); // validates existence → ENOENT if unknown
     this.retains.set(id, (this.retains.get(id) ?? 0) + 1);
   }
   async release(id: NodeId): Promise<void> {
