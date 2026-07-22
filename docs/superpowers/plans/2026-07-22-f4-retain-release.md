@@ -264,15 +264,17 @@ git commit -m "feat(vfs): CachedBackend retain/release — retain owner; dropVic
 
 ---
 
-### Task 4: FdTable + Vfs.open/close wiring + writable-mount cap check
+### Task 4: FdTable + Vfs.open/close retain wiring
+
+> **Amendment (2026-07-22):** the `Vfs.mount` writable-cap check moved OUT of this task to the capstone **Task 8** — the gate rejects any writable mount whose backend lacks `fdRetention`, but OPFS/IDB do not flip that cap to `true` until Tasks 6/7, so landing the gate here breaks the OPFS/IDB integration tests (they mount their raw backend into a `Vfs`). Task 4 is now the open/close retain wiring only; the gate lands last, once every backend advertises the cap.
 
 **Files:**
 - Modify: `packages/vfs/src/core/fd.ts`, `packages/vfs/src/core/vfs.ts`
 - Test: `packages/vfs/test/vfs-retention.test.ts`
 
 **Interfaces:**
-- Consumes: `WashBackend.retain?`/`release?`; `FdTable.alloc`/`get`/`close`; `Vfs.open`/`close`/`mount`.
-- Produces: `Vfs.open` retains all-or-nothing; `Vfs.close` releases once-only; `Vfs.mount` rejects a writable mount whose backend lacks `fdRetention`.
+- Consumes: `WashBackend.retain?`/`release?`; `FdTable.alloc`/`get`/`close`; `Vfs.open`/`close`.
+- Produces: `Vfs.open` retains all-or-nothing; `Vfs.close` releases once-only. (The `Vfs.mount` cap check is Task 8.)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -632,6 +634,50 @@ git add packages/backend-indexeddb/src/backend.ts packages/backend-indexeddb/tes
 git commit -m "feat(backend-indexeddb): retain/release + open-time orphan sweep (F4)"
 ```
 Then the full gate: `pnpm turbo build test typecheck` (Node) green, and the two browser suites green.
+
+### Task 8 (capstone): writable-mount `fdRetention` gate
+
+Lands LAST — after Tasks 6/7 flip OPFS and IDB to `fdRetention: true`, so no backend's integration tests break.
+
+**Files:**
+- Modify: `packages/vfs/src/core/vfs.ts` (`mount`)
+- Test: `packages/vfs/test/vfs-retention.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `packages/vfs/test/vfs-retention.test.ts`:
+```ts
+  it("a writable mount whose backend lacks fdRetention is rejected", async () => {
+    const vfs = new Vfs();
+    const be = new MemoryBackend();
+    (be.caps as { fdRetention: boolean }).fdRetention = false; // simulate a non-retaining backend
+    await expect(vfs.mount("/", be)).rejects.toMatchObject({ errno: "EINVAL" });
+  });
+```
+Run RED: `pnpm --filter @wash/vfs test vfs-retention -t "lacks fdRetention"` → FAIL (mount doesn't check the cap yet).
+
+- [ ] **Step 2: Add the gate**
+
+In `Vfs.mount(path, backend, opts?)` (grep `async mount`), reject a writable mount whose backend lacks the cap. If a read-only mount concept does not exist yet, apply unconditionally (note it in the report):
+```ts
+    if (!backend.caps.fdRetention /* && mount is writable */) {
+      throw new VfsError("EINVAL", "backend lacks fd-lifetime support (fdRetention); required for a writable mount");
+    }
+```
+
+- [ ] **Step 3: Full gate**
+
+Run: `pnpm turbo build test typecheck` (Node) + `pnpm --filter @wash/backend-opfs test:browser` + `pnpm --filter @wash/backend-indexeddb test:browser`.
+Expected: ALL green — every real backend now advertises `fdRetention: true`, so no `mount(...)` of a real backend is rejected; only the cap-forced-false test asserts the rejection.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add packages/vfs/src/core/vfs.ts packages/vfs/test/vfs-retention.test.ts
+git commit -m "feat(vfs): reject a writable mount whose backend lacks fdRetention (F4 capstone)"
+```
+
+---
 
 ## Exit criteria
 - `fd = open(f); unlink(f); read(fd)` succeeds; the inode is reclaimed only after the last `close` — across MemoryBackend, `CachedBackend`, OPFS, and IDB.
