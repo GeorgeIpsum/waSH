@@ -415,7 +415,7 @@ export class Vfs {
 
   async fsync(): Promise<void> {
     for (const m of [...this.mounts].sort((a, b) => a.path.length - b.path.length)) {
-      await m.backend.flush();
+      await m.backend.flush({ strict: true });
     }
   }
 
@@ -424,7 +424,7 @@ export class Vfs {
     if (p === "/") throw new VfsError("EINVAL", p);
     const m = this.mounts.find((x) => x.path === p);
     if (!m) throw new VfsError("ENOENT", p);
-    await m.backend.flush();
+    await m.backend.flush({ strict: true });
     const i = this.mounts.indexOf(m);
     if (i < 0) throw new VfsError("ENOENT", p);
     this.mounts.splice(i, 1);

@@ -4,6 +4,7 @@ import { MemoryBackend } from "../src/backend/memory.js";
 import { ulid } from "../src/ulid.js";
 import type { WashBackend } from "../src/types.js";
 import { VfsError } from "../src/errors.js";
+import { Vfs } from "../src/core/vfs.js";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -398,5 +399,36 @@ describe("CachedBackend write-back", () => {
     expect(dec.decode(await inner.read(g, 0, 100))).toBe("G2");
     expect(dec.decode(await inner.read(f, 0, 100))).toBe("F1");
     expect(be.pendingOps()).toBe(0);
+  });
+
+  it("strict flush rejects on a non-durable barrier; a non-strict auto-flush routes to onFlushError", async () => {
+    vi.useFakeTimers();
+    try {
+      const inner = new MemoryBackend();
+      const errs: unknown[] = [];
+      const be = new CachedBackend(rollbackFlaky(inner, 5), { flushDelayMs: 10 });
+      be.onFlushError = (e) => errs.push(e);
+      const root = await be.root();
+      await be.create(root, "a", ulid(), "file"); // arms the auto-flush timer
+      await vi.advanceTimersByTimeAsync(15);       // a background auto-flush fires and fails
+      expect(errs.length).toBeGreaterThan(0);       // non-strict: reported, not thrown
+      expect(be.pendingOps()).toBeGreaterThan(0);   // ops retained
+    } finally {
+      vi.useRealTimers();
+    }
+    const inner2 = new MemoryBackend();
+    const be2 = new CachedBackend(rollbackFlaky(inner2, 1), { flushDelayMs: 60_000 });
+    const r2 = await be2.root();
+    await be2.create(r2, "a", ulid(), "file");
+    await expect(be2.flush({ strict: true })).rejects.toMatchObject({ errno: "ENOSPC" });
+  });
+
+  it("Vfs.fsync rejects when the mount's durability barrier fails", async () => {
+    const inner = new MemoryBackend();
+    const vfs = new Vfs();
+    await vfs.mount("/", new CachedBackend(rollbackFlaky(inner, 1), { flushDelayMs: 60_000 }));
+    const fd = await vfs.open("/f", "w");
+    await vfs.write(fd, enc.encode("x"));
+    await expect(vfs.fsync()).rejects.toMatchObject({ errno: "ENOSPC" });
   });
 });
