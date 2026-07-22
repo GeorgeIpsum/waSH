@@ -33,6 +33,15 @@ describe("MemoryBackend retain/release", () => {
     await expect(be.getattr(b)).rejects.toMatchObject({ errno: "ENOENT" });
   });
 
+  it("retain on an unknown id throws ENOENT; release on an unknown id does not throw", async () => {
+    const be = new MemoryBackend();
+    const unknown = ulid();
+    expect(() => be.retain!(unknown)).toThrow(               // retain validates existence (§A.2)
+      expect.objectContaining({ errno: "ENOENT" }),
+    );
+    expect(() => be.release!(unknown)).not.toThrow();        // release is best-effort/lenient (§A.5)
+  });
+
   it("caps.fdRetention is true", () => {
     expect(new MemoryBackend().caps.fdRetention).toBe(true);
   });

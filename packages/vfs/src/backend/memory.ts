@@ -135,6 +135,7 @@ export class MemoryBackend implements WashBackend {
   }
 
   retain(id: NodeId): void {
+    if (!this.nodes.has(id)) throw new VfsError("ENOENT", id); // retain validates existence (§A.2)
     this.retains.set(id, (this.retains.get(id) ?? 0) + 1);
   }
 
