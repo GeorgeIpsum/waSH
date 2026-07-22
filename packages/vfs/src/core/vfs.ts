@@ -70,6 +70,11 @@ export class Vfs {
 
   async mount(path: string, backend: WashBackend, opts: { exclusive?: boolean } = {}): Promise<void> {
     const p = normalize(path);
+    // §A.6: a WRITABLE mount requires fd-lifetime support. There is no read-only
+    // mount concept yet, so this applies unconditionally (deferred: relax once one exists).
+    if (!backend.caps.fdRetention) {
+      throw new VfsError("EINVAL", "backend lacks fd-lifetime support (fdRetention); required for a writable mount");
+    }
     if (this.mounts.length === 0 && p !== "/") throw new VfsError("EINVAL", "first mount must be /");
     if (this.mounts.some((m) => m.path === p)) throw new VfsError("EEXIST", p);
     if (p !== "/") {
@@ -295,7 +300,13 @@ export class Vfs {
       const r = await this.resolve(p);
       if (r.attrs.kind === "dir") throw new VfsError("EISDIR", p);
       if (flags === "wx" || flags === "ax") throw new VfsError("EEXIST", p);
-      if (flags === "w" || flags === "w+") await r.backend.truncate(r.id, 0);
+      await r.backend.retain?.(r.id); // BEFORE truncate (§A.4): a retain failure aborts with content intact
+      try {
+        if (flags === "w" || flags === "w+") await r.backend.truncate(r.id, 0);
+      } catch (e) {
+        await Promise.resolve(r.backend.release?.(r.id)).catch(() => {});
+        throw e;
+      }
       target = { backend: r.backend, id: r.id };
     } catch (e) {
       if (!(e instanceof VfsError) || e.errno !== "ENOENT") throw e;
@@ -303,6 +314,12 @@ export class Vfs {
       const { backend, dirId, name } = await this.resolveParent(p);
       const id = ulid();
       await backend.create(dirId, name, id, "file");
+      try {
+        await backend.retain?.(id);
+      } catch (e2) {
+        await backend.unlink(dirId, name).catch(() => {}); // roll back the create (§A.4)
+        throw e2;
+      }
       target = { backend, id };
     }
     const file = this.fds.alloc(target.backend, target.id, flags);
@@ -339,7 +356,8 @@ export class Vfs {
   }
 
   async close(fd: number): Promise<void> {
-    this.fds.close(fd);
+    const file = this.fds.close(fd); // throws EBADF if already closed → no double release
+    await Promise.resolve(file.backend.release?.(file.id)).catch(() => {}); // best-effort (§A.5): never wedge close
   }
 
   async readFile(path: string): Promise<Uint8Array> {
