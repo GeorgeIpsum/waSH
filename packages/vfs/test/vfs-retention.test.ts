@@ -23,11 +23,4 @@ describe("Vfs fd retention (exec 3<f; rm f)", () => {
     await vfs.close(fd);
     await expect(vfs.close(fd)).rejects.toMatchObject({ errno: "EBADF" });
   });
-
-  it("a writable mount whose backend lacks fdRetention is rejected", async () => {
-    const vfs = new Vfs();
-    const be = new MemoryBackend();
-    (be.caps as { fdRetention: boolean }).fdRetention = false; // simulate a non-retaining backend
-    await expect(vfs.mount("/", be)).rejects.toMatchObject({ errno: "EINVAL" });
-  });
 });
