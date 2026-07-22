@@ -76,6 +76,11 @@ export class Vfs {
       const at = await this.resolve(p); // mountpoint must exist on parent mount
       if (at.attrs.kind !== "dir") throw new VfsError("ENOTDIR", p);
     }
+    // No read-only mount concept exists yet; every mount is writable, so this
+    // gate applies unconditionally (see F4 plan §Global Constraints, Task 8).
+    if (!backend.caps.fdRetention) {
+      throw new VfsError("EINVAL", "backend lacks fd-lifetime support (fdRetention); required for a writable mount");
+    }
     let release: (() => void) | undefined;
     const locks = (globalThis as { navigator?: { locks?: LockManagerLike } }).navigator?.locks;
     if (opts.exclusive && locks) {
