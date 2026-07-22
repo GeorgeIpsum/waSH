@@ -511,6 +511,7 @@ describe("CachedBackend write-back", () => {
     const a = ulid(), b = ulid();
     await be.create(root, "a", a, "file");
     const flushing = be.flush({ strict: true }); // synchronously snapshots [createA]
+    expect(be.pendingOps()).toBe(0); // splice drained the batch synchronously (old loop → 1 here)
     await be.create(root, "b", b, "file");        // enqueued AFTER the splice → a later batch
     await flushing;
     expect((await inner.lookup(root, "a"))?.id).toBe(a); // call-time batch durable
