@@ -546,4 +546,21 @@ describe("CachedBackend write-back", () => {
     await be.flush();                                                     // retry writes the owned buffer
     expect(dec.decode(await inner.read(f, 0, 100))).toBe("hello");
   });
+
+  it("re-queues a very large batch without a RangeError (concat, not spread)", async () => {
+    // Regression (PR #4 Codex P2): the flush re-queue used `queue.unshift(...batch/applied)`,
+    // which spreads one argument per op; V8 throws RangeError past ~125k args, and since the
+    // queue was spliced empty at flush start, that secondary throw would DROP the batch —
+    // reintroducing the divergence. All three re-queue sites now use `X.concat(this.queue)`
+    // (no arg limit). We make the FIRST op throw so the per-op-path concat runs on the full
+    // large batch immediately, without draining it (batch.shift() per op is O(n^2)).
+    const inner = new MemoryBackend();
+    const be = new CachedBackend(inner, { flushDelayMs: 60_000 });
+    const q = (be as unknown as { queue: Array<() => Promise<void>> }).queue;
+    const N = 150_000; // safely past V8's spread-arg limit (~125k)
+    q.push(async () => { throw new VfsError("EIO"); }); // per-op failure at the head
+    for (let i = 1; i < N; i++) q.push(async () => {});
+    await expect(be.flush()).rejects.toMatchObject({ errno: "EIO" }); // per-op fail → batch.concat re-queue
+    expect(be.pendingOps()).toBe(N); // the whole batch re-queued (failed op at head), none lost, no RangeError
+  });
 });

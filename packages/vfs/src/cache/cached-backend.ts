@@ -312,12 +312,17 @@ export class CachedBackend implements WashBackend {
           // any mid-cycle ops. Give the backend a durability point for the applied
           // prefix; if THAT flush also rejects the backend rolled the prefix back, so
           // re-queue it too (ahead of the remainder).
-          this.queue.unshift(...batch);
+          // Prepend via concat, NOT unshift(...batch): a spread passes one argument per
+          // op, so a large batch overflows V8's argument-count/stack limit with a
+          // RangeError — and since the queue was already spliced empty, that secondary
+          // throw would DROP the batch (reintroducing the divergence). concat has no
+          // such limit and preserves order: [failedOp, ...remainder, ...midCycle].
+          this.queue = batch.concat(this.queue);
           try {
             await this.inner.flush(opts);
             this.confirmContent();
           } catch {
-            this.queue.unshift(...applied);
+            this.queue = applied.concat(this.queue); // ahead of the remainder (see above)
             this.discardContentConfirm();
             this.unhealthy = true;
           }
@@ -330,7 +335,9 @@ export class CachedBackend implements WashBackend {
         this.confirmContent();
         this.unhealthy = false;
       } catch (e) {
-        this.queue.unshift(...applied); // backend rolled the batch back → replay next cycle
+        // concat, not unshift(...applied): the spread would RangeError on a large batch
+        // and drop it (the queue is already spliced empty) — see the per-op path above.
+        this.queue = applied.concat(this.queue); // backend rolled the batch back → replay next cycle
         this.discardContentConfirm();
         this.unhealthy = true;
         throw e;
