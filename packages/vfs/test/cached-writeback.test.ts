@@ -485,4 +485,22 @@ describe("CachedBackend write-back", () => {
     await be.flush();
     expect((await inner.read(f, 0, 1000)).byteLength).toBe(1000);
   });
+
+  it("integration: cache and backend agree after a transient flush outage", async () => {
+    const inner = new MemoryBackend();
+    const be = new CachedBackend(rollbackFlaky(inner, 2), { flushDelayMs: 60_000 });
+    be.onFlushError = () => {};
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("hello"));
+    await be.rename(root, "f", root, "g");
+    await expect(be.flush()).rejects.toBeTruthy();  // fail 1
+    await expect(be.flush()).rejects.toBeTruthy();  // fail 2
+    await be.flush();                                // succeeds
+    expect(await inner.lookup(root, "f")).toBeNull();
+    expect((await inner.lookup(root, "g"))?.id).toBe(f);
+    expect(dec.decode(await inner.read(f, 0, 100))).toBe("hello");
+    expect(be.pendingOps()).toBe(0);
+  });
 });
