@@ -103,6 +103,14 @@ export class CachedBackend implements WashBackend {
   // `dirtyData.set` silently clobbers the first's bytes (lost update).
   private nodeLocks = new Map<NodeId, Promise<unknown>>();
 
+  // Retain-owner (spec §A.2): CachedBackend keeps its own per-id retain-count
+  // so `dropVictim` can keep an open fd's `attrCache`/`dirtyData` entries
+  // alive across unlink/rename-displace even though the cache itself never
+  // sees an fd. `inner.retain`/`inner.release` are forwarded through the
+  // write-back queue (not called synchronously) so they stay ordered after
+  // this id's already-queued `create`/writes.
+  private retains = new Map<NodeId, number>();
+
   private withNodeLock<T>(id: NodeId, fn: () => Promise<T>): Promise<T> {
     const prev = this.nodeLocks.get(id) ?? Promise.resolve();
     const run = prev.then(fn, fn);
@@ -195,6 +203,8 @@ export class CachedBackend implements WashBackend {
     protected inner: WashBackend,
     protected opts: { flushDelayMs?: number; maxDirtyBytes?: number } = {},
   ) {
+    // Full passthrough — CachedBackend implements retain/release/dropVictim-gating
+    // itself, so it advertises exactly whatever `inner.caps.fdRetention` says.
     this.caps = inner.caps;
     if (!inner.symlink) this.symlink = undefined as never;
     if (!inner.readlink) this.readlink = undefined as never;
@@ -245,6 +255,7 @@ export class CachedBackend implements WashBackend {
       const wasOnlyLink = hit.nlink === 1;
       hit.nlink -= 1;
       if (hit.nlink <= 0) {
+        if ((this.retains.get(id) ?? 0) > 0) return; // anonymous but retained — keep cache for open fds (§A.2)
         this.attrCache.delete(id);
         if (wasOnlyLink || this.caps.hardlinks === false) {
           this.dirtyData.delete(id);
@@ -567,5 +578,32 @@ export class CachedBackend implements WashBackend {
     }
     await this.drain(); // cache-miss read: never read stale
     return this.inner.read(id, offset, length);
+  }
+
+  /** An fd reference was acquired on `id` (spec §A.2): bump our own retain-count so
+   *  `dropVictim` keeps this id's `attrCache`/`dirtyData` alive across unlink/rename-
+   *  displace, then forward to `inner` — ENQUEUED (not awaited now) so it lands ordered
+   *  after this id's already-queued `create`/writes and never races ahead of them. */
+  async retain(id: NodeId): Promise<void> {
+    this.retains.set(id, (this.retains.get(id) ?? 0) + 1);
+    this.enqueue(() => Promise.resolve(this.inner.retain?.(id)));
+  }
+
+  /** An fd reference on `id` was dropped: decrement our retain-count; at zero, if the
+   *  cached node is anonymous (nlink <= 0 — already unlinked while retained), evict its
+   *  `attrCache`/`dirtyData` now that no open fd needs them. `inner.release` is enqueued
+   *  the same way `retain` is, to stay ordered with this id's queued ops. */
+  async release(id: NodeId): Promise<void> {
+    const n = (this.retains.get(id) ?? 0) - 1;
+    if (n > 0) this.retains.set(id, n);
+    else {
+      this.retains.delete(id);
+      const a = this.attrCache.get(id);
+      if (a && a.nlink <= 0) {
+        this.attrCache.delete(id);
+        this.dirtyData.delete(id);
+      }
+    }
+    this.enqueue(() => Promise.resolve(this.inner.release?.(id)));
   }
 }
