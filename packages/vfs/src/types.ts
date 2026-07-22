@@ -66,8 +66,10 @@ export interface WashBackend {
   symlink?(parent: NodeId, name: string, id: NodeId, target: string): Promise<void>;
   readlink?(id: NodeId): Promise<string>;
   link?(parent: NodeId, name: string, id: NodeId): Promise<void>;
-  /** Durability barrier. `strict: true` REJECTS if the batch cannot be made durable
-   *  (honored by CachedBackend; raw backends are inherently strict and ignore opts). */
+  /** Durability barrier. REJECTS if the batch cannot be made durable (the backend rolls
+   *  it back). `strict` is threaded to the inner backend; the strict/non-strict split is
+   *  caller-side — `Vfs.fsync`/`unmount` propagate the rejection, a background auto-flush
+   *  routes it to `onFlushError`. Raw backends are inherently strict and ignore opts. */
   flush(opts?: { strict?: boolean }): Promise<void>;
   /** Optional bulk namespace export for mount-time cache warming (spec §5). */
   dump?(): Promise<BackendDump>;
