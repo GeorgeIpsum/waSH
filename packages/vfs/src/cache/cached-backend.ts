@@ -93,7 +93,12 @@ export class CachedBackend implements WashBackend {
   /** content buffers applied to `inner` this flush cycle, awaiting durable-confirm. */
   private pendingContentConfirm: Array<{ id: NodeId; buf: Uint8Array }> = [];
 
-  private queue: Array<() => Promise<void>> = [];
+  // Each entry carries `replay`: durable ops (create/write/unlink/…) roll back with the
+  // backend on a barrier failure and MUST replay; retain/release ops mutate the backend's
+  // in-memory retain map, which `inner.flush()` does NOT roll back, so they must NOT replay
+  // (replaying a retain double-counts → leak; replaying a release under-counts → early
+  // reclaim). See the barrier-failure re-queue in `flush()`.
+  private queue: Array<{ run: () => Promise<void>; replay: boolean }> = [];
   private timer: ReturnType<typeof setTimeout> | null = null;
   private flushing: Promise<void> | null = null;
 
@@ -268,8 +273,8 @@ export class CachedBackend implements WashBackend {
     return this.queue.length;
   }
 
-  private enqueue(op: () => Promise<void>): void {
-    this.queue.push(op);
+  private enqueue(op: () => Promise<void>, replay = true): void {
+    this.queue.push({ run: op, replay });
     if (this.timer === null) {
       this.timer = setTimeout(() => {
         this.timer = null;
@@ -301,11 +306,11 @@ export class CachedBackend implements WashBackend {
       // a strict fsync always reaches it — ops enqueued mid-cycle collect in the live
       // queue as a later batch (never chased by this flush → no writer can starve fsync).
       const batch = this.queue.splice(0);
-      const applied: Array<() => Promise<void>> = [];
+      const applied: Array<{ run: () => Promise<void>; replay: boolean }> = [];
       while (batch.length > 0) {
         const op = batch[0]!;
         try {
-          await op();
+          await op.run();
         } catch (e) {
           // Per-op APPLICATION failure (narrow contract): self-atomic; the failed op
           // and the un-run remainder go back to the FRONT of the live queue, ahead of
@@ -322,7 +327,9 @@ export class CachedBackend implements WashBackend {
             await this.inner.flush(opts);
             this.confirmContent();
           } catch {
-            this.queue = applied.concat(this.queue); // ahead of the remainder (see above)
+            // Barrier also failed → replay the applied prefix, but drop already-applied
+            // retain/release (replay:false) — their in-memory effect survives the rollback.
+            this.queue = applied.filter((o) => o.replay).concat(this.queue);
             this.discardContentConfirm();
             this.unhealthy = true;
           }
@@ -337,7 +344,10 @@ export class CachedBackend implements WashBackend {
       } catch (e) {
         // concat, not unshift(...applied): the spread would RangeError on a large batch
         // and drop it (the queue is already spliced empty) — see the per-op path above.
-        this.queue = applied.concat(this.queue); // backend rolled the batch back → replay next cycle
+        // filter(replay): the backend rolled its DURABLE batch back, but retain/release
+        // deltas already hit its in-memory retain map (not rolled back), so they must NOT
+        // replay — only the durable ops do.
+        this.queue = applied.filter((o) => o.replay).concat(this.queue);
         this.discardContentConfirm();
         this.unhealthy = true;
         throw e;
@@ -545,10 +555,10 @@ export class CachedBackend implements WashBackend {
       if (data.byteLength === 0) return;
       const cur = await this.materialize(id, attrs);
       const end = Math.max(cur.byteLength, offset + data.byteLength);
-      const next = new Uint8Array(end);
+      this.admit(end); // BEFORE allocating `next`: reject an over-bound write without materializing
+      const next = new Uint8Array(end); //           hundreds of MiB (backpressure OOM guard, §B.6)
       next.set(cur, 0);
       next.set(data, offset);
-      this.admit(next.byteLength);
       this.enqueueContentOp(id, next);
       this.dirtyData.set(id, next);
       const hit = this.attrCache.get(id);
@@ -564,9 +574,9 @@ export class CachedBackend implements WashBackend {
       const attrs = await this.getattr(id);
       if (attrs.kind === "dir") throw new VfsError("EISDIR");
       const cur = await this.materialize(id, attrs);
+      this.admit(size); // BEFORE allocating `next`: reject an over-bound truncate without materializing (§B.6)
       const next = new Uint8Array(size);
       next.set(cur.slice(0, Math.min(size, cur.byteLength)), 0);
-      this.admit(next.byteLength);
       this.enqueueContentOp(id, next);
       this.dirtyData.set(id, next);
       const hit = this.attrCache.get(id);
@@ -599,7 +609,9 @@ export class CachedBackend implements WashBackend {
     // ordering above, which guarantees the enqueued `inner.retain` lands after this id's
     // `inner.create`, so it never ENOENTs at the backend.
     this.retains.set(id, (this.retains.get(id) ?? 0) + 1);
-    this.enqueue(() => Promise.resolve(this.inner.retain?.(id)));
+    // replay:false — this mutates the backend's in-memory retain map, which a barrier
+    // failure does NOT roll back, so it must not be replayed with the durable batch.
+    this.enqueue(() => Promise.resolve(this.inner.retain?.(id)), false);
   }
 
   /** An fd reference on `id` was dropped: decrement our retain-count; at zero, if the
@@ -617,6 +629,8 @@ export class CachedBackend implements WashBackend {
         this.dirtyData.delete(id);
       }
     }
-    this.enqueue(() => Promise.resolve(this.inner.release?.(id)));
+    // replay:false — same reasoning as `retain`: the in-memory retain-map delta survives a
+    // barrier rollback, so replaying it would decrement the count too far (early reclaim).
+    this.enqueue(() => Promise.resolve(this.inner.release?.(id)), false);
   }
 }

@@ -556,11 +556,32 @@ describe("CachedBackend write-back", () => {
     // large batch immediately, without draining it (batch.shift() per op is O(n^2)).
     const inner = new MemoryBackend();
     const be = new CachedBackend(inner, { flushDelayMs: 60_000 });
-    const q = (be as unknown as { queue: Array<() => Promise<void>> }).queue;
+    const q = (be as unknown as { queue: Array<{ run: () => Promise<void>; replay: boolean }> }).queue;
     const N = 150_000; // safely past V8's spread-arg limit (~125k)
-    q.push(async () => { throw new VfsError("EIO"); }); // per-op failure at the head
-    for (let i = 1; i < N; i++) q.push(async () => {});
+    q.push({ run: async () => { throw new VfsError("EIO"); }, replay: true }); // per-op failure at the head
+    for (let i = 1; i < N; i++) q.push({ run: async () => {}, replay: true });
     await expect(be.flush()).rejects.toMatchObject({ errno: "EIO" }); // per-op fail → batch.concat re-queue
     expect(be.pendingOps()).toBe(N); // the whole batch re-queued (failed op at head), none lost, no RangeError
+  });
+
+  it("does not replay retain/release across a barrier failure (retain-map is not rolled back)", async () => {
+    // Regression (PR #4 Codex P1): retain/release mutate the backend's in-memory retain map,
+    // which inner.flush() does NOT roll back. Replaying them on a barrier failure would
+    // double-count a retain → the inode leaks (a later release never drives the count to 0).
+    const inner = new MemoryBackend();
+    const be = new CachedBackend(rollbackFlaky(inner, 1), { flushDelayMs: 60_000 });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, enc.encode("keep"));
+    await be.retain(f); // enqueues inner.retain (replay:false)
+    await be.unlink(root, "f"); // nlink → 0, retained
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" }); // barrier fails once → re-queue
+    await be.flush(); // retry: durable ops replay, inner.retain does NOT → inner count stays 1
+    expect(dec.decode(await be.read(f, 0, 100))).toBe("keep"); // still readable through the fd
+    await be.release(f); // last reference → count 1→0
+    await be.flush();
+    // With the bug, inner.retain replayed → count 2 → release leaves 1 → f leaks (nlink-0, kept).
+    await expect(be.getattr(f)).rejects.toMatchObject({ errno: "ENOENT" }); // reclaimed exactly once
   });
 });
