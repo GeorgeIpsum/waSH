@@ -584,4 +584,45 @@ describe("CachedBackend write-back", () => {
     // With the bug, inner.retain replayed → count 2 → release leaves 1 → f leaks (nlink-0, kept).
     await expect(be.getattr(f)).rejects.toMatchObject({ errno: "ENOENT" }); // reclaimed exactly once
   });
+
+  it("retries a rolled-back reclamation on the last release (P2: reclaim not suppressed)", async () => {
+    // Regression (PR #4 Codex P2): the last release's DURABLE reclaim rolls back on a barrier
+    // failure while its in-memory decrement survives. Suppressing the whole release (P1 fix)
+    // would strand the orphan until the next open-time sweep; the last release must instead
+    // replay idempotently so the reclaim is retried. A toggle-fail rollback double lets the
+    // SETUP flush commit and only the release flush fail.
+    const inner = new MemoryBackend();
+    const asNodes = () => inner as unknown as { nodes: Map<string, unknown> };
+    let committed = structuredClone(asNodes().nodes);
+    let failNext = false;
+    const proxy = new Proxy(inner, {
+      get(t, p, r) {
+        const v = Reflect.get(t, p, r);
+        if (p === "flush") {
+          return async (o?: { strict?: boolean }) => {
+            if (failNext) { failNext = false; asNodes().nodes = structuredClone(committed); throw new VfsError("ENOSPC"); }
+            const res = await (v as (o?: unknown) => Promise<void>).apply(t, [o]);
+            committed = structuredClone(asNodes().nodes);
+            return res;
+          };
+        }
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(t) : v;
+      },
+    }) as unknown as WashBackend;
+    const be = new CachedBackend(proxy, { flushDelayMs: 60_000 });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.retain(f);
+    await be.unlink(root, "f");
+    await be.flush(); // SETUP committed: f present in inner (nlink 0), inner retain-count 1
+    expect((await inner.getattr(f)).nlink).toBe(0);
+    failNext = true;
+    await be.release(f); // last release → inner.release (decrement + reclaim) enqueued replay:TRUE
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" }); // reclaim runs → barrier fails → rolled back, re-queued
+    await be.flush(); // retry: idempotent reclaim re-runs (inner count already 0)
+    // Reclaimed on retry, WITHOUT waiting for an open-time sweep. (With release suppressed,
+    // f would still be present here as a stranded nlink-0 orphan.)
+    await expect(inner.getattr(f)).rejects.toMatchObject({ errno: "ENOENT" });
+  });
 });

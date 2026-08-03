@@ -620,7 +620,8 @@ export class CachedBackend implements WashBackend {
    *  the same way `retain` is, to stay ordered with this id's queued ops. */
   async release(id: NodeId): Promise<void> {
     const n = (this.retains.get(id) ?? 0) - 1;
-    if (n > 0) this.retains.set(id, n);
+    const last = n <= 0; // this release drops the reference count to zero
+    if (!last) this.retains.set(id, n);
     else {
       this.retains.delete(id);
       const a = this.attrCache.get(id);
@@ -629,8 +630,15 @@ export class CachedBackend implements WashBackend {
         this.dirtyData.delete(id);
       }
     }
-    // replay:false — same reasoning as `retain`: the in-memory retain-map delta survives a
-    // barrier rollback, so replaying it would decrement the count too far (early reclaim).
-    this.enqueue(() => Promise.resolve(this.inner.release?.(id)), false);
+    // A NON-last release is replay:false — its in-memory decrement survives a barrier
+    // rollback, so replaying it would drop the inner count below the number of still-open
+    // fds (early reclaim → data loss). The LAST release is replay:TRUE: `inner.release`
+    // bundles the (in-memory) decrement with the (durable) reclaim of an anonymous inode.
+    // On a barrier failure the reclaim rolls back but the decrement survives, so re-running
+    // it is idempotent — the inner count is already 0, so the decrement is a no-op (n→-1,
+    // the key is simply re-deleted) while reclaim-if-orphan retries the rolled-back
+    // reclamation. Without this, the freed inode+data would strand until the next open-time
+    // sweep, worsening the ENOSPC that caused the failure.
+    this.enqueue(() => Promise.resolve(this.inner.release?.(id)), last);
   }
 }
