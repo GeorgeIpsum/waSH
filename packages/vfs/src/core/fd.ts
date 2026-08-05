@@ -37,7 +37,10 @@ export class FdTable {
     return f;
   }
 
-  close(fd: number): void {
-    if (!this.files.delete(fd)) throw new VfsError("EBADF", String(fd));
+  close(fd: number): OpenFile {
+    const f = this.files.get(fd);
+    if (!f) throw new VfsError("EBADF", String(fd));
+    this.files.delete(fd);
+    return f;
   }
 }

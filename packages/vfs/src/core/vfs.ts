@@ -76,6 +76,11 @@ export class Vfs {
       const at = await this.resolve(p); // mountpoint must exist on parent mount
       if (at.attrs.kind !== "dir") throw new VfsError("ENOTDIR", p);
     }
+    // No read-only mount concept exists yet; every mount is writable, so this
+    // gate applies unconditionally (see F4 plan §Global Constraints, Task 8).
+    if (!backend.caps.fdRetention) {
+      throw new VfsError("EINVAL", "backend lacks fd-lifetime support (fdRetention); required for a writable mount");
+    }
     let release: (() => void) | undefined;
     const locks = (globalThis as { navigator?: { locks?: LockManagerLike } }).navigator?.locks;
     if (opts.exclusive && locks) {
@@ -295,7 +300,17 @@ export class Vfs {
       const r = await this.resolve(p);
       if (r.attrs.kind === "dir") throw new VfsError("EISDIR", p);
       if (flags === "wx" || flags === "ax") throw new VfsError("EEXIST", p);
-      if (flags === "w" || flags === "w+") await r.backend.truncate(r.id, 0);
+      await r.backend.retain?.(r.id); // BEFORE truncate (§A.4): a retain failure aborts with content intact
+      try {
+        if (flags === "w" || flags === "w+") await r.backend.truncate(r.id, 0);
+      } catch (e) {
+        try {
+          await Promise.resolve(r.backend.release?.(r.id));
+        } catch {
+          /* best-effort (§A.5): a sync-throwing release must not mask the original error */
+        }
+        throw e;
+      }
       target = { backend: r.backend, id: r.id };
     } catch (e) {
       if (!(e instanceof VfsError) || e.errno !== "ENOENT") throw e;
@@ -303,12 +318,28 @@ export class Vfs {
       const { backend, dirId, name } = await this.resolveParent(p);
       const id = ulid();
       await backend.create(dirId, name, id, "file");
+      try {
+        await backend.retain?.(id);
+      } catch (e2) {
+        await backend.unlink(dirId, name).catch(() => {}); // roll back the create (§A.4)
+        throw e2;
+      }
       target = { backend, id };
     }
     const file = this.fds.alloc(target.backend, target.id, flags);
     // O_APPEND affects writes only (write() re-derives EOF per call);
     // "a+" fds read from the start, so only write-only append flags seed pos.
-    if (flags === "a" || flags === "ax") file.pos = (await target.backend.getattr(target.id)).size;
+    if (flags === "a" || flags === "ax") {
+      try {
+        file.pos = (await target.backend.getattr(target.id)).size;
+      } catch (e) {
+        // all-or-nothing (§A.4): a seek fault after alloc must leak neither the fd
+        // entry nor the retain — undo both before surfacing the error.
+        this.fds.close(file.fd);
+        await Promise.resolve(target.backend.release?.(target.id)).catch(() => {});
+        throw e;
+      }
+    }
     return file.fd;
   }
 
@@ -339,7 +370,12 @@ export class Vfs {
   }
 
   async close(fd: number): Promise<void> {
-    this.fds.close(fd);
+    const file = this.fds.close(fd); // throws EBADF if already closed → no double release
+    try {
+      await Promise.resolve(file.backend.release?.(file.id));
+    } catch {
+      /* best-effort (§A.5): a release rejection (or sync throw) must never wedge close */
+    }
   }
 
   async readFile(path: string): Promise<Uint8Array> {
@@ -415,7 +451,7 @@ export class Vfs {
 
   async fsync(): Promise<void> {
     for (const m of [...this.mounts].sort((a, b) => a.path.length - b.path.length)) {
-      await m.backend.flush();
+      await m.backend.flush({ strict: true });
     }
   }
 
@@ -424,7 +460,7 @@ export class Vfs {
     if (p === "/") throw new VfsError("EINVAL", p);
     const m = this.mounts.find((x) => x.path === p);
     if (!m) throw new VfsError("ENOENT", p);
-    await m.backend.flush();
+    await m.backend.flush({ strict: true });
     const i = this.mounts.indexOf(m);
     if (i < 0) throw new VfsError("ENOENT", p);
     this.mounts.splice(i, 1);

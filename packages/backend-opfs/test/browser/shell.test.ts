@@ -32,6 +32,7 @@ describe("OpfsBackend manifest shell", () => {
     const be = await OpfsBackend.open(testRoot());
     expect(be.caps).toEqual({
       symlinks: "supported", hardlinks: true, atomicDirRename: true, renameCost: "O1", reservedNames: [],
+      fdRetention: true,
     });
     await be.close();
   });

@@ -66,7 +66,39 @@ export class CachedBackend implements WashBackend {
   // optimization for backends (e.g. IndexedDB) where it matters.
   private dirtyData = new Map<NodeId, Uint8Array>();
 
-  private queue: Array<() => Promise<void>> = [];
+  // Bounded write-back (spec §B.6): `liveDirtyBytes` tracks the summed byteLength
+  // of every live owned content payload — every content op currently queued or
+  // in-flight owns an immutable buffer (§B.3/§B.4), and this is the sum of those
+  // buffers' byteLengths. Charged in `enqueueContentOp` (op enqueued), uncharged
+  // in `confirmContent` (op durably confirmed) — NOT touched by `dirtyData`
+  // set/delete or by `dropVictim`, since the read-view cache and the owned
+  // write-back payload are tracked independently.
+  // `unhealthy` records whether the last durability barrier failed (cleared on the
+  // next successful barrier); `admit()` only ever rejects while unhealthy.
+  private liveDirtyBytes = 0;
+  private unhealthy = false;
+  private get maxDirtyBytes(): number {
+    return this.opts.maxDirtyBytes ?? 64 * 1024 * 1024;
+  }
+
+  /** Synchronous reservation (spec §B.6): reject before mutating if write-back is unhealthy
+   *  and admitting this new owned payload would exceed the bound. Each write/truncate adds a
+   *  full owned buffer to the live set, so charge the full projected size (spec F11/F12). */
+  private admit(bytes: number): void {
+    if (this.unhealthy && this.liveDirtyBytes + bytes > this.maxDirtyBytes) {
+      throw new VfsError("ENOSPC");
+    }
+  }
+
+  /** content buffers applied to `inner` this flush cycle, awaiting durable-confirm. */
+  private pendingContentConfirm: Array<{ id: NodeId; buf: Uint8Array }> = [];
+
+  // Each entry carries `replay`: durable ops (create/write/unlink/…) roll back with the
+  // backend on a barrier failure and MUST replay; retain/release ops mutate the backend's
+  // in-memory retain map, which `inner.flush()` does NOT roll back, so they must NOT replay
+  // (replaying a retain double-counts → leak; replaying a release under-counts → early
+  // reclaim). See the barrier-failure re-queue in `flush()`.
+  private queue: Array<{ run: () => Promise<void>; replay: boolean }> = [];
   private timer: ReturnType<typeof setTimeout> | null = null;
   private flushing: Promise<void> | null = null;
 
@@ -75,6 +107,14 @@ export class CachedBackend implements WashBackend {
   // callers on the same node must not interleave their bodies or the second
   // `dirtyData.set` silently clobbers the first's bytes (lost update).
   private nodeLocks = new Map<NodeId, Promise<unknown>>();
+
+  // Retain-owner (spec §A.2): CachedBackend keeps its own per-id retain-count
+  // so `dropVictim` can keep an open fd's `attrCache`/`dirtyData` entries
+  // alive across unlink/rename-displace even though the cache itself never
+  // sees an fd. `inner.retain`/`inner.release` are forwarded through the
+  // write-back queue (not called synchronously) so they stay ordered after
+  // this id's already-queued `create`/writes.
+  private retains = new Map<NodeId, number>();
 
   private withNodeLock<T>(id: NodeId, fn: () => Promise<T>): Promise<T> {
     const prev = this.nodeLocks.get(id) ?? Promise.resolve();
@@ -164,7 +204,12 @@ export class CachedBackend implements WashBackend {
       this.enqueue(() => this.inner.link!(parent, name, id));
     });
 
-  constructor(protected inner: WashBackend, protected opts: { flushDelayMs?: number } = {}) {
+  constructor(
+    protected inner: WashBackend,
+    protected opts: { flushDelayMs?: number; maxDirtyBytes?: number } = {},
+  ) {
+    // Full passthrough — CachedBackend implements retain/release/dropVictim-gating
+    // itself, so it advertises exactly whatever `inner.caps.fdRetention` says.
     this.caps = inner.caps;
     if (!inner.symlink) this.symlink = undefined as never;
     if (!inner.readlink) this.readlink = undefined as never;
@@ -215,6 +260,7 @@ export class CachedBackend implements WashBackend {
       const wasOnlyLink = hit.nlink === 1;
       hit.nlink -= 1;
       if (hit.nlink <= 0) {
+        if ((this.retains.get(id) ?? 0) > 0) return; // anonymous but retained — keep cache for open fds (§A.2)
         this.attrCache.delete(id);
         if (wasOnlyLink || this.caps.hardlinks === false) {
           this.dirtyData.delete(id);
@@ -227,8 +273,8 @@ export class CachedBackend implements WashBackend {
     return this.queue.length;
   }
 
-  private enqueue(op: () => Promise<void>): void {
-    this.queue.push(op);
+  private enqueue(op: () => Promise<void>, replay = true): void {
+    this.queue.push({ run: op, replay });
     if (this.timer === null) {
       this.timer = setTimeout(() => {
         this.timer = null;
@@ -243,7 +289,7 @@ export class CachedBackend implements WashBackend {
     if (this.queue.length > 0 || this.flushing) await this.flush();
   }
 
-  async flush(): Promise<void> {
+  async flush(opts?: { strict?: boolean }): Promise<void> {
     // Fully serialize concurrent callers: keep waiting (and re-checking)
     // until no flush cycle is in flight, then start our own. This is a loop
     // rather than a single `if` because a waiter can wake up to find another
@@ -256,20 +302,56 @@ export class CachedBackend implements WashBackend {
       this.timer = null;
     }
     const run = (async () => {
-      while (this.queue.length > 0) {
-        const op = this.queue[0]!;
+      // Snapshot the call-time prefix (F4): the barrier applies to a FINITE batch, so
+      // a strict fsync always reaches it — ops enqueued mid-cycle collect in the live
+      // queue as a later batch (never chased by this flush → no writer can starve fsync).
+      const batch = this.queue.splice(0);
+      const applied: Array<{ run: () => Promise<void>; replay: boolean }> = [];
+      while (batch.length > 0) {
+        const op = batch[0]!;
         try {
-          await op(); // rejection leaves the op at the head for retry — see dropVictim/enqueue docs
+          await op.run();
         } catch (e) {
-          // Give the backend its durability-point callback even though the
-          // drain failed — backends like IndexedDB clear their sticky abort
-          // poison in flush(); without this the queue head can never retry.
-          await this.inner.flush().catch(() => {});
+          // Per-op APPLICATION failure (narrow contract): self-atomic; the failed op
+          // and the un-run remainder go back to the FRONT of the live queue, ahead of
+          // any mid-cycle ops. Give the backend a durability point for the applied
+          // prefix; if THAT flush also rejects the backend rolled the prefix back, so
+          // re-queue it too (ahead of the remainder).
+          // Prepend via concat, NOT unshift(...batch): a spread passes one argument per
+          // op, so a large batch overflows V8's argument-count/stack limit with a
+          // RangeError — and since the queue was already spliced empty, that secondary
+          // throw would DROP the batch (reintroducing the divergence). concat has no
+          // such limit and preserves order: [failedOp, ...remainder, ...midCycle].
+          this.queue = batch.concat(this.queue);
+          try {
+            await this.inner.flush(opts);
+            this.confirmContent();
+          } catch {
+            // Barrier also failed → replay the applied prefix, but drop already-applied
+            // retain/release (replay:false) — their in-memory effect survives the rollback.
+            this.queue = applied.filter((o) => o.replay).concat(this.queue);
+            this.discardContentConfirm();
+            this.unhealthy = true;
+          }
           throw e;
         }
-        this.queue.shift();
+        applied.push(batch.shift()!);
       }
-      await this.inner.flush();
+      try {
+        await this.inner.flush(opts);   // durability BARRIER (finite batch)
+        this.confirmContent();
+        this.unhealthy = false;
+      } catch (e) {
+        // concat, not unshift(...applied): the spread would RangeError on a large batch
+        // and drop it (the queue is already spliced empty) — see the per-op path above.
+        // filter(replay): the backend rolled its DURABLE batch back, but retain/release
+        // deltas already hit its in-memory retain map (not rolled back), so they must NOT
+        // replay — only the durable ops do.
+        this.queue = applied.filter((o) => o.replay).concat(this.queue);
+        this.discardContentConfirm();
+        this.unhealthy = true;
+        throw e;
+      }
     })();
     this.flushing = run;
     try {
@@ -434,36 +516,36 @@ export class CachedBackend implements WashBackend {
     return this.inner.read(id, 0, attrs.size);
   }
 
-  /** Queues the single write-back op for `id`'s content, once per dirty session. */
-  private queueContentFlush(id: NodeId): void {
-    if (this.dirtyData.has(id)) return; // already queued; the op re-reads dirtyData lazily at flush time
-    this.enqueueContentOp(id);
-  }
-
-  /**
-   * The actual content-flush op. Split out from `queueContentFlush` so a
-   * write/truncate that re-dirties `id` while this op's inner calls are still
-   * in flight can re-enqueue itself once the identity check below detects the
-   * newer buffer — otherwise `queueContentFlush`'s "buffer present ⟹ op
-   * pending" gate would stay closed forever (the buffer is only deleted
-   * *after* inner succeeds), permanently stranding the newer content
-   * unflushed even though `pendingOps()` reports zero.
-   */
-  private enqueueContentOp(id: NodeId): void {
+  /** Enqueue a content-flush op that OWNS the immutable buffer `buf` (§B.3): replay
+   *  writes exactly `buf`, never re-reading live `dirtyData` (which could apply a newer
+   *  version under an fsync that barriered this one). `write`/`truncate` install a fresh
+   *  Uint8Array each time, so each call is its own entry; `dirtyData[id]` stays the
+   *  optimistic latest for reads. The owned buffer is a live write-back payload
+   *  (`liveDirtyBytes`) until its batch is durably confirmed. */
+  private enqueueContentOp(id: NodeId, buf: Uint8Array): void {
+    this.liveDirtyBytes += buf.byteLength;
     this.enqueue(async () => {
-      const buf = this.dirtyData.get(id);
-      if (!buf) return; // evicted (unlinked) or already flushed before this op ran
-      // Only delete the buffer after the inner ops succeed. A rejection here
-      // must leave dirtyData intact — the queue's failed-op-at-head retry
-      // policy re-runs this same closure, and reads must keep serving the
-      // dirty buffer (not stale inner content) until that retry lands. The
-      // identity check guards against a concurrent re-dirty (write/truncate
-      // always installs a fresh Uint8Array) clobbering the newer buffer.
       await this.inner.truncate(id, buf.byteLength);
       if (buf.byteLength > 0) await this.inner.write(id, 0, buf);
-      if (this.dirtyData.get(id) === buf) this.dirtyData.delete(id);
-      else this.enqueueContentOp(id); // re-dirtied mid-flush: newer buffer needs its own op
+      this.pendingContentConfirm.push({ id, buf });
     });
+  }
+
+  /** After a successful barrier: each owned content buffer is durable — uncharge it and
+   *  drop the read-view `dirtyData[id]` if it is still that buffer (a later write installed
+   *  a newer buffer with its own entry — keep that one). */
+  private confirmContent(): void {
+    for (const { id, buf } of this.pendingContentConfirm) {
+      this.liveDirtyBytes -= buf.byteLength;
+      if (this.dirtyData.get(id) === buf) this.dirtyData.delete(id);
+    }
+    this.pendingContentConfirm = [];
+  }
+
+  /** After a FAILED barrier: buffers stay in dirtyData for the replay (the flush
+   *  re-queue); just clear the confirm list — the next cycle rebuilds it. */
+  private discardContentConfirm(): void {
+    this.pendingContentConfirm = [];
   }
 
   async write(id: NodeId, offset: number, data: Uint8Array): Promise<void> {
@@ -471,12 +553,19 @@ export class CachedBackend implements WashBackend {
       const attrs = await this.getattr(id);
       if (attrs.kind === "dir") throw new VfsError("EISDIR");
       if (data.byteLength === 0) return;
+      // Reserve against the PROJECTED size BEFORE materialize(): on a cache miss materialize
+      // reads the file's full current contents (a large allocation), so an over-bound write
+      // must be rejected here, before that read (§B.6 OOM guard). `cur.byteLength` will equal
+      // `attrs.size`, so the projected end is known from `attrs` alone.
+      const projected = Math.max(attrs.size, offset + data.byteLength);
+      this.admit(projected);
       const cur = await this.materialize(id, attrs);
       const end = Math.max(cur.byteLength, offset + data.byteLength);
+      this.admit(end); // atomic reservation immediately before the install (no await before the charge)
       const next = new Uint8Array(end);
       next.set(cur, 0);
       next.set(data, offset);
-      this.queueContentFlush(id);
+      this.enqueueContentOp(id, next);
       this.dirtyData.set(id, next);
       const hit = this.attrCache.get(id);
       if (hit) {
@@ -490,10 +579,24 @@ export class CachedBackend implements WashBackend {
     return this.withNodeLock(id, async () => {
       const attrs = await this.getattr(id);
       if (attrs.kind === "dir") throw new VfsError("EISDIR");
-      const cur = await this.materialize(id, attrs);
+      // Reserve the projected new size before any allocation/read (§B.6 OOM guard).
+      this.admit(size);
+      // Only the first min(size, current) bytes survive, so read just those — never
+      // materialize the full old file (a shrink of a huge stored file would otherwise read
+      // it all into memory only to discard the tail).
+      const keep = Math.min(size, attrs.size);
+      const dirty = this.dirtyData.get(id);
+      let head: Uint8Array;
+      if (dirty) head = dirty.subarray(0, Math.min(keep, dirty.byteLength));
+      else if (keep === 0) head = new Uint8Array(0);
+      else {
+        await this.drain(); // never read stale (matches materialize)
+        head = await this.inner.read(id, 0, keep);
+      }
+      this.admit(size); // atomic reservation immediately before the install
       const next = new Uint8Array(size);
-      next.set(cur.slice(0, Math.min(size, cur.byteLength)), 0);
-      this.queueContentFlush(id);
+      next.set(head, 0);
+      this.enqueueContentOp(id, next);
       this.dirtyData.set(id, next);
       const hit = this.attrCache.get(id);
       if (hit) {
@@ -511,5 +614,50 @@ export class CachedBackend implements WashBackend {
     }
     await this.drain(); // cache-miss read: never read stale
     return this.inner.read(id, offset, length);
+  }
+
+  /** An fd reference was acquired on `id` (spec §A.2): bump our own retain-count so
+   *  `dropVictim` keeps this id's `attrCache`/`dirtyData` alive across unlink/rename-
+   *  displace, then forward to `inner` — ENQUEUED (not awaited now) so it lands ordered
+   *  after this id's already-queued `create`/writes and never races ahead of them. */
+  async retain(id: NodeId): Promise<void> {
+    // Unlike the raw backends, we deliberately do NOT validate existence here: the
+    // `attrCache` is not an authoritative existence oracle (a live id may be uncached),
+    // so a cache-based check would risk a false ENOENT. Correctness rests on the caller
+    // contract — `Vfs.open` only retains an id it just resolved or created — plus the FIFO
+    // ordering above, which guarantees the enqueued `inner.retain` lands after this id's
+    // `inner.create`, so it never ENOENTs at the backend.
+    this.retains.set(id, (this.retains.get(id) ?? 0) + 1);
+    // replay:false — this mutates the backend's in-memory retain map, which a barrier
+    // failure does NOT roll back, so it must not be replayed with the durable batch.
+    this.enqueue(() => Promise.resolve(this.inner.retain?.(id)), false);
+  }
+
+  /** An fd reference on `id` was dropped: decrement our retain-count; at zero, if the
+   *  cached node is anonymous (nlink <= 0 — already unlinked while retained), evict its
+   *  `attrCache`/`dirtyData` now that no open fd needs them. `inner.release` is enqueued
+   *  the same way `retain` is, to stay ordered with this id's queued ops. */
+  async release(id: NodeId): Promise<void> {
+    const n = (this.retains.get(id) ?? 0) - 1;
+    const last = n <= 0; // this release drops the reference count to zero
+    if (!last) this.retains.set(id, n);
+    else {
+      this.retains.delete(id);
+      const a = this.attrCache.get(id);
+      if (a && a.nlink <= 0) {
+        this.attrCache.delete(id);
+        this.dirtyData.delete(id);
+      }
+    }
+    // A NON-last release is replay:false — its in-memory decrement survives a barrier
+    // rollback, so replaying it would drop the inner count below the number of still-open
+    // fds (early reclaim → data loss). The LAST release is replay:TRUE: `inner.release`
+    // bundles the (in-memory) decrement with the (durable) reclaim of an anonymous inode.
+    // On a barrier failure the reclaim rolls back but the decrement survives, so re-running
+    // it is idempotent — the inner count is already 0, so the decrement is a no-op (n→-1,
+    // the key is simply re-deleted) while reclaim-if-orphan retries the rolled-back
+    // reclamation. Without this, the freed inode+data would strand until the next open-time
+    // sweep, worsening the ENOSPC that caused the failure.
+    this.enqueue(() => Promise.resolve(this.inner.release?.(id)), last);
   }
 }

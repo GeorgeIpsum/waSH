@@ -41,6 +41,9 @@ export interface BackendCaps {
    * mutation — enforced by backends that declare it.
    */
   reservedNames?: string[];
+  /** True iff the backend keeps an unlinked inode's content alive while an fd retains it
+   *  (implements retain/release). Required for a WRITABLE mount used by the shell engine. */
+  fdRetention: boolean;
 }
 
 /**
@@ -66,7 +69,15 @@ export interface WashBackend {
   symlink?(parent: NodeId, name: string, id: NodeId, target: string): Promise<void>;
   readlink?(id: NodeId): Promise<string>;
   link?(parent: NodeId, name: string, id: NodeId): Promise<void>;
-  flush(): Promise<void>;
+  /** Durability barrier. REJECTS if the batch cannot be made durable (the backend rolls
+   *  it back). `strict` is threaded to the inner backend; the strict/non-strict split is
+   *  caller-side — `Vfs.fsync`/`unmount` propagate the rejection, a background auto-flush
+   *  routes it to `onFlushError`. Raw backends are inherently strict and ignore opts. */
+  flush(opts?: { strict?: boolean }): Promise<void>;
   /** Optional bulk namespace export for mount-time cache warming (spec §5). */
   dump?(): Promise<BackendDump>;
+  /** An fd reference was acquired on this inode — do not reclaim it even at nlink 0. */
+  retain?(id: NodeId): void | Promise<void>;
+  /** An fd reference was dropped — reclaim if now unreferenced. Best-effort, must not throw meaningfully. */
+  release?(id: NodeId): void | Promise<void>;
 }

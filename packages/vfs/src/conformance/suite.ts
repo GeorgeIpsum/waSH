@@ -272,6 +272,40 @@ export function runBackendConformance(
       });
     });
 
+    describe("fd lifecycle (capability-gated)", () => {
+      it("retain keeps an unlinked inode readable; last release reclaims it", async (ctx) => {
+        if (!be.caps.fdRetention) return ctx.skip();
+        const root = await be.root();
+        const f = ulid();
+        await be.create(root, "f", f, "file");
+        await be.write(f, 0, new TextEncoder().encode("keep"));
+        await be.retain!(f);
+        await be.unlink(root, "f");
+        await be.flush();
+        expect(new TextDecoder().decode(await be.read(f, 0, 100))).toBe("keep"); // anonymous, still readable
+        expect((await be.getattr(f)).nlink).toBe(0);
+        await be.release!(f);
+        await be.flush();
+        await expect(be.getattr(f)).rejects.toMatchObject({ errno: "ENOENT" });
+      });
+
+      it("rename-over a retained target keeps it alive until release", async (ctx) => {
+        if (!be.caps.fdRetention) return ctx.skip();
+        const root = await be.root();
+        const a = ulid(), b = ulid();
+        await be.create(root, "a", a, "file");
+        await be.create(root, "b", b, "file");
+        await be.write(b, 0, new TextEncoder().encode("bb"));
+        await be.retain!(b);
+        await be.rename(root, "a", root, "b");
+        await be.flush();
+        expect(new TextDecoder().decode(await be.read(b, 0, 100))).toBe("bb");
+        await be.release!(b);
+        await be.flush();
+        await expect(be.getattr(b)).rejects.toMatchObject({ errno: "ENOENT" });
+      });
+    });
+
     describe("flush", () => {
       it("flush() resolves (durability point)", async () => {
         await be.create(root, "f", ulid(), "file");

@@ -53,6 +53,11 @@ let committedBytes: Uint8Array; // last successfully committed serialization
 let dirty = false;
 let releaseLock: (() => void) | null = null;
 let poolSize = 64;
+// F4 retain/release: in-memory per-inode fd-reference count. NEVER persisted — this is the
+// crash-safety premise for the open-time unreachable-nlink0 sweep below (ops.open): a fresh
+// worker always starts with an empty map, so any nlink<=0 inode still in the loaded manifest
+// is unreachable garbage from a session whose retain(s) are gone.
+const retains = new Map<NodeId, number>();
 
 // ---- size-guard advisory (spec §7/§11: v1 writes a whole manifest generation per flush
 // batch, so per-flush commit cost is O(manifest size), not O(1) per mutated entry). No
@@ -289,6 +294,19 @@ const ops: Record<string, OpFn> = {
       // shrink+flush, kept around for GC/fallback) cannot resurface in the working view.
       await blobs.buildVersionMap(generation, mani);
     }
+    // Open-time unreachable-nlink0 sweep (§A.7): `retains` above is always empty on a brand
+    // new worker (retain-count is in-memory only, never persisted), so ANY nlink<=0 inode still
+    // sitting in the just-loaded working manifest is unreachable garbage — it was kept alive by
+    // a retain from a prior session that is now gone (a crash, or an unlink-while-retained that
+    // was never released). Drop it from the WORKING manifest so the next commit stops
+    // re-persisting it; the union GC below (already unioning the working view + BOTH on-disk
+    // slots) reclaims its blob chunks once every retained generation has rotated past it.
+    for (const [orphanId, rec] of Object.entries(mani.inodes)) {
+      if (rec.nlink <= 0) {
+        delete mani.inodes[orphanId];
+        dirty = true;
+      }
+    }
     // At open, working == loaded generation, but both slots still contribute to the
     // union live set (the other slot may hold a fallback generation) — see unionLiveChunkFiles().
     await blobs.gc(await unionLiveChunkFiles());
@@ -303,6 +321,35 @@ const ops: Record<string, OpFn> = {
    *  from the working manifest OR either retained on-disk generation. */
   async gc(): Promise<OpResult> {
     await blobs.gc(await unionLiveChunkFiles());
+    return { value: undefined };
+  },
+
+  /** An fd reference was acquired on `id` — do not reclaim it even at nlink 0 (§A.1/A.2).
+   *  Validates existence: an unknown id is a caller bug (a retain must always name a real
+   *  inode), so it throws ENOENT rather than silently tracking a phantom count. */
+  async retain(id: NodeId): Promise<OpResult> {
+    if (!mani.inodes[id]) throw new VfsError("ENOENT", id);
+    retains.set(id, (retains.get(id) ?? 0) + 1);
+    return { value: undefined };
+  },
+
+  /** An fd reference was dropped — best-effort/lenient (§A.5): a decrement on an id this worker
+   *  never retained (or has already forgotten) is a no-op, never a throw. At the last reference,
+   *  if the inode is anonymous (nlink <= 0 — unlinked or displaced-over while retained), mirror
+   *  ops.unlink's own persistence pattern: mutate the working manifest and mark `dirty` for the
+   *  next commit()/flush() to persist (release does NOT force-commit here, same as unlink), then
+   *  opportunistically run the same union GC ops.gc uses — a no-op if a retained on-disk
+   *  generation still resolves the chunk, until later commits + the open-time sweep catch up. */
+  async release(id: NodeId): Promise<OpResult> {
+    const n = (retains.get(id) ?? 0) - 1;
+    if (n > 0) { retains.set(id, n); return { value: undefined }; }
+    retains.delete(id);
+    const rec = mani.inodes[id];
+    if (rec && rec.nlink <= 0) {
+      delete mani.inodes[id]; // blob chunks reclaimed by GC; NEVER deleted in-op
+      dirty = true;
+      await blobs.gc(await unionLiveChunkFiles());
+    }
     return { value: undefined };
   },
 
@@ -364,9 +411,11 @@ const ops: Record<string, OpFn> = {
       delete mani.inodes[e.id];
     } else {
       child.nlink -= 1;
-      if (child.nlink <= 0) {
-        delete mani.inodes[e.id]; // blob chunks reclaimed by GC (Task 6); NEVER deleted in-op
+      if (child.nlink <= 0 && (retains.get(e.id) ?? 0) === 0) {
+        delete mani.inodes[e.id]; // blob chunks reclaimed by GC; NEVER deleted in-op
       }
+      // else: nlink 0 but retained by a live fd — keep mani.inodes[e.id] (anonymous inode) so
+      // union GC does not reclaim its chunks; release() or the open-time sweep reclaims it later.
     }
     delete dir[name];
     p.mtimeMs = Date.now();
@@ -496,9 +545,11 @@ const ops: Record<string, OpFn> = {
       } else {
         if (mv.kind === "dir") throw new VfsError("ENOTDIR", toName);
         ex.nlink -= 1;
-        if (ex.nlink <= 0) {
-          delete mani.inodes[displaced.id]; // blobs reclaimed by GC (Task 6); NEVER deleted in-op
+        if (ex.nlink <= 0 && (retains.get(displaced.id) ?? 0) === 0) {
+          delete mani.inodes[displaced.id]; // blobs reclaimed by GC; NEVER deleted in-op
         }
+        // else: displaced target retained by a live fd — keep its record alive (§A.3); release()
+        // or the open-time sweep reclaims it later.
       }
     }
     delete fromDir[fromName];

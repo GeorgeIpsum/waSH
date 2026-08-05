@@ -20,6 +20,42 @@ export interface IndexedDBBackendOptions {
   chunkSize?: number;
 }
 
+interface LockManagerLike {
+  request(
+    name: string,
+    opts: { mode?: string; ifAvailable?: boolean },
+    cb: (lock: unknown) => Promise<unknown> | unknown,
+  ): Promise<unknown>;
+}
+
+/**
+ * Acquire an exclusive per-db Web Lock, best-effort (spec §A.6 single-writer). Returns a
+ * `release` fn + the `held` promise (which resolves once the lock is fully released) when
+ * granted, `null` when another live instance already holds it (→ EBUSY), or `"nolocks"`
+ * where the Web Locks API is unavailable (Node/old browsers → proceed lockless).
+ *
+ * The lock makes the open-time orphan sweep safe: without it, opening a second instance of
+ * the same db would sweep an `nlink:0` inode that the first instance still retains through
+ * an open fd, deleting live data. Unlike OPFS the lock is NOT mandatory — IndexedDB's whole
+ * point is broader reach, and a lockless environment is single-instance in practice.
+ */
+function acquireDbLock(
+  name: string,
+): Promise<{ release: () => void; held: Promise<unknown> } | null | "nolocks"> {
+  const locks = (globalThis as { navigator?: { locks?: LockManagerLike } }).navigator?.locks;
+  if (!locks) return Promise.resolve("nolocks");
+  return new Promise((resolve) => {
+    let held!: Promise<unknown>;
+    held = locks.request(name, { mode: "exclusive", ifAvailable: true }, (lock) => {
+      if (!lock) {
+        resolve(null); // held by another live instance
+        return Promise.resolve();
+      }
+      return new Promise<void>((release) => resolve({ release: () => release(), held }));
+    });
+  });
+}
+
 /**
  * Per-attempt request wrapper handed to every op body by `withTx`. Op bodies
  * call `r(request)` instead of a shared instance method so the "did this
@@ -37,11 +73,22 @@ export class IndexedDBBackend implements WashBackend {
     hardlinks: true,
     atomicDirRename: true,
     renameCost: "O1",
+    fdRetention: true,
   };
 
   private tx: IDBTransaction | null = null;
   private txCompletion: Promise<void> | null = null;
   private lastAbort: unknown = null;
+
+  /**
+   * F4 retain/release: in-memory per-inode fd-reference count. NEVER persisted
+   * — this is the crash-safety premise the open-time orphan sweep (`static
+   * open` → `sweepOrphans`) exists for: a fresh instance's `retains` map
+   * always starts empty, so any `nlink <= 0` inode found at open is
+   * unreachable garbage from a prior session (a retain from before a crash,
+   * or an unlink-while-retained that was never released).
+   */
+  private retains = new Map<NodeId, number>();
 
   /**
    * Maps a raw IDB request/transaction error to a VfsError where we know what
@@ -87,6 +134,8 @@ export class IndexedDBBackend implements WashBackend {
     private readonly rootId: NodeId,
     private readonly durability: "relaxed" | "strict",
     readonly chunkSize: number,
+    private releaseLock: (() => void) | null = null,
+    private lockHeld: Promise<unknown> | null = null,
   ) {}
 
   static async open(dbName: string, opts: IndexedDBBackendOptions = {}): Promise<IndexedDBBackend> {
@@ -103,12 +152,69 @@ export class IndexedDBBackend implements WashBackend {
       meta.put(SCHEMA_VERSION, "schemaVersion");
     }
     await txDone(tx);
-    return new IndexedDBBackend(db, rootId, opts.durability ?? "relaxed", opts.chunkSize ?? CHUNK_SIZE);
+    // Single-writer lock (§A.6) — held for our lifetime so the open-time sweep below can't
+    // delete an inode a concurrently-live instance still retains (see acquireDbLock).
+    const lock = await acquireDbLock(`wash-idb:${dbName}`);
+    if (lock === null) {
+      db.close();
+      throw new VfsError("EBUSY", dbName); // another live instance holds the db
+    }
+    const releaseLock = lock === "nolocks" ? null : lock.release;
+    const lockHeld = lock === "nolocks" ? null : lock.held;
+    try {
+      await IndexedDBBackend.sweepOrphans(db); // §A.7: retain-count is gone on a fresh open
+    } catch (e) {
+      releaseLock?.();
+      db.close();
+      throw e;
+    }
+    return new IndexedDBBackend(db, rootId, opts.durability ?? "relaxed", opts.chunkSize ?? CHUNK_SIZE, releaseLock, lockHeld);
   }
 
-  close(): void {
+  /**
+   * Open-time unreachable-`nlink0` sweep (§A.7). Retain-count is in-memory
+   * only (never persisted, see `retains` above), so a `nlink <= 0` inode left
+   * over from a prior session is unreachable garbage — *provided no OTHER
+   * instance is concurrently live and retaining it*. `open()` holds an
+   * exclusive per-db Web Lock across this sweep to guarantee exactly that (a
+   * concurrent open is rejected EBUSY), so every swept record is genuinely a
+   * crashed/orphaned leftover, never a peer's live-retained inode. Runs in its
+   * own readwrite tx over `inodes` + `data`, before the instance (and thus
+   * any caller) can observe the database.
+   */
+  private static async sweepOrphans(db: IDBDatabase): Promise<void> {
+    const tx = db.transaction(["inodes", "data"], "readwrite");
+    const inodes = tx.objectStore("inodes");
+    const orphans: NodeId[] = [];
+    await new Promise<void>((resolve, reject) => {
+      const cur = inodes.openCursor();
+      cur.onsuccess = () => {
+        const c = cur.result;
+        if (!c) { resolve(); return; }
+        const rec = c.value as InodeRecord;
+        if (rec.nlink <= 0) orphans.push(c.primaryKey as NodeId);
+        c.continue();
+      };
+      cur.onerror = () => reject(cur.error);
+    });
+    const data = tx.objectStore("data");
+    for (const id of orphans) {
+      inodes.delete(id);
+      data.delete(IndexedDBBackend.dataKeyRange(id));
+    }
+    await txDone(tx);
+  }
+
+  async close(): Promise<void> {
     this.tx = null;
+    this.releaseLock?.();
+    this.releaseLock = null;
+    const held = this.lockHeld;
+    this.lockHeld = null;
     this.db.close();
+    // Await the Web Lock's full release so an immediate reopen of the same db isn't
+    // spuriously rejected EBUSY (models a clean shutdown; a real crash frees it via the OS).
+    if (held) await held;
   }
 
   async root(): Promise<NodeId> {
@@ -219,7 +325,7 @@ export class IndexedDBBackend implements WashBackend {
    * CachedBackend, tracked alongside the fsync-strict contract work
    * (pre-Plan-4).
    */
-  async flush(): Promise<void> {
+  async flush(_opts?: { strict?: boolean }): Promise<void> {
     const completion = this.txCompletion;
     this.tx = null; // stop reusing; the pending txn auto-commits
     try {
@@ -372,8 +478,20 @@ export class IndexedDBBackend implements WashBackend {
     });
   }
 
-  private chunkRange(id: NodeId, first = 0, last: number = Infinity): IDBKeyRange {
+  /**
+   * Shared key-range shape for `data` store chunks: keyed `[id, chunkIndex]`,
+   * IDB array-key ordering brackets exactly one inode's chunks between
+   * `[id, first]` and `[id, last]`. Factored out as a `static` so
+   * `sweepOrphans` (which runs before any instance exists) uses the exact
+   * same bounds as the instance-level `chunkRange` — a mismatched range here
+   * could delete another inode's data or leak chunks.
+   */
+  private static dataKeyRange(id: NodeId, first = 0, last: number = Infinity): IDBKeyRange {
     return IDBKeyRange.bound([id, first], [id, last]);
+  }
+
+  private chunkRange(id: NodeId, first = 0, last: number = Infinity): IDBKeyRange {
+    return IndexedDBBackend.dataKeyRange(id, first, last);
   }
 
   private async requireFile(tx: IDBTransaction, r: ReqFn, id: NodeId): Promise<InodeRecord> {
@@ -465,14 +583,51 @@ export class IndexedDBBackend implements WashBackend {
     return keys.length > 0;
   }
 
+  /**
+   * The single reclamation choke point for unlink + rename-displacement
+   * (§A.3). Physically deletes (inode + data chunks) only when the inode is
+   * BOTH unnamed (`nlink <= 0`) AND unretained (no live fd reference); a
+   * retained nlink-0 inode is anonymous — still readable/writable via its
+   * fds — so its decremented record is `put` back instead, and `release`
+   * reclaims it once the last reference drops.
+   */
   private async gcInode(tx: IDBTransaction, r: ReqFn, id: NodeId, rec: InodeRecord): Promise<void> {
     rec.nlink -= 1;
-    if (rec.nlink <= 0) {
+    if (rec.nlink <= 0 && (this.retains.get(id) ?? 0) === 0) {
       await r(tx.objectStore("inodes").delete(id));
       await r(tx.objectStore("data").delete(this.chunkRange(id)));
     } else {
       await r(tx.objectStore("inodes").put(rec, id));
     }
+  }
+
+  /** An fd reference was acquired on this inode — do not reclaim it even at
+   *  nlink 0. Validates existence (ENOENT on an unknown id): a retain must
+   *  always name a real inode, and this is what makes the write-back
+   *  ordering requirement upstream (CachedBackend) meaningful. */
+  async retain(id: NodeId): Promise<void> {
+    await this.withTx(async (tx, r) => { await this.getInode(tx, r, id); });
+    this.retains.set(id, (this.retains.get(id) ?? 0) + 1);
+  }
+
+  /** An fd reference was dropped — reclaim iff now unreferenced AND the
+   *  inode is anonymous (nlink <= 0). Best-effort/lenient: an unknown or
+   *  never-retained id is a no-op, never a throw (§A.5) — a transient
+   *  failure here must not wedge `close`. */
+  async release(id: NodeId): Promise<void> {
+    const n = (this.retains.get(id) ?? 0) - 1;
+    if (n > 0) {
+      this.retains.set(id, n);
+      return;
+    }
+    this.retains.delete(id);
+    await this.withTx(async (tx, r) => {
+      const rec = (await r(tx.objectStore("inodes").get(id))) as InodeRecord | undefined;
+      if (rec && rec.nlink <= 0) {
+        await r(tx.objectStore("inodes").delete(id));
+        await r(tx.objectStore("data").delete(this.chunkRange(id)));
+      }
+    });
   }
 
   async unlink(parent: NodeId, name: string): Promise<void> {
