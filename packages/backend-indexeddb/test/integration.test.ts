@@ -17,7 +17,7 @@ describe("Vfs + CachedBackend + IndexedDBBackend end-to-end", () => {
     await vfs1.symlink("/project/src/index.ts", "/project/main");
     await vfs1.rename("/project/src/index.ts", "/project/src/main.ts");
     await vfs1.fsync();
-    be1.close();
+    await be1.close();
 
     // Session 2 (simulated reload): reopen, warm, verify
     const be2 = await IndexedDBBackend.open(dbName);
@@ -28,7 +28,7 @@ describe("Vfs + CachedBackend + IndexedDBBackend end-to-end", () => {
     expect(await vfs2.readTextFile("/project/src/main.ts")).toBe("export const x = 1;\nexport const y = 2;\n");
     expect(await vfs2.readlink("/project/main")).toBe("/project/src/index.ts"); // symlink target is a path string, unaffected by the rename
     expect((await vfs2.readdir("/project")).map((d) => d.name)).toEqual(["main", "src"]);
-    be2.close();
+    await be2.close();
   });
 
   it("EXDEV across a memory mount and an IDB mount", async () => {
@@ -42,7 +42,7 @@ describe("Vfs + CachedBackend + IndexedDBBackend end-to-end", () => {
     await vfs.writeFile("/idb/direct.txt", "y");
     await vfs.fsync();
     expect(await vfs.readTextFile("/idb/direct.txt")).toBe("y");
-    be.close();
+    await be.close();
   });
 
   it("a transient abort mid-batch fails one fsync, then the mount recovers", async () => {

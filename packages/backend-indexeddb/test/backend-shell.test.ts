@@ -22,10 +22,10 @@ describe("IndexedDBBackend shell", () => {
     const attrs = await be.getattr(root);
     expect(attrs.kind).toBe("dir");
     expect(attrs.mode).toBe(0o755);
-    be.close();
+    await be.close();
     const be2 = await IndexedDBBackend.open(name);
     expect(await be2.root()).toBe(root); // ids stable across sessions
-    be2.close();
+    await be2.close();
   });
 
   it("declares the required caps", async () => {
@@ -37,7 +37,7 @@ describe("IndexedDBBackend shell", () => {
       renameCost: "O1",
       fdRetention: true,
     });
-    be.close();
+    await be.close();
   });
 
   it("getattr of an unknown id throws ENOENT; setattr updates mode and mtime", async () => {
@@ -48,7 +48,7 @@ describe("IndexedDBBackend shell", () => {
     const attrs = await be.getattr(root);
     expect(attrs.mode).toBe(0o700);
     expect(attrs.mtimeMs).toBe(12345);
-    be.close();
+    await be.close();
   });
 
   it("flush resolves after pending work commits", async () => {
@@ -56,7 +56,7 @@ describe("IndexedDBBackend shell", () => {
     await be.setattr(await be.root(), { mtimeMs: 1 });
     await be.flush();
     await be.flush(); // idempotent
-    be.close();
+    await be.close();
   });
 
   it("ops spanning a macrotask boundary reuse a fresh txn transparently (withTx retry path)", async () => {
@@ -68,7 +68,7 @@ describe("IndexedDBBackend shell", () => {
     const attrs = await be.getattr(root);
     expect(attrs.mtimeMs).toBe(111);
     expect(attrs.ctimeMs).toBe(222);
-    be.close();
+    await be.close();
   });
 
   it("an aborted batch poisons ops until flush() reports and clears it", async () => {
@@ -82,7 +82,7 @@ describe("IndexedDBBackend shell", () => {
     await be.setattr(root, { mtimeMs: 3 }); // cleared: fresh txn works
     await be.flush();
     expect((await be.getattr(root)).mtimeMs).toBe(3);
-    be.close();
+    await be.close();
   });
 
   it("an abort is never masked by the stale-handle retry (no-wait race)", async () => {
@@ -96,6 +96,6 @@ describe("IndexedDBBackend shell", () => {
     await be.setattr(root, { mtimeMs: 3 });
     await be.flush();
     expect((await be.getattr(root)).mtimeMs).toBe(3);
-    be.close();
+    await be.close();
   });
 });

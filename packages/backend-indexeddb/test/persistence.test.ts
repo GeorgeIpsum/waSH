@@ -18,7 +18,7 @@ describe("persistence across reopen", () => {
     await be.link!(d, "hard", f);
     await be.symlink!(root, "ln", ulid(), "/dir/file.txt");
     await be.flush();
-    be.close();
+    await be.close();
 
     const be2 = await IndexedDBBackend.open(name, { chunkSize: 8 });
     expect(await be2.root()).toBe(root);
@@ -27,7 +27,7 @@ describe("persistence across reopen", () => {
     expect(dec.decode(await be2.read(f, 0, 100))).toBe("persisted content");
     expect((await be2.getattr(f)).nlink).toBe(2);
     expect(await be2.readlink!((await be2.lookup(root, "ln"))!.id)).toBe("/dir/file.txt");
-    be2.close();
+    await be2.close();
   });
 
   it("uncommitted shared-txn work still lands once control returns to the event loop", async () => {
@@ -37,9 +37,9 @@ describe("persistence across reopen", () => {
     await be.create(root, "x", ulid(), "file");
     // no explicit flush(): the shared txn auto-commits at the macrotask boundary
     await new Promise((r) => setTimeout(r, 0));
-    be.close();
+    await be.close();
     const be2 = await IndexedDBBackend.open(name);
     expect((await be2.lookup(root, "x"))?.attrs.kind).toBe("file");
-    be2.close();
+    await be2.close();
   });
 });

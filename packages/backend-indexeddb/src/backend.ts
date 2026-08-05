@@ -20,6 +20,42 @@ export interface IndexedDBBackendOptions {
   chunkSize?: number;
 }
 
+interface LockManagerLike {
+  request(
+    name: string,
+    opts: { mode?: string; ifAvailable?: boolean },
+    cb: (lock: unknown) => Promise<unknown> | unknown,
+  ): Promise<unknown>;
+}
+
+/**
+ * Acquire an exclusive per-db Web Lock, best-effort (spec §A.6 single-writer). Returns a
+ * `release` fn + the `held` promise (which resolves once the lock is fully released) when
+ * granted, `null` when another live instance already holds it (→ EBUSY), or `"nolocks"`
+ * where the Web Locks API is unavailable (Node/old browsers → proceed lockless).
+ *
+ * The lock makes the open-time orphan sweep safe: without it, opening a second instance of
+ * the same db would sweep an `nlink:0` inode that the first instance still retains through
+ * an open fd, deleting live data. Unlike OPFS the lock is NOT mandatory — IndexedDB's whole
+ * point is broader reach, and a lockless environment is single-instance in practice.
+ */
+function acquireDbLock(
+  name: string,
+): Promise<{ release: () => void; held: Promise<unknown> } | null | "nolocks"> {
+  const locks = (globalThis as { navigator?: { locks?: LockManagerLike } }).navigator?.locks;
+  if (!locks) return Promise.resolve("nolocks");
+  return new Promise((resolve) => {
+    let held!: Promise<unknown>;
+    held = locks.request(name, { mode: "exclusive", ifAvailable: true }, (lock) => {
+      if (!lock) {
+        resolve(null); // held by another live instance
+        return Promise.resolve();
+      }
+      return new Promise<void>((release) => resolve({ release: () => release(), held }));
+    });
+  });
+}
+
 /**
  * Per-attempt request wrapper handed to every op body by `withTx`. Op bodies
  * call `r(request)` instead of a shared instance method so the "did this
@@ -98,6 +134,8 @@ export class IndexedDBBackend implements WashBackend {
     private readonly rootId: NodeId,
     private readonly durability: "relaxed" | "strict",
     readonly chunkSize: number,
+    private releaseLock: (() => void) | null = null,
+    private lockHeld: Promise<unknown> | null = null,
   ) {}
 
   static async open(dbName: string, opts: IndexedDBBackendOptions = {}): Promise<IndexedDBBackend> {
@@ -114,16 +152,33 @@ export class IndexedDBBackend implements WashBackend {
       meta.put(SCHEMA_VERSION, "schemaVersion");
     }
     await txDone(tx);
-    await IndexedDBBackend.sweepOrphans(db); // §A.7: retain-count is gone on a fresh open
-    return new IndexedDBBackend(db, rootId, opts.durability ?? "relaxed", opts.chunkSize ?? CHUNK_SIZE);
+    // Single-writer lock (§A.6) — held for our lifetime so the open-time sweep below can't
+    // delete an inode a concurrently-live instance still retains (see acquireDbLock).
+    const lock = await acquireDbLock(`wash-idb:${dbName}`);
+    if (lock === null) {
+      db.close();
+      throw new VfsError("EBUSY", dbName); // another live instance holds the db
+    }
+    const releaseLock = lock === "nolocks" ? null : lock.release;
+    const lockHeld = lock === "nolocks" ? null : lock.held;
+    try {
+      await IndexedDBBackend.sweepOrphans(db); // §A.7: retain-count is gone on a fresh open
+    } catch (e) {
+      releaseLock?.();
+      db.close();
+      throw e;
+    }
+    return new IndexedDBBackend(db, rootId, opts.durability ?? "relaxed", opts.chunkSize ?? CHUNK_SIZE, releaseLock, lockHeld);
   }
 
   /**
    * Open-time unreachable-`nlink0` sweep (§A.7). Retain-count is in-memory
-   * only (never persisted, see `retains` above), so on every fresh open every
-   * `nlink <= 0` inode left over from a prior session is unreachable garbage
-   * — no live fd can reference it, because a live fd would require a live
-   * process, and this IS that process's first moment of life. Runs in its
+   * only (never persisted, see `retains` above), so a `nlink <= 0` inode left
+   * over from a prior session is unreachable garbage — *provided no OTHER
+   * instance is concurrently live and retaining it*. `open()` holds an
+   * exclusive per-db Web Lock across this sweep to guarantee exactly that (a
+   * concurrent open is rejected EBUSY), so every swept record is genuinely a
+   * crashed/orphaned leftover, never a peer's live-retained inode. Runs in its
    * own readwrite tx over `inodes` + `data`, before the instance (and thus
    * any caller) can observe the database.
    */
@@ -150,9 +205,16 @@ export class IndexedDBBackend implements WashBackend {
     await txDone(tx);
   }
 
-  close(): void {
+  async close(): Promise<void> {
     this.tx = null;
+    this.releaseLock?.();
+    this.releaseLock = null;
+    const held = this.lockHeld;
+    this.lockHeld = null;
     this.db.close();
+    // Await the Web Lock's full release so an immediate reopen of the same db isn't
+    // spuriously rejected EBUSY (models a clean shutdown; a real crash frees it via the OS).
+    if (held) await held;
   }
 
   async root(): Promise<NodeId> {
