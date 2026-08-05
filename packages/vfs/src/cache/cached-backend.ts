@@ -553,10 +553,16 @@ export class CachedBackend implements WashBackend {
       const attrs = await this.getattr(id);
       if (attrs.kind === "dir") throw new VfsError("EISDIR");
       if (data.byteLength === 0) return;
+      // Reserve against the PROJECTED size BEFORE materialize(): on a cache miss materialize
+      // reads the file's full current contents (a large allocation), so an over-bound write
+      // must be rejected here, before that read (§B.6 OOM guard). `cur.byteLength` will equal
+      // `attrs.size`, so the projected end is known from `attrs` alone.
+      const projected = Math.max(attrs.size, offset + data.byteLength);
+      this.admit(projected);
       const cur = await this.materialize(id, attrs);
       const end = Math.max(cur.byteLength, offset + data.byteLength);
-      this.admit(end); // BEFORE allocating `next`: reject an over-bound write without materializing
-      const next = new Uint8Array(end); //           hundreds of MiB (backpressure OOM guard, §B.6)
+      this.admit(end); // atomic reservation immediately before the install (no await before the charge)
+      const next = new Uint8Array(end);
       next.set(cur, 0);
       next.set(data, offset);
       this.enqueueContentOp(id, next);
@@ -573,10 +579,23 @@ export class CachedBackend implements WashBackend {
     return this.withNodeLock(id, async () => {
       const attrs = await this.getattr(id);
       if (attrs.kind === "dir") throw new VfsError("EISDIR");
-      const cur = await this.materialize(id, attrs);
-      this.admit(size); // BEFORE allocating `next`: reject an over-bound truncate without materializing (§B.6)
+      // Reserve the projected new size before any allocation/read (§B.6 OOM guard).
+      this.admit(size);
+      // Only the first min(size, current) bytes survive, so read just those — never
+      // materialize the full old file (a shrink of a huge stored file would otherwise read
+      // it all into memory only to discard the tail).
+      const keep = Math.min(size, attrs.size);
+      const dirty = this.dirtyData.get(id);
+      let head: Uint8Array;
+      if (dirty) head = dirty.subarray(0, Math.min(keep, dirty.byteLength));
+      else if (keep === 0) head = new Uint8Array(0);
+      else {
+        await this.drain(); // never read stale (matches materialize)
+        head = await this.inner.read(id, 0, keep);
+      }
+      this.admit(size); // atomic reservation immediately before the install
       const next = new Uint8Array(size);
-      next.set(cur.slice(0, Math.min(size, cur.byteLength)), 0);
+      next.set(head, 0);
       this.enqueueContentOp(id, next);
       this.dirtyData.set(id, next);
       const hit = this.attrCache.get(id);

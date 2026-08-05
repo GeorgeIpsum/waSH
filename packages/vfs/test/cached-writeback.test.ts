@@ -625,4 +625,47 @@ describe("CachedBackend write-back", () => {
     // f would still be present here as a stranded nlink-0 orphan.)
     await expect(inner.getattr(f)).rejects.toMatchObject({ errno: "ENOENT" });
   });
+
+  it("an over-bound write on an unhealthy cache rejects before materializing the file (P2)", async () => {
+    // Regression (PR #4 Codex P2 follow-on): admit() must run against the PROJECTED size
+    // before materialize(), which on a cache miss reads the file's full current contents.
+    // Otherwise a large over-bound write materializes the whole file before ENOSPC.
+    const inner = new MemoryBackend();
+    let reads = 0;
+    const asNodes = () => inner as unknown as { nodes: Map<string, unknown> };
+    let committed = structuredClone(asNodes().nodes);
+    let failNext = false;
+    const proxy = new Proxy(inner, {
+      get(t, p, r) {
+        const v = Reflect.get(t, p, r);
+        if (p === "read") return async (...a: unknown[]) => { reads++; return (v as (...x: unknown[]) => unknown).apply(t, a); };
+        if (p === "flush") {
+          return async (o?: { strict?: boolean }) => {
+            if (failNext) { failNext = false; asNodes().nodes = structuredClone(committed); throw new VfsError("ENOSPC"); }
+            const res = await (v as (o?: unknown) => Promise<void>).apply(t, [o]);
+            committed = structuredClone(asNodes().nodes);
+            return res;
+          };
+        }
+        return typeof v === "function" ? (v as (...x: unknown[]) => unknown).bind(t) : v;
+      },
+    }) as unknown as WashBackend;
+    const be = new CachedBackend(proxy, { flushDelayMs: 60_000, maxDirtyBytes: 16 });
+    const root = await be.root();
+    const f = ulid();
+    await be.create(root, "f", f, "file");
+    await be.write(f, 0, new Uint8Array(16));
+    await be.flush(); // f STORED (16 bytes), dirtyData[f] cleared → a later write is a cache miss
+    // drive the cache unhealthy:
+    failNext = true;
+    const g = ulid();
+    await be.create(root, "g", g, "file");
+    await be.write(g, 0, new Uint8Array(16)); // 16 dirty bytes held
+    await expect(be.flush()).rejects.toMatchObject({ errno: "ENOSPC" }); // barrier fails → unhealthy, g retained
+    reads = 0;
+    // A large over-bound write to the STORED (cache-miss) file f must reject at the projected
+    // admit BEFORE materialize's inner.read — so no full-file read happens.
+    await expect(be.write(f, 0, new Uint8Array(1000))).rejects.toMatchObject({ errno: "ENOSPC" });
+    expect(reads).toBe(0); // materialize's inner.read never ran
+  });
 });
